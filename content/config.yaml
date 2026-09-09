@@ -10,8 +10,7 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
-  # RAM cache + native MosDNS v4.5.3 disk snapshot for warm starts.
-  # The dump is optional: DNS continues to work if the file is missing or unusable.
+  # Custom v4.5.3 cache: RAM first, with an optional disk warm snapshot.
   - tag: mem_cache
     type: cache
     args:
