@@ -1,4 +1,3 @@
-```markdown
 # MosDNS on Koyeb
 
 A lightweight, Koyeb-ready deployment of [MosDNS](https://github.com/IrineSistiana/Mosdns) v4.5.3 with DNS-over-HTTPS (DoH) support.
@@ -200,4 +199,4 @@ If you find this project useful, donations are appreciated.
 ## License
 
 See the repository's license file for licensing information.
-```
+
