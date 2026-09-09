@@ -2,9 +2,7 @@ log:
   level: warn
 
 plugins:
-  # Public DoH abuse protection. This is NOT authentication.
-  # v4.5.3 uses client_limiter (not the v5 rate_limiter plugin).
-  # 20 requests/second per client IP; excess requests receive REFUSED.
+  # Public DoH abuse protection. This is rate limiting, not authentication.
   - tag: client_limit
     type: client_limiter
     args:
@@ -12,14 +10,15 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
+  # RAM-only cache for the first clean deployment.
+  # Disk persistence is intentionally disabled until the runtime binary
+  # is confirmed and the service is healthy.
   - tag: mem_cache
     type: cache
     args:
       size: CACHE_SIZE_PLACEHOLDER
       lazy_cache_ttl: 86400
       lazy_cache_reply_ttl: 30
-      dump_file: CACHE_DUMP_FILE_PLACEHOLDER
-      dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
 
   - tag: forward_upstream
     type: fast_forward
