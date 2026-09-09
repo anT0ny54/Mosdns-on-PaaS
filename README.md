@@ -1,52 +1,70 @@
-[点击前往中文说明](README_chs.md)
+# MosDNS v5.3.4 — Koyeb Optimized DoH
 
-## Acknowledgments
+A minimal MosDNS v5.3.4 DNS-over-HTTPS forwarder optimized for Koyeb.
 
-- [IrineSistiana/mosdns](https://github.com/IrineSistiana/mosdns) An advanced DNS forwarder.
-- [v2fly](https://github.com/v2fly)
+## Features
 
-## Attention
+- MosDNS v5.3.4
+- No GeoIP/Geosite downloads
+- No unnecessary PaaS-specific files
+- Three Hagezi DoH upstreams:
+  - `https://root.hagezi.org/dns-query`
+  - `https://wurzn.hagezi.org/dns-query`
+  - `https://juuri.hagezi.org/dns-query`
+- `trusted: true` and `enable_pipeline: true` on every upstream
+- 40,960-entry in-memory cache
+- Lazy cache for up to 3 days
+- Koyeb `PORT` support
+- Configurable `DOH_PATH`
 
- **Do not abuse service from PaaS platforms or your account could get banned. Deploy at your own risk.**
+## Koyeb deployment
 
-## <a id="Overview"></a>Overview
+Deploy the repository with the **Dockerfile** builder.
 
-This repo is for deploying [mosdns](https://github.com/IrineSistiana/mosdns) DoH service which is an advanced DNS forwarder on various PaaS platforms (Heroku, Okteto, Railway, Northflank, fly.io, etc.).
+Expose one public web port:
 
-![未命名绘图 (1)](https://user-images.githubusercontent.com/98247050/179379517-1cb35632-e594-4712-8d62-f0ef1ba5c8d9.jpg)
+- Port: `8080` (or the value you set as `PORT`)
+- Protocol: `HTTP`
+- Route: `/`
 
-## <a id="Deployment"></a>Deployment
+Koyeb automatically provides the `PORT` environment variable for Web Services. The container also defaults to `8080` if `PORT` is not supplied.
 
-- Fork this repo
-- Modify /content/config.yaml to suit your needs. Default config file has ad-blocking and ECS enabled.
-- Strongly recommend custom DOH_PATH env value to prevent other ppl from abusing your deployment.
+Recommended environment variable:
 
-### Deploy to Heroku 
-- Heroku will stop offering free product plans and shut down free dynos starting Nov. 28, 2022. 
-
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy)
-
-### Deploy to Okteto, Railway, Northflank etc.
-- Link your forked repo in PaaS platform's dashboard
-- Set DOH_PATH env
-- Deploy
-
-### Deploy to Koyeb
-- Create a new release in your forked repo with a tag like "v0.0.1"
-- Wait for github action to finish
-- Use your new generated container image to deploy.
-
-### Deploy to fly.io
-- Install [flyctl](https://fly.io/docs/flyctl/installing/)
-- git clone repo and change path to repo folder
-- edit fly.toml to set DOH_PATH env
+```text
+DOH_PATH=/dns-query
 ```
-# Login
-flyctl auth login
-# Create app
-flyctl apps create <app_name>
-# Set region https://fly.io/docs/reference/regions/
-flyctl regions set <region_code> -a <app_name>
-# Deploy
-flyctl deploy --detach -a <app_name> --remote-only --no-cache
+
+For additional protection against unwanted public use, choose a private/random path, for example:
+
+```text
+DOH_PATH=/dns-query
+```
+
+## Health check
+
+The default Koyeb TCP health check is sufficient because MosDNS listens on the exposed HTTP port. No separate health endpoint is required.
+
+## DoH endpoint
+
+After deployment, the DoH endpoint is:
+
+```text
+https://YOUR-SERVICE.koyeb.app/dns-query
+```
+
+If you changed `DOH_PATH`, replace `/dns-query` with your configured path.
+
+## Project files
+
+```text
+.
+├── .dockerignore
+├── .gitignore
+├── Dockerfile
+├── LICENSE
+├── README.md
+└── content
+    ├── config.yaml
+    └── entrypoint.sh
 ```

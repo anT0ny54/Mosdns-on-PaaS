@@ -1,0 +1,11 @@
+.git
+.github
+*.md
+README_chs.md
+Dockerfile*
+compose*.yml
+fly.toml
+heroku.yml
+app.json
+*.zip
+*.tar.gz

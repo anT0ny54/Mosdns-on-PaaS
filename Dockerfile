@@ -1,11 +1,10 @@
-FROM irinesistiana/mosdns:v4.5.3
-COPY ./content /etc/mosdns
+FROM irinesistiana/mosdns:v5.3.4
 
-RUN sh /etc/mosdns/install_geodata.sh
+COPY content /etc/mosdns
 
-ENV PORT=8080
-ENV DOH_PATH=/dns-query
+ENV PORT=8080 \
+    DOH_PATH=/dns-query
 
 EXPOSE 8080
 
-ENTRYPOINT [ "sh","/etc/mosdns/entrypoint.sh" ]
+ENTRYPOINT ["/etc/mosdns/entrypoint.sh"]
