@@ -153,7 +153,9 @@ func (w *warmBackend) snapshot() {
     tmp := w.path + ".tmp"
     f, err := os.Create(tmp)
     if err != nil { w.warn("failed to create warm cache snapshot", zap.Error(err)); return }
-    encErr := gob.NewEncoder(bufio.NewWriter(f)).Encode(warmDisk{Entries: entries})
+    bw := bufio.NewWriter(f)
+    encErr := gob.NewEncoder(bw).Encode(warmDisk{Entries: entries})
+    if encErr == nil { encErr = bw.Flush() }
     if encErr == nil { encErr = f.Sync() }
     closeErr := f.Close()
     if encErr == nil { encErr = closeErr }
