@@ -2,7 +2,7 @@
 
 A lightweight, Koyeb-ready deployment of [MosDNS](https://github.com/IrineSistiana/Mosdns) v4.5.3 with DNS-over-HTTPS (DoH) support.
 
-The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi DNS-over-HTTPS upstreams, a small in-memory cache, and no GeoIP or Geosite database downloads.
+The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi DNS-over-HTTPS upstreams, a low-footprint RAM cache with native disk snapshots, and no GeoIP or Geosite database downloads.
 
 ## Features
 
@@ -12,12 +12,12 @@ The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi D
 - Configurable DoH endpoint path
 - HaGeZi DoH upstream resolvers
 - DNS pipelining enabled
-- Small in-memory DNS cache
+- Per-client QPS guard for public-resolver abuse/bursts
+- RAM DNS cache with native on-disk warm-start cache snapshots
 - No GeoIP or Geosite downloads
 - No external geodata files
 - Dockerfile-based deployment
 - Focused specifically on Koyeb
-- No unnecessary Heroku, Fly.io, or Railway configuration files
 
 ## Requirements
 
@@ -73,6 +73,24 @@ The TCP health check is suitable for this service because the DoH endpoint is no
 | --- | --- | --- |
 | `PORT` | `8080` | Port used by Koyeb. Usually provided automatically. |
 | `DOH_PATH` | `/dns-query` | Path used by the DNS-over-HTTPS endpoint. |
+| `CACHE_SIZE` | `32768` | Maximum in-memory cache entries. |
+| `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Local warm-start snapshot path. |
+| `CACHE_DUMP_INTERVAL` | `300` | Snapshot interval in seconds. |
+
+
+## Disk-assisted cache
+
+The cache uses MosDNS's native cache dump support rather than adding dnsmasq, BIND, SQLite, or another resident process. Hot queries stay in RAM for low latency; MosDNS periodically writes a bounded cache snapshot to local disk and reloads it on startup. The disk file is a warm-start snapshot, not a disk-backed query cache.
+
+The default settings are conservative for a Koyeb instance with 512 MB RAM, 0.1 vCPU, and 2 GB local SSD:
+
+- `CACHE_SIZE=32768` — maximum in-memory cache entries.
+- `CACHE_DUMP_FILE=/var/cache/mosdns/cache.dump` — local warm-cache snapshot.
+- `CACHE_DUMP_INTERVAL=300` — snapshot every 5 minutes.
+
+These snapshots are only a warm-start optimization. Koyeb local storage is ephemeral, so a replacement/redeployment can still start with an empty cache. DNS operation does not depend on the dump file.
+
+You can override these values with environment variables. For example, `CACHE_SIZE=16384` reduces RAM usage further, while `CACHE_DUMP_INTERVAL=600` reduces disk-write frequency.
 
 ## Configure a custom DoH path
 
@@ -107,11 +125,13 @@ After deployment, the endpoint will be available at:
 https://YOUR-KOYEB-DOMAIN/my-secret-dns
 ```
 
-### Security recommendation
+### Public resolver and abuse protection
 
-Keep your DoH path private and avoid sharing it publicly. A publicly accessible DoH resolver may be abused by third parties, which can increase bandwidth usage and service costs.
+This service is intentionally **public**. The DoH endpoint does not require authentication, so any client that knows the endpoint can use it. A custom path can reduce casual automated scanning, but it is **not** an access-control mechanism.
 
-For stronger access control, consider placing the service behind an authentication layer or restricting access through a private network.
+The configuration includes MosDNS `client_limiter` with a default limit of **20 QPS per IPv4 address** and **20 QPS per IPv6 /48**. Requests above the limit are refused before they reach the cache or upstream resolvers. This is intended to protect a small Koyeb instance from friendly-client mistakes and bursty abuse; it is **not DDoS protection** and cannot stop a distributed attack.
+
+For a public deployment, also monitor Koyeb CPU, memory, bandwidth, and upstream errors. If legitimate clients frequently hit the limit, raise `max_qps` carefully rather than disabling the limiter.
 
 ## DoH endpoint
 
