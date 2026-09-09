@@ -1,12 +1,12 @@
 # MosDNS on Koyeb
 
-A lightweight, Koyeb-ready deployment of [MosDNS](https://github.com/IrineSistiana/Mosdns) v4.5.3 with DNS-over-HTTPS (DoH) support.
+A lightweight, Koyeb-ready deployment of [MosDNS](https://github.com/IrineSistiana/Mosdns) v5.3.4 with DNS-over-HTTPS (DoH) support.
 
 The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi DNS-over-HTTPS upstreams, a low-footprint RAM cache with native disk snapshots, and no GeoIP or Geosite database downloads.
 
 ## Features
 
-- MosDNS v4.5.3
+- MosDNS v5.3.4
 - DNS-over-HTTPS support
 - Automatic Koyeb `PORT` detection
 - Configurable DoH endpoint path
@@ -18,6 +18,7 @@ The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi D
 - No external geodata files
 - Dockerfile-based deployment
 - Focused specifically on Koyeb
+- No unnecessary Heroku, Fly.io, or Railway configuration files
 
 ## Requirements
 
@@ -129,7 +130,7 @@ https://YOUR-KOYEB-DOMAIN/my-secret-dns
 
 This service is intentionally **public**. The DoH endpoint does not require authentication, so any client that knows the endpoint can use it. A custom path can reduce casual automated scanning, but it is **not** an access-control mechanism.
 
-The configuration includes MosDNS `client_limiter` with a default limit of **20 QPS per IPv4 address** and **20 QPS per IPv6 /48**. Requests above the limit are refused before they reach the cache or upstream resolvers. This is intended to protect a small Koyeb instance from friendly-client mistakes and bursty abuse; it is **not DDoS protection** and cannot stop a distributed attack.
+The configuration includes MosDNS `rate_limiter` with a default limit of **20 QPS per IPv4 address** and **20 QPS per IPv6 /48**. Requests above the limit are refused before they reach the cache or upstream resolvers. This is intended to protect a small Koyeb instance from friendly-client mistakes and bursty abuse; it is **not DDoS protection** and cannot stop a distributed attack.
 
 For a public deployment, also monitor Koyeb CPU, memory, bandwidth, and upstream errors. If legitimate clients frequently hit the limit, raise `max_qps` carefully rather than disabling the limiter.
 
