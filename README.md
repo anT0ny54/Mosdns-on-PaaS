@@ -1,65 +1,203 @@
+```markdown
 # MosDNS on Koyeb
 
-Minimal Koyeb-ready MosDNS v4 deployment.
+A lightweight, Koyeb-ready deployment of [MosDNS](https://github.com/IrineSistiana/Mosdns) v4.5.3 with DNS-over-HTTPS (DoH) support.
+
+The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi DNS-over-HTTPS upstreams, a small in-memory cache, and no GeoIP or Geosite database downloads.
 
 ## Features
 
 - MosDNS v4.5.3
-- DNS-over-HTTPS (DoH) service
-- Koyeb `PORT` is used automatically
-- Custom `DOH_PATH` can be set at runtime
-- No GeoIP/Geosite downloads
-- No geodata files
-- No Heroku/Fly/Railway-specific deployment files
-- Hagezi DoH upstreams with pipelining enabled
-- Small in-memory cache
+- DNS-over-HTTPS support
+- Automatic Koyeb `PORT` detection
+- Configurable DoH endpoint path
+- HaGeZi DoH upstream resolvers
+- DNS pipelining enabled
+- Small in-memory DNS cache
+- No GeoIP or Geosite downloads
+- No external geodata files
+- Dockerfile-based deployment
+- Focused specifically on Koyeb
+- No unnecessary Heroku, Fly.io, or Railway configuration files
 
-## Koyeb deployment
+## Requirements
 
-Deploy this repository with the **Dockerfile** builder.
+- A [Koyeb](https://www.koyeb.com/) account
+- A GitHub repository containing this project
+- A domain provided by Koyeb or a custom domain
+- Dockerfile support enabled for the service
 
-Expose the container port as HTTP. Koyeb Web Services provide `PORT` automatically; if it is not set explicitly, Koyeb uses the lowest exposed port. The Dockerfile exposes port 8080, so the service normally uses port 8080.
+## Deploy to Koyeb
 
-Recommended environment variable:
+### Using the Koyeb dashboard
 
-```text
-DOH_PATH=/dns-query
+1. Sign in to your Koyeb account.
+2. Create a new **Web Service**.
+3. Select the GitHub repository containing this project.
+4. Choose the **Dockerfile** builder.
+5. Expose port `8080` using the HTTP protocol.
+6. Add the following environment variable:
+
+   ```text
+   DOH_PATH=/dns-query
+   ```
+
+7. Deploy the service.
+
+Koyeb provides the `PORT` environment variable automatically. If no port is configured explicitly, Koyeb uses the lowest port exposed by the Dockerfile.
+
+This project exposes port `8080` by default.
+
+### Using the Koyeb CLI
+
+```bash
+koyeb app init mosdns \
+  --git github.com/YOUR_USERNAME/YOUR_REPOSITORY \
+  --git-branch main \
+  --git-builder docker \
+  --ports 8080:http \
+  --routes /:8080 \
+  --env DOH_PATH=/dns-query \
+  --checks 8080:tcp
 ```
 
-For a custom path, for example:
+Replace the following values:
+
+- `YOUR_USERNAME` with your GitHub username
+- `YOUR_REPOSITORY` with your repository name
+
+The TCP health check is suitable for this service because the DoH endpoint is not a regular web page.
+
+## Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORT` | `8080` | Port used by Koyeb. Usually provided automatically. |
+| `DOH_PATH` | `/dns-query` | Path used by the DNS-over-HTTPS endpoint. |
+
+## Configure a custom DoH path
+
+The default DoH path is:
+
+```text
+/dns-query
+```
+
+To use a custom path, set the `DOH_PATH` environment variable:
 
 ```text
 DOH_PATH=/my-secret-dns
 ```
 
-Keep the path private to reduce abuse of a public DoH endpoint.
-
-### Koyeb CLI example
+For example:
 
 ```bash
-koyeb app init mosdns   --git github.com/YOUR_USERNAME/YOUR_REPOSITORY   --git-branch main   --git-builder docker   --ports 8080:http   --routes /:8080   --env DOH_PATH=/dns-query   --checks 8080:tcp
+koyeb app init mosdns \
+  --git github.com/YOUR_USERNAME/YOUR_REPOSITORY \
+  --git-branch main \
+  --git-builder docker \
+  --ports 8080:http \
+  --routes /:8080 \
+  --env DOH_PATH=/my-secret-dns \
+  --checks 8080:tcp
 ```
 
-Koyeb's default TCP health check is appropriate for this service because the DoH endpoint is not a normal web page.
+After deployment, the endpoint will be available at:
+
+```text
+https://YOUR-KOYEB-DOMAIN/my-secret-dns
+```
+
+### Security recommendation
+
+Keep your DoH path private and avoid sharing it publicly. A publicly accessible DoH resolver may be abused by third parties, which can increase bandwidth usage and service costs.
+
+For stronger access control, consider placing the service behind an authentication layer or restricting access through a private network.
 
 ## DoH endpoint
 
-After deployment:
+With the default configuration, the endpoint is:
 
 ```text
 https://YOUR-KOYEB-DOMAIN/dns-query
 ```
 
-## Upstreams
+Replace `YOUR-KOYEB-DOMAIN` with the hostname assigned to your Koyeb service.
 
-The configuration uses:
+You can configure this endpoint in any DNS client that supports DNS-over-HTTPS.
+
+### Example client configuration
+
+```text
+https://YOUR-KOYEB-DOMAIN/dns-query
+```
+
+If you selected a custom path, replace `/dns-query` with your configured path.
+
+## Upstream resolvers
+
+MosDNS uses the following HaGeZi DNS-over-HTTPS upstream resolvers:
 
 - `https://root.hagezi.org/dns-query`
 - `https://wurzn.hagezi.org/dns-query`
 - `https://juuri.hagezi.org/dns-query`
 
-All are configured as trusted upstreams with `enable_pipeline: true`.
+The upstreams are configured as trusted resolvers with DNS pipelining enabled.
 
-## Notes
+## Free DNS services
 
-This project is intentionally kept focused on Koyeb. The original multi-PaaS deployment files and GeoIP/Geosite installation logic have been removed.
+The following public DNS-over-HTTPS services use HaGeZi blocklists, including Multi Pro and TIF.
+
+| Service | DNS-over-HTTPS endpoint |
+| --- | --- |
+| Recommended | `https://freedns.koyeb.app/dns-query` |
+| Recommended | `https://freedns-six.vercel.app/api/doh/dns-query` |
+| Alternative | `https://dnssix.netlify.app/api/doh/dns-query` |
+
+Public services may have usage limits, performance differences, or availability changes. Use them at your own discretion.
+
+## Health checks
+
+Koyeb is configured to use a TCP health check on port `8080`:
+
+```text
+8080:tcp
+```
+
+This verifies that the service is accepting connections without requiring the DoH endpoint to behave like a normal web page.
+
+## Project scope
+
+This repository is intentionally focused on running MosDNS on Koyeb.
+
+The following components are not included:
+
+- GeoIP database installation
+- Geosite database installation
+- GeoIP or Geosite files
+- External geodata downloads
+- Deployment files for other PaaS providers
+- Unnecessary build and runtime dependencies
+
+## Bandwidth Hero Server
+
+[Bandwidth Hero Server](https://github.com/ayastreb/bandwidth-hero) is a lightweight image optimization proxy designed to reduce bandwidth usage and improve browsing performance.
+
+It fetches remote images, compresses them on the fly, and delivers optimized versions to clients.
+
+**Live demo:** [bhserv.netlify.app](https://bhserv.netlify.app/)
+
+## Supporting the project
+
+If you find this project useful, donations are appreciated.
+
+**Bitcoin:**
+
+```text
+1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
+```
+
+## License
+
+See the repository's license file for licensing information.
+```
