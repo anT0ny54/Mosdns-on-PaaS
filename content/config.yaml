@@ -2,12 +2,25 @@ log:
   level: warn
 
 plugins:
+  # Public-resolver abuse guard. This is intentionally a per-client limit,
+  # not authentication: the DoH endpoint remains fully public.
+  # It is meant to protect friendly clients and the tiny Koyeb instance
+  # from accidental/bursty overuse; it is NOT DDoS protection.
+  - tag: client_limit
+    type: client_limiter
+    args:
+      max_qps: 20
+      v4_mask: 32
+      v6_mask: 48
+
   - tag: mem_cache
     type: cache
     args:
-      size: 16384
+      size: CACHE_SIZE_PLACEHOLDER
       lazy_cache_ttl: 86400
       lazy_cache_reply_ttl: 30
+      dump_file: CACHE_DUMP_FILE_PLACEHOLDER
+      dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
 
   - tag: forward_upstream
     type: fast_forward
@@ -27,6 +40,7 @@ plugins:
     type: sequence
     args:
       exec:
+        - client_limit
         - _misc_optm
         - mem_cache
         - forward_upstream
