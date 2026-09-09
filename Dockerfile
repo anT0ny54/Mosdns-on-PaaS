@@ -1,4 +1,6 @@
-FROM irinesistiana/mosdns@sha256:db2db6c7cdce
+# MosDNS v4.5.3. Koyeb builds linux/amd64 for this deployment.
+# The previous digest was accidentally truncated; use the verified v4.5.3 tag.
+FROM --platform=linux/amd64 irinesistiana/mosdns:v4.5.3
 
 WORKDIR /etc/mosdns
 
