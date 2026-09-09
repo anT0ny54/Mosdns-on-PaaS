@@ -1,23 +1,91 @@
 # MosDNS on Koyeb
 
-A lightweight, Koyeb-ready deployment of [MosDNS](https://github.com/IrineSistiana/Mosdns) v4.5.3 with DNS-over-HTTPS (DoH) support.
+A lightweight Koyeb deployment of MosDNS v4.5.3 with DNS-over-HTTPS (DoH), three rotating HaGeZi upstreams, and a bounded warm-start cache.
 
-The project is designed to be simple, fast, and easy to deploy. It uses HaGeZi DNS-over-HTTPS upstreams, a low-footprint RAM cache with native disk snapshots, and no GeoIP or Geosite database downloads.
+## Optimized for Koyeb 512 MB / 0.1 vCPU
 
-## Features
+The configuration is intentionally conservative:
 
 - MosDNS v4.5.3
-- DNS-over-HTTPS support
-- Automatic Koyeb `PORT` detection
-- Configurable DoH endpoint path
-- HaGeZi DoH upstream resolvers
+- one active DoH upstream at a time
+- three HaGeZi endpoints rotated every 30 minutes by default
+- deterministic round-robin rotation (`rotate`) so all three endpoints are used without random repeats
 - DNS pipelining enabled
-- RAM DNS cache with native on-disk warm-start cache snapshots
-- No GeoIP or Geosite downloads
-- No external geodata files
-- Dockerfile-based deployment
-- Focused specifically on Koyeb
-- No unnecessary Heroku, Fly.io, or Railway configuration files
+- 8,192-entry RAM cache by default
+- bounded disk warm-cache snapshot
+- warm cache survives graceful rotation/restart as long as Koyeb's local storage remains available
+- no GeoIP/Geosite downloads
+- no additional resident cache/database process
+- non-root runtime user
+- Go memory limit of 384 MiB
+- 3-second DNS server timeout
+
+The warm-cache file is only a warm-start optimization. Koyeb local storage is ephemeral, so a new/replaced instance may still start without the previous snapshot.
+
+## Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORT` | `8080` | Koyeb HTTP port |
+| `DOH_PATH` | `/dns-query` | DoH endpoint path |
+| `CACHE_SIZE` | `8192` | Maximum RAM cache entries |
+| `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot |
+| `CACHE_DUMP_INTERVAL` | `900` | Snapshot interval in seconds |
+| `MAX_QPS` | `20` | Per-client QPS limit |
+| `HAGEZI_UPSTREAM` | `rotate` | `rotate`, `random`, or one fixed `https://` endpoint |
+| `ROTATE_INTERVAL` | `1800` | Rotation interval in seconds; minimum 60 |
+| `GOMEMLIMIT` | `384MiB` | Go runtime memory limit |
+
+## Three-upstream rotation
+
+`HAGEZI_UPSTREAM=rotate` uses these three endpoints in order:
+
+1. `https://root.hagezi.org/dns-query`
+2. `https://wurzn.hagezi.org/dns-query`
+3. `https://juuri.hagezi.org/dns-query`
+
+After the third endpoint, it returns to the first. This is preferable to pure random selection when the requirement is to continuously rotate among exactly three upstreams because random selection can choose the same endpoint repeatedly.
+
+The active MosDNS process is gracefully stopped at each rotation. The warm-cache backend writes a final bounded snapshot during shutdown and the next process reloads it. The RAM cache therefore does not intentionally start empty after a normal rotation, provided the local cache file is still present.
+
+If you prefer random selection, set:
+
+```text
+HAGEZI_UPSTREAM=random
+```
+
+For no rotation, set one fixed endpoint and the supervisor exits after MosDNS starts normally:
+
+```text
+HAGEZI_UPSTREAM=https://root.hagezi.org/dns-query
+```
+
+## Warm cache
+
+The hot path is always the RAM cache. The custom cache backend maintains a bounded second copy for warm starts.
+
+Default:
+
+```text
+CACHE_SIZE=8192
+CACHE_DUMP_INTERVAL=900
+CACHE_DUMP_FILE=/var/cache/mosdns/cache.dump
+```
+
+The cache uses atomic replacement when writing the snapshot. Expired entries are not restored. The warm cache is deliberately bounded to the same configured maximum as the RAM cache so it cannot grow without limit.
+
+## Why the configuration is small
+
+On a 0.1-vCPU instance, avoiding unnecessary resident processes and large databases matters more than maximizing cache size. The deployment therefore does not install GeoIP/Geosite data, SQLite, dnsmasq, BIND, or another cache daemon.
+
+8,192 entries is a good starting point for 512 MB RAM. If measurements show the cache is too small, increase `CACHE_SIZE`; otherwise leave it unchanged.
+
+## DoH security
+
+A public DoH service can be abused. `MAX_QPS` is rate limiting, not authentication. Keep the DoH URL private and consider additional access control if the endpoint is intended only for personal use.
+
+The service expects Koyeb's proxy to provide the client address through `X-Forwarded-For` for the client limiter.
+
 
 ## Requirements
 
@@ -75,19 +143,62 @@ The TCP health check is suitable for this service because the DoH endpoint is no
 | `DOH_PATH` | `/dns-query` | Path used by the DNS-over-HTTPS endpoint. |
 
 
-## Disk-assisted cache
+## Disk-assisted warm cache
 
-The cache uses MosDNS's native cache dump support rather than adding dnsmasq, BIND, SQLite, or another resident process. Hot queries stay in RAM for low latency; MosDNS periodically writes a bounded cache snapshot to local disk and reloads it on startup.
+The deployment keeps the hot DNS cache in RAM and maintains a bounded warm-start
+snapshot on local disk. This is intentionally retained because the service uses
+graceful restarts during upstream rotation.
 
-The default settings are conservative for a Koyeb instance with 512 MB RAM, 0.1 vCPU, and 2 GB local SSD:
+The default settings are conservative for a Koyeb instance with 512 MB RAM,
+0.1 vCPU, and 2 GB local SSD:
 
-- `CACHE_SIZE=32768` — maximum in-memory cache entries.
+- `CACHE_SIZE=8192` — maximum in-memory cache entries.
 - `CACHE_DUMP_FILE=/var/cache/mosdns/cache.dump` — local warm-cache snapshot.
-- `CACHE_DUMP_INTERVAL=300` — snapshot every 5 minutes.
+- `CACHE_DUMP_INTERVAL=900` — snapshot every 15 minutes.
+- `GOMEMLIMIT=384MiB` — Go runtime memory limit.
 
-These snapshots are only a warm-start optimization. Koyeb local storage is ephemeral, so a replacement/redeployment can still start with an empty cache. DNS operation does not depend on the dump file.
+The RAM cache is always the hot path. The disk snapshot is only a warm-start
+optimization and does not participate in normal query serving.
 
-You can override these values with environment variables. For example, `CACHE_SIZE=16384` reduces RAM usage further, while `CACHE_DUMP_INTERVAL=600` reduces disk-write frequency.
+### Rotation and warm-cache behavior
+
+With the default `HAGEZI_UPSTREAM=rotate`, the supervisor rotates through all
+three configured HaGeZi endpoints every 30 minutes:
+
+1. root.hagezi.org
+2. wurzn.hagezi.org
+3. juuri.hagezi.org
+
+Rotation is deterministic round-robin, so the same endpoint is not selected
+repeatedly by chance. Before each rotation, MosDNS is stopped gracefully so
+the warm-cache backend can write its final bounded snapshot. The next MosDNS
+process then reloads that snapshot.
+
+This means a normal upstream rotation does not intentionally start from an
+empty cache.
+
+Koyeb local storage is ephemeral, however. A new or replaced instance may not
+have the previous snapshot, so the service must never depend on the warm-cache
+file for correctness.
+
+The snapshot is written using atomic replacement, and expired entries are not
+restored. The warm-cache copy is bounded to the configured cache size so it
+cannot grow without limit.
+
+### Recommended tuning
+
+For this 512 MB / 0.1 vCPU profile, start with:
+
+```text
+CACHE_SIZE=8192
+CACHE_DUMP_INTERVAL=900
+MAX_QPS=20
+GOMEMLIMIT=384MiB
+```
+
+If memory pressure is observed, reduce `CACHE_SIZE` to `4096` before increasing
+other resource limits. If disk-write frequency is more important than restart
+warmth, increase `CACHE_DUMP_INTERVAL` to `1800`.
 
 ## Configure a custom DoH path
 
