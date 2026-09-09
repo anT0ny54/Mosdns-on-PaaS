@@ -1,203 +1,172 @@
 package cache
 
 import (
-	"encoding/gob"
-	"os"
-	"path/filepath"
-	"sync"
-	"time"
+    "bufio"
+    "encoding/gob"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
 
-	"github.com/IrineSistiana/mosdns/v4/pkg/cache"
-	"go.uber.org/zap"
+    cachepkg "github.com/IrineSistiana/mosdns/v4/pkg/cache"
+    "go.uber.org/zap"
 )
 
-type warmRecord struct {
-	Value          []byte
-	StoredTime     time.Time
-	ExpirationTime time.Time
+type warmEntry struct {
+    Value          []byte
+    StoredTime     time.Time
+    ExpirationTime time.Time
+}
+
+type warmDisk struct {
+    Entries map[string]warmEntry
 }
 
 type warmBackend struct {
-	base     cache.Backend
-	path     string
-	interval time.Duration
-	log      *zap.Logger
+    inner    cachepkg.Backend
+    path     string
+    interval time.Duration
+    logger   *zap.Logger
 
-	mu      sync.RWMutex
-	records map[string]warmRecord
-	stop    chan struct{}
-	done    chan struct{}
-	once    sync.Once
+    mu      sync.RWMutex
+    entries map[string]warmEntry
+    stop    chan struct{}
+    done    chan struct{}
+    once    sync.Once
 }
 
-func newWarmBackend(base cache.Backend, path string, intervalSeconds int, log *zap.Logger) *warmBackend {
-	w := &warmBackend{
-		base:    base,
-		path:    path,
-		log:     log,
-		records: make(map[string]warmRecord),
-	}
-	if path == "" {
-		return w
-	}
-	w.load()
-	if intervalSeconds > 0 {
-		w.interval = time.Duration(intervalSeconds) * time.Second
-		w.stop = make(chan struct{})
-		w.done = make(chan struct{})
-		go w.dumpLoop()
-	}
-	return w
+func newWarmBackend(inner cachepkg.Backend, path string, intervalSeconds int, logger *zap.Logger) cachepkg.Backend {
+    w := &warmBackend{
+        inner:    inner,
+        path:     path,
+        interval: time.Duration(intervalSeconds) * time.Second,
+        logger:   logger,
+        entries:  make(map[string]warmEntry),
+        stop:     make(chan struct{}),
+        done:     make(chan struct{}),
+    }
+    if path == "" {
+        close(w.done)
+        return w
+    }
+    w.load()
+    if w.interval > 0 {
+        go w.loop()
+    } else {
+        close(w.done)
+    }
+    return w
 }
 
 func (w *warmBackend) Get(key string) ([]byte, time.Time, time.Time) {
-	if v, stored, exp := w.base.Get(key); v != nil {
-		return v, stored, exp
-	}
-
-	now := time.Now()
-	w.mu.RLock()
-	r, ok := w.records[key]
-	w.mu.RUnlock()
-	if !ok || !r.ExpirationTime.After(now) {
-		if ok {
-			w.mu.Lock()
-			delete(w.records, key)
-			w.mu.Unlock()
-		}
-		return nil, time.Time{}, time.Time{}
-	}
-
-	v := append([]byte(nil), r.Value...)
-	// Rehydrate the RAM cache after a warm-disk hit.
-	w.base.Store(key, v, r.StoredTime, r.ExpirationTime)
-	return v, r.StoredTime, r.ExpirationTime
+    if v, st, exp := w.inner.Get(key); v != nil {
+        return v, st, exp
+    }
+    w.mu.RLock()
+    e, ok := w.entries[key]
+    w.mu.RUnlock()
+    if !ok || (!e.ExpirationTime.IsZero() && !e.ExpirationTime.After(time.Now())) {
+        return nil, time.Time{}, time.Time{}
+    }
+    v := append([]byte(nil), e.Value...)
+    w.inner.Store(key, v, e.StoredTime, e.ExpirationTime)
+    return v, e.StoredTime, e.ExpirationTime
 }
 
 func (w *warmBackend) Store(key string, v []byte, storedTime, expirationTime time.Time) {
-	w.base.Store(key, v, storedTime, expirationTime)
-	if w.path == "" || v == nil {
-		return
-	}
-	w.mu.Lock()
-	w.records[key] = warmRecord{
-		Value:          append([]byte(nil), v...),
-		StoredTime:     storedTime,
-		ExpirationTime: expirationTime,
-	}
-	w.mu.Unlock()
+    if expirationTime.IsZero() || expirationTime.After(time.Now()) {
+        w.inner.Store(key, v, storedTime, expirationTime)
+        cp := append([]byte(nil), v...)
+        w.mu.Lock()
+        w.entries[key] = warmEntry{Value: cp, StoredTime: storedTime, ExpirationTime: expirationTime}
+        w.mu.Unlock()
+    }
 }
 
-func (w *warmBackend) Len() int { return w.base.Len() }
+func (w *warmBackend) Len() int { return w.inner.Len() }
 
 func (w *warmBackend) Close() error {
-	w.once.Do(func() {
-		if w.stop != nil {
-			close(w.stop)
-			<-w.done
-		}
-		w.dump()
-	})
-	return w.base.Close()
+    w.once.Do(func() {
+        close(w.stop)
+        <-w.done
+        w.snapshot()
+        _ = w.inner.Close()
+    })
+    return nil
 }
 
-func (w *warmBackend) dumpLoop() {
-	ticker := time.NewTicker(w.interval)
-	defer func() {
-		ticker.Stop()
-		close(w.done)
-	}()
-	for {
-		select {
-		case <-ticker.C:
-			w.dump()
-		case <-w.stop:
-			return
-		}
-	}
+func (w *warmBackend) loop() {
+    defer close(w.done)
+    ticker := time.NewTicker(w.interval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ticker.C:
+            w.snapshot()
+        case <-w.stop:
+            return
+        }
+    }
 }
 
 func (w *warmBackend) load() {
-	f, err := os.Open(w.path)
-	if err != nil {
-		if !os.IsNotExist(err) && w.log != nil {
-			w.log.Warn("warm cache load failed", zap.String("file", w.path), zap.Error(err))
-		}
-		return
-	}
-	defer f.Close()
+    f, err := os.Open(w.path)
+    if err != nil {
+        if !os.IsNotExist(err) {
+            w.warn("failed to open warm cache", zap.Error(err))
+        }
+        return
+    }
+    defer f.Close()
 
-	var records map[string]warmRecord
-	if err := gob.NewDecoder(f).Decode(&records); err != nil {
-		if w.log != nil {
-			w.log.Warn("warm cache load failed; starting with empty disk cache", zap.String("file", w.path), zap.Error(err))
-		}
-		return
-	}
-
-	now := time.Now()
-	for key, r := range records {
-		if r.ExpirationTime.After(now) && len(r.Value) > 0 {
-			w.records[key] = r
-		}
-	}
-	if w.log != nil && len(w.records) > 0 {
-		w.log.Info("warm cache loaded", zap.String("file", w.path), zap.Int("entries", len(w.records)))
-	}
+    var d warmDisk
+    if err := gob.NewDecoder(bufio.NewReader(f)).Decode(&d); err != nil {
+        w.warn("failed to decode warm cache; starting empty", zap.Error(err))
+        return
+    }
+    now := time.Now()
+    for k, e := range d.Entries {
+        if e.ExpirationTime.IsZero() || e.ExpirationTime.After(now) {
+            w.entries[k] = e
+            w.inner.Store(k, append([]byte(nil), e.Value...), e.StoredTime, e.ExpirationTime)
+        }
+    }
+    w.info("loaded warm cache", zap.Int("entries", len(w.entries)))
 }
 
-func (w *warmBackend) dump() {
-	if w.path == "" {
-		return
-	}
+func (w *warmBackend) snapshot() {
+    if w.path == "" { return }
+    w.mu.RLock()
+    now := time.Now()
+    entries := make(map[string]warmEntry, len(w.entries))
+    for k, e := range w.entries {
+        if e.ExpirationTime.IsZero() || e.ExpirationTime.After(now) {
+            e.Value = append([]byte(nil), e.Value...)
+            entries[k] = e
+        }
+    }
+    w.mu.RUnlock()
 
-	now := time.Now()
-	w.mu.RLock()
-	records := make(map[string]warmRecord, len(w.records))
-	for key, r := range w.records {
-		if r.ExpirationTime.After(now) && len(r.Value) > 0 {
-			records[key] = warmRecord{
-				Value:          append([]byte(nil), r.Value...),
-				StoredTime:     r.StoredTime,
-				ExpirationTime: r.ExpirationTime,
-			}
-		}
-	}
-	w.mu.RUnlock()
-
-	if err := os.MkdirAll(filepath.Dir(w.path), 0755); err != nil {
-		if w.log != nil {
-			w.log.Warn("warm cache mkdir failed", zap.String("file", w.path), zap.Error(err))
-		}
-		return
-	}
-
-	tmp := w.path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		if w.log != nil {
-			w.log.Warn("warm cache dump create failed", zap.String("file", w.path), zap.Error(err))
-		}
-		return
-	}
-	encErr := gob.NewEncoder(f).Encode(records)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if encErr != nil || syncErr != nil || closeErr != nil {
-		_ = os.Remove(tmp)
-		if w.log != nil {
-			w.log.Warn("warm cache dump failed", zap.String("file", w.path), zap.Errors("errors", []error{encErr, syncErr, closeErr}))
-		}
-		return
-	}
-	if err := os.Rename(tmp, w.path); err != nil {
-		_ = os.Remove(tmp)
-		if w.log != nil {
-			w.log.Warn("warm cache dump rename failed", zap.String("file", w.path), zap.Error(err))
-		}
-		return
-	}
-	if w.log != nil {
-		w.log.Info("warm cache dumped", zap.String("file", w.path), zap.Int("entries", len(records)))
-	}
+    if err := os.MkdirAll(filepath.Dir(w.path), 0755); err != nil {
+        w.warn("failed to create warm cache directory", zap.Error(err)); return
+    }
+    tmp := w.path + ".tmp"
+    f, err := os.Create(tmp)
+    if err != nil { w.warn("failed to create warm cache snapshot", zap.Error(err)); return }
+    encErr := gob.NewEncoder(bufio.NewWriter(f)).Encode(warmDisk{Entries: entries})
+    if encErr == nil { encErr = f.Sync() }
+    closeErr := f.Close()
+    if encErr == nil { encErr = closeErr }
+    if encErr != nil {
+        _ = os.Remove(tmp)
+        w.warn("failed to write warm cache snapshot", zap.Error(encErr)); return
+    }
+    if err := os.Rename(tmp, w.path); err != nil {
+        _ = os.Remove(tmp)
+        w.warn("failed to install warm cache snapshot", zap.Error(err)); return
+    }
+    w.info("saved warm cache", zap.Int("entries", len(entries)))
 }
+
+func (w *warmBackend) warn(msg string, fields ...zap.Field) { if w.logger != nil { w.logger.Warn(msg, fields...) } }
+func (w *warmBackend) info(msg string, fields ...zap.Field) { if w.logger != nil { w.logger.Info(msg, fields...) } }

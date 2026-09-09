@@ -7,10 +7,19 @@ set -eu
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
 : "${CACHE_DUMP_INTERVAL:=600}"
 
-case "${PORT}" in ''|*[!0-9]*) echo "Invalid PORT: ${PORT}" >&2; exit 1 ;; esac
-case "${CACHE_SIZE}" in ''|*[!0-9]*) echo "Invalid CACHE_SIZE: ${CACHE_SIZE}" >&2; exit 1 ;; esac
-case "${CACHE_DUMP_INTERVAL}" in ''|*[!0-9]*) echo "Invalid CACHE_DUMP_INTERVAL: ${CACHE_DUMP_INTERVAL}" >&2; exit 1 ;; esac
-case "${DOH_PATH}" in /*) ;; *) echo "DOH_PATH must start with /" >&2; exit 1 ;; esac
+case "${PORT}" in
+  ''|*[!0-9]*) echo "Invalid PORT: ${PORT}" >&2; exit 1 ;;
+esac
+case "${CACHE_SIZE}" in
+  ''|*[!0-9]*) echo "Invalid CACHE_SIZE: ${CACHE_SIZE}" >&2; exit 1 ;;
+esac
+case "${CACHE_DUMP_INTERVAL}" in
+  ''|*[!0-9]*) echo "Invalid CACHE_DUMP_INTERVAL: ${CACHE_DUMP_INTERVAL}" >&2; exit 1 ;;
+esac
+case "${DOH_PATH}" in
+  /*) ;;
+  *) echo "DOH_PATH must start with /" >&2; exit 1 ;;
+esac
 
 sed_escape_replacement() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
@@ -22,7 +31,12 @@ CACHE_SIZE_ESCAPED=$(sed_escape_replacement "${CACHE_SIZE}")
 CACHE_DUMP_FILE_ESCAPED=$(sed_escape_replacement "${CACHE_DUMP_FILE}")
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "${CACHE_DUMP_INTERVAL}")
 
-mkdir -p "$(dirname "${CACHE_DUMP_FILE}")"
+# Native MosDNS cache snapshots are stored on local disk for warm starts.
+# Failure to create the directory/file must not prevent DNS from starting.
+CACHE_DIR=$(dirname "${CACHE_DUMP_FILE}")
+if ! mkdir -p "${CACHE_DIR}" 2>/dev/null; then
+  echo "Warning: unable to create cache directory ${CACHE_DIR}; continuing without disk persistence" >&2
+fi
 
 sed -i \
   -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g" \
@@ -32,10 +46,9 @@ sed -i \
   -e "s|CACHE_DUMP_INTERVAL_PLACEHOLDER|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
   /etc/mosdns/config.yaml
 
-echo "=== MosDNS custom runtime ==="
+echo "=== MosDNS runtime version ==="
 mosdns version
-echo "RAM cache: ${CACHE_SIZE} entries"
-echo "Disk warm-cache: ${CACHE_DUMP_FILE} every ${CACHE_DUMP_INTERVAL}s"
 echo "================================"
+echo "Cache: RAM ${CACHE_SIZE} entries + disk snapshot ${CACHE_DUMP_FILE} every ${CACHE_DUMP_INTERVAL}s"
 
 exec mosdns start -d /etc/mosdns
