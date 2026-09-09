@@ -1,4 +1,4 @@
-FROM irinesistiana/mosdns:v4.5.3
+FROM irinesistiana/mosdns@sha256:db2db6c7cdce
 
 WORKDIR /etc/mosdns
 

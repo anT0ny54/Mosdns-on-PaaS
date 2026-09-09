@@ -1,57 +1,43 @@
-# MosDNS Public DoH for Koyeb (v4.5.3)
+# MosDNS v4.5.3 — Koyeb Public DoH
 
-Lightweight public DNS-over-HTTPS resolver optimized for a small Koyeb instance (512 MB RAM, 0.1 vCPU, 2 GB SSD).
+Lightweight public DNS-over-HTTPS resolver designed for Koyeb's small instance limits.
 
-## Design
+## Current deployment profile
 
-- MosDNS **v4.5.3**
-- Public DoH endpoint; no authentication
-- 32,768-entry RAM cache by default
-- Native MosDNS cache snapshot to local SSD every 5 minutes
-- Three redundant HaGeZi DoH upstreams
-- Per-client abuse guard: 20 QPS per client IP
-- No SQLite, BIND, dnsmasq, nginx, or additional resident service
+- MosDNS: **v4.5.3**
+- Docker image: pinned to the official linux/amd64 v4.5.3 digest
+- DoH: `/dns-query`
+- Port: Koyeb `$PORT`
+- Cache: 32,768 entries in RAM
+- Cache persistence: **disabled in this build**
+- Public resolver protection: `client_limiter`, 20 QPS/client
+- Upstreams: HaGeZi Root / Wurzn / Juuri DoH
+- No SQLite
+- No BIND
+- No dnsmasq
+- No nginx
+- No additional resident services
 
-The SSD cache is a **warm-start snapshot**, not durable storage. If Koyeb replaces the instance and the file disappears, MosDNS simply starts with an empty RAM cache and continues normally.
+## Why disk cache is disabled
 
-## Public resolver abuse protection
+The deployed service previously failed during cache initialization with:
 
-The endpoint is intentionally public. The `client_limiter` plugin is only a lightweight resource-protection mechanism. It is not DDoS protection.
+`invalid keys: dump_file, dump_interval`
 
-MosDNS v4.5.3 provides `client_limiter` with `max_qps`, `v4_mask`, and `v6_mask`; requests over the configured limit are returned as `REFUSED`. The v4.5.3 implementation is the reason this project uses `client_limiter` rather than the newer v5 `rate_limiter` plugin.
+Although MosDNS v4.5.3 documentation/source examples include these cache options, this build intentionally removes them so the first deployment can be validated cleanly. The entrypoint prints `mosdns version` before starting.
 
-Default:
-
-```yaml
-max_qps: 20
-v4_mask: 32
-v6_mask: 48
-```
-
-If your public traffic is legitimate but gets limited, increase `max_qps` carefully. If the service receives abusive traffic, use Koyeb/network-level controls as the stronger mitigation.
+After a successful deployment, disk-backed cache persistence can be tested separately without mixing it with the initial startup problem.
 
 ## Environment variables
 
-- `PORT` — HTTP listener port; default `8080`
-- `DOH_PATH` — public DoH path; default `/dns-query`
-- `CACHE_SIZE` — RAM cache entries; default `32768`
-- `CACHE_DUMP_FILE` — local snapshot path; default `/var/cache/mosdns/cache.dump`
-- `CACHE_DUMP_INTERVAL` — snapshot interval in seconds; default `300`
+- `PORT` — defaults to `8080`; Koyeb should provide its assigned port.
+- `DOH_PATH` — defaults to `/dns-query`.
+- `CACHE_SIZE` — defaults to `32768`.
 
-## Why v4.5.3?
+## Public resolver warning
 
-This project intentionally stays on MosDNS v4.5.3 because the original deployment configuration is written for the v4 plugin/configuration model. MosDNS v5 changes several plugin names and configuration structures. Mixing v5 configuration into a v4 image can cause startup failures.
+This is intentionally public DoH. `client_limiter` is basic abuse protection and is not DDoS protection, authentication, or a substitute for upstream/network controls.
 
-## Deployment
+## Health check
 
-Build/deploy the repository with the included Dockerfile. Koyeb should provide `PORT` automatically; leave it unset unless you need a custom port.
-
-After deployment, the public endpoint is:
-
-`https://YOUR-KOYEB-DOMAIN${DOH_PATH}`
-
-## Notes
-
-This service is deliberately public. Do not treat an obscure URL path as authentication.
-
-The cache snapshot is best-effort. Local PaaS storage can disappear when an instance is replaced.
+Use the Koyeb HTTP health check against `/dns-query` only if your Koyeb setup supports the required DoH request semantics. Otherwise use the service's TCP/HTTP listener check as appropriate.
