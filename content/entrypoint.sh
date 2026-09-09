@@ -4,12 +4,17 @@ set -eu
 : "${PORT:=8080}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=32768}"
+: "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
+: "${CACHE_DUMP_INTERVAL:=600}"
 
 case "${PORT}" in
   ''|*[!0-9]*) echo "Invalid PORT: ${PORT}" >&2; exit 1 ;;
 esac
 case "${CACHE_SIZE}" in
   ''|*[!0-9]*) echo "Invalid CACHE_SIZE: ${CACHE_SIZE}" >&2; exit 1 ;;
+esac
+case "${CACHE_DUMP_INTERVAL}" in
+  ''|*[!0-9]*) echo "Invalid CACHE_DUMP_INTERVAL: ${CACHE_DUMP_INTERVAL}" >&2; exit 1 ;;
 esac
 case "${DOH_PATH}" in
   /*) ;;
@@ -23,10 +28,27 @@ sed_escape_replacement() {
 PORT_ESCAPED=$(sed_escape_replacement "${PORT}")
 DOH_PATH_ESCAPED=$(sed_escape_replacement "${DOH_PATH}")
 CACHE_SIZE_ESCAPED=$(sed_escape_replacement "${CACHE_SIZE}")
+CACHE_DUMP_FILE_ESCAPED=$(sed_escape_replacement "${CACHE_DUMP_FILE}")
+CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "${CACHE_DUMP_INTERVAL}")
 
-sed -i   -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g"   -e "s|PATH_PLACEHOLDER|${DOH_PATH_ESCAPED}|g"   -e "s|CACHE_SIZE_PLACEHOLDER|${CACHE_SIZE_ESCAPED}|g"   /etc/mosdns/config.yaml
+# Native MosDNS cache snapshots are stored on local disk for warm starts.
+# Failure to create the directory/file must not prevent DNS from starting.
+CACHE_DIR=$(dirname "${CACHE_DUMP_FILE}")
+if ! mkdir -p "${CACHE_DIR}" 2>/dev/null; then
+  echo "Warning: unable to create cache directory ${CACHE_DIR}; continuing without disk persistence" >&2
+fi
 
-echo "Starting MosDNS:"
-mosdns version || true
+sed -i \
+  -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g" \
+  -e "s|PATH_PLACEHOLDER|${DOH_PATH_ESCAPED}|g" \
+  -e "s|CACHE_SIZE_PLACEHOLDER|${CACHE_SIZE_ESCAPED}|g" \
+  -e "s|CACHE_DUMP_FILE_PLACEHOLDER|${CACHE_DUMP_FILE_ESCAPED}|g" \
+  -e "s|CACHE_DUMP_INTERVAL_PLACEHOLDER|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
+  /etc/mosdns/config.yaml
+
+echo "=== MosDNS runtime version ==="
+mosdns version
+echo "================================"
+echo "Cache: RAM ${CACHE_SIZE} entries + disk snapshot ${CACHE_DUMP_FILE} every ${CACHE_DUMP_INTERVAL}s"
 
 exec mosdns start -d /etc/mosdns

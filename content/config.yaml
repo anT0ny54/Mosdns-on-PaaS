@@ -10,15 +10,16 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
-  # RAM-only cache for the first clean deployment.
-  # Disk persistence is intentionally disabled until the runtime binary
-  # is confirmed and the service is healthy.
+  # RAM cache + native MosDNS v4.5.3 disk snapshot for warm starts.
+  # The dump is optional: DNS continues to work if the file is missing or unusable.
   - tag: mem_cache
     type: cache
     args:
       size: CACHE_SIZE_PLACEHOLDER
       lazy_cache_ttl: 86400
       lazy_cache_reply_ttl: 30
+      dump_file: CACHE_DUMP_FILE_PLACEHOLDER
+      dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
 
   - tag: forward_upstream
     type: fast_forward
