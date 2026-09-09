@@ -1,11 +1,9 @@
 .git
 .github
-*.md
+.gitignore
 README_chs.md
-Dockerfile*
-compose*.yml
+LICENSE
+docker-compose.yaml
 fly.toml
 heroku.yml
 app.json
-*.zip
-*.tar.gz

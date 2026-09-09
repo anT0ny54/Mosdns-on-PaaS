@@ -1,33 +1,24 @@
-# MosDNS v5.3.4 — Koyeb Optimized DoH
+# MosDNS on Koyeb
 
-A minimal MosDNS v5.3.4 DNS-over-HTTPS forwarder optimized for Koyeb.
+Minimal Koyeb-ready MosDNS v4 deployment.
 
 ## Features
 
-- MosDNS v5.3.4
+- MosDNS v4.5.3
+- DNS-over-HTTPS (DoH) service
+- Koyeb `PORT` is used automatically
+- Custom `DOH_PATH` can be set at runtime
 - No GeoIP/Geosite downloads
-- No unnecessary PaaS-specific files
-- Three Hagezi DoH upstreams:
-  - `https://root.hagezi.org/dns-query`
-  - `https://wurzn.hagezi.org/dns-query`
-  - `https://juuri.hagezi.org/dns-query`
-- `trusted: true` and `enable_pipeline: true` on every upstream
-- 40,960-entry in-memory cache
-- Lazy cache for up to 3 days
-- Koyeb `PORT` support
-- Configurable `DOH_PATH`
+- No geodata files
+- No Heroku/Fly/Railway-specific deployment files
+- Hagezi DoH upstreams with pipelining enabled
+- Small in-memory cache
 
 ## Koyeb deployment
 
-Deploy the repository with the **Dockerfile** builder.
+Deploy this repository with the **Dockerfile** builder.
 
-Expose one public web port:
-
-- Port: `8080` (or the value you set as `PORT`)
-- Protocol: `HTTP`
-- Route: `/`
-
-Koyeb automatically provides the `PORT` environment variable for Web Services. The container also defaults to `8080` if `PORT` is not supplied.
+Expose the container port as HTTP. Koyeb Web Services provide `PORT` automatically; if it is not set explicitly, Koyeb uses the lowest exposed port. The Dockerfile exposes port 8080, so the service normally uses port 8080.
 
 Recommended environment variable:
 
@@ -35,36 +26,40 @@ Recommended environment variable:
 DOH_PATH=/dns-query
 ```
 
-For additional protection against unwanted public use, choose a private/random path, for example:
+For a custom path, for example:
 
 ```text
-DOH_PATH=/dns-query
+DOH_PATH=/my-secret-dns
 ```
 
-## Health check
+Keep the path private to reduce abuse of a public DoH endpoint.
 
-The default Koyeb TCP health check is sufficient because MosDNS listens on the exposed HTTP port. No separate health endpoint is required.
+### Koyeb CLI example
+
+```bash
+koyeb app init mosdns   --git github.com/YOUR_USERNAME/YOUR_REPOSITORY   --git-branch main   --git-builder docker   --ports 8080:http   --routes /:8080   --env DOH_PATH=/dns-query   --checks 8080:tcp
+```
+
+Koyeb's default TCP health check is appropriate for this service because the DoH endpoint is not a normal web page.
 
 ## DoH endpoint
 
-After deployment, the DoH endpoint is:
+After deployment:
 
 ```text
-https://YOUR-SERVICE.koyeb.app/dns-query
+https://YOUR-KOYEB-DOMAIN/dns-query
 ```
 
-If you changed `DOH_PATH`, replace `/dns-query` with your configured path.
+## Upstreams
 
-## Project files
+The configuration uses:
 
-```text
-.
-├── .dockerignore
-├── .gitignore
-├── Dockerfile
-├── LICENSE
-├── README.md
-└── content
-    ├── config.yaml
-    └── entrypoint.sh
-```
+- `https://root.hagezi.org/dns-query`
+- `https://wurzn.hagezi.org/dns-query`
+- `https://juuri.hagezi.org/dns-query`
+
+All are configured as trusted upstreams with `enable_pipeline: true`.
+
+## Notes
+
+This project is intentionally kept focused on Koyeb. The original multi-PaaS deployment files and GeoIP/Geosite installation logic have been removed.
