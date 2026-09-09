@@ -2,16 +2,18 @@ log:
   level: warn
 
 plugins:
-  # Public DoH abuse protection. This is rate limiting, not authentication.
+  # Per-client limiter. This protects the public DoH endpoint without adding
+  # another resident process or large state table.
   - tag: client_limit
     type: client_limiter
     args:
-      max_qps: 20
+      max_qps: MAX_QPS_PLACEHOLDER
       v4_mask: 32
       v6_mask: 48
 
-  # RAM cache + native MosDNS v4.5.3 disk snapshot for warm starts.
-  # The dump is optional: DNS continues to work if the file is missing or unusable.
+  # Hot RAM cache + bounded warm-start snapshot. The disk copy is an
+  # optimization for graceful rotations/restarts; DNS operation never
+  # depends on it.
   - tag: mem_cache
     type: cache
     args:
@@ -21,17 +23,13 @@ plugins:
       dump_file: CACHE_DUMP_FILE_PLACEHOLDER
       dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
 
+  # Exactly one upstream is active at a time. The supervisor changes this
+  # endpoint on rotation so every query uses only the selected resolver.
   - tag: forward_upstream
     type: fast_forward
     args:
       upstream:
-        - addr: https://root.hagezi.org/dns-query
-          trusted: true
-          enable_pipeline: true
-        - addr: https://wurzn.hagezi.org/dns-query
-          trusted: true
-          enable_pipeline: true
-        - addr: https://juuri.hagezi.org/dns-query
+        - addr: HAGEZI_UPSTREAM_PLACEHOLDER
           trusted: true
           enable_pipeline: true
 
@@ -47,7 +45,7 @@ plugins:
 
 servers:
   - exec: forward
-    timeout: 5
+    timeout: 3
     listeners:
       - protocol: http
         addr: ":PORT_PLACEHOLDER"
