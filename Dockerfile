@@ -1,7 +1,7 @@
 # Custom MosDNS v4.5.3 build. Go 1.19 is required by v4.5.3 dependencies.
-FROM --platform=linux/amd64 golang:1.19-bullseye AS build
+FROM --platform=linux/amd64 golang:1.19-alpine AS build
 WORKDIR /src
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache git ca-certificates perl
 RUN git clone --depth 1 --branch v4.5.3 https://github.com/IrineSistiana/mosdns.git .
 COPY content/warm_backend.go /src/plugin/executable/cache/warm_backend.go
 RUN perl -0pi -e 's/(WhenHit\s+string\s+`yaml:"when_hit"`)/$1\n\tDumpFile          string `yaml:"dump_file"`\n\tDumpInterval      int    `yaml:"dump_interval"`/' /src/plugin/executable/cache/cache.go \
