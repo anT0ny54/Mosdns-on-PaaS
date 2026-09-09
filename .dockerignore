@@ -1,4 +1,9 @@
 .git
 .github
-*.zip
-README.md
+.gitignore
+README_chs.md
+LICENSE
+docker-compose.yaml
+fly.toml
+heroku.yml
+app.json
