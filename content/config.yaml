@@ -1,19 +1,15 @@
-# MosDNS v5.3.4 - Koyeb optimized DoH forwarder
-# No GeoIP/Geosite data is required.
-
 log:
-  level: warn
+  level: info
 
 plugins:
-  # In-memory DNS cache. 40960 entries is a good balance for a small Koyeb instance.
-  - tag: cache
+  - tag: mem_cache
     type: cache
     args:
       size: 40960
       lazy_cache_ttl: 259200
+      lazy_cache_reply_ttl: 30
 
-  # Three Hagezi DoH upstreams. All are trusted and use connection pipelining.
-  - tag: hagezi
+  - tag: forward_upstream
     type: fast_forward
     args:
       upstream:
@@ -27,23 +23,19 @@ plugins:
           trusted: true
           enable_pipeline: true
 
-  # Main request pipeline.
-  - tag: main
+  - tag: forward
     type: sequence
     args:
-      - exec: cache
-      - matches:
-          - has_resp
-        exec: accept
-      - exec: $hagezi
+      exec:
+        - mem_cache
+        - forward_upstream
+        - _return
 
-  # Koyeb exposes the HTTP port and supplies PORT automatically.
-  - tag: doh
-    type: http_server
-    args:
-      entries:
-        - path: /dns-query
-          exec: $main
-      src_ip_header: X-Forwarded-For
-      listen: 0.0.0.0:8080
-      idle_timeout: 30
+servers:
+  - exec: forward
+    timeout: 5
+    listeners:
+      - protocol: http
+        addr: ":PORT_PLACEHOLDER"
+        url_path: "PATH_PLACEHOLDER"
+        get_user_ip_from_header: "X-Forwarded-For"

@@ -1,19 +1,11 @@
 #!/bin/sh
 set -eu
 
-CONFIG=/etc/mosdns/config.yaml
-PORT="${PORT:-8080}"
-DOH_PATH="${DOH_PATH:-/dns-query}"
+: "${PORT:=8080}"
+: "${DOH_PATH:=/dns-query}"
 
-case "$DOH_PATH" in
-  /*) ;;
-  *) DOH_PATH="/$DOH_PATH" ;;
-esac
-
-# Escape values before inserting them into YAML.
-ESCAPED_PORT=$(printf '%s' "$PORT" | sed 's/[\\&|]/\\&/g')
-ESCAPED_PATH=$(printf '%s' "$DOH_PATH" | sed 's/[\\&|]/\\&/g')
-
-sed -i "s|0.0.0.0:8080|0.0.0.0:${ESCAPED_PORT}|; s|path: /dns-query|path: ${ESCAPED_PATH}|" "$CONFIG"
+# Generate the runtime listener from the Koyeb-provided PORT and
+# optional custom DoH path without modifying the image at build time.
+sed -i   -e "s|PORT_PLACEHOLDER|${PORT}|g"   -e "s|PATH_PLACEHOLDER|${DOH_PATH}|g"   /etc/mosdns/config.yaml
 
 exec mosdns start -d /etc/mosdns
