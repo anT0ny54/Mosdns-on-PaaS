@@ -349,3 +349,60 @@ If you find this project useful, donations are appreciated.
 
 See the repository's license file for licensing information.
 
+
+## Adaptive upstream health scoring
+
+The optimized build adds a tiny, statically linked `mosdns-probe` helper. At
+startup/rotation it sends a minimal DNS-over-HTTPS query to each configured
+upstream in parallel and ranks them by a simple health score:
+
+- healthy: measured request latency in milliseconds
+- failed: score `10000`, which pushes the endpoint to the end of the failover chain
+- in `rotate`/`random` mode, the selected healthy endpoint remains preferred so
+  rotation semantics are preserved without ignoring a dead resolver
+- in fixed-endpoint mode, the fixed endpoint remains first when healthy; if it
+  is down, the two healthy HaGeZi endpoints are tried first and the failed
+  fixed endpoint becomes the final fallback
+
+This is deliberately lightweight: the probe runs only at configuration
+rotation/restart rather than once per DNS query, so it adds no steady-state
+CPU cost to the request path.
+
+## Timeout and connection tuning
+
+The optimized defaults are:
+
+```text
+UPSTREAM_TIMEOUT=2
+UPSTREAM_IDLE_TIMEOUT=15
+SERVER_TIMEOUT=5
+HEALTH_TIMEOUT_MS=1200
+```
+
+The 2-second per-upstream timeout reduces long stalls while still allowing a
+normal DoH connection to complete. The 5-second server budget leaves enough
+time for sequential failover without making ordinary failures hang for the
+previous 3-second default. HTTP connection reuse is retained with a short
+15-second idle lifetime and one pooled connection per upstream, which keeps
+resident memory and idle sockets small on a 0.1-vCPU instance.
+
+## Cache / memory tuning
+
+The default RAM cache is reduced from 8192 to 4096 entries. This is a safer
+512-MiB baseline because DNS cache entries can vary substantially in memory
+cost. The warm snapshot remains bounded to the same cache size. The lazy cache
+window is 12 hours and the stale reply TTL is 20 seconds, reducing long-lived
+cache metadata while retaining useful warm-start behavior.
+
+Recommended starting environment:
+
+```text
+CACHE_SIZE=4096
+CACHE_DUMP_INTERVAL=900
+GOMEMLIMIT=384MiB
+MAX_QPS=20
+```
+
+If measurements show high cache churn, increase `CACHE_SIZE` to 8192 before
+increasing the Go memory limit. If memory pressure appears, keep 4096 or reduce
+it to 2048.
