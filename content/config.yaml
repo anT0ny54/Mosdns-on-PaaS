@@ -2,8 +2,6 @@ log:
   level: warn
 
 plugins:
-  # Per-client limiter. This protects the public DoH endpoint without adding
-  # another resident process or large state table.
   - tag: client_limit
     type: client_limiter
     args:
@@ -11,9 +9,7 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
-  # Hot RAM cache + bounded warm-start snapshot. The disk copy is an
-  # optimization for graceful rotations/restarts; DNS operation never
-  # depends on it.
+  # Hot RAM cache plus bounded warm-start snapshot.
   - tag: mem_cache
     type: cache
     args:
@@ -23,15 +19,54 @@ plugins:
       dump_file: CACHE_DUMP_FILE_PLACEHOLDER
       dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
 
-  # Exactly one upstream is active at a time. The supervisor changes this
-  # endpoint on rotation so every query uses only the selected resolver.
-  - tag: forward_upstream
+  # Three ordered upstream slots. The entrypoint rewrites their order so the
+  # selected upstream is always tried first, followed by the other two.
+  - tag: upstream_0
     type: fast_forward
     args:
       upstream:
-        - addr: HAGEZI_UPSTREAM_PLACEHOLDER
+        - addr: UPSTREAM_0_PLACEHOLDER
           trusted: true
           enable_pipeline: true
+
+  - tag: upstream_1
+    type: fast_forward
+    args:
+      upstream:
+        - addr: UPSTREAM_1_PLACEHOLDER
+          trusted: true
+          enable_pipeline: true
+
+  - tag: upstream_2
+    type: fast_forward
+    args:
+      upstream:
+        - addr: UPSTREAM_2_PLACEHOLDER
+          trusted: true
+          enable_pipeline: true
+
+  # Sequential failover:
+  #   1) upstream_0
+  #   2) upstream_1 if #1 fails
+  #   3) upstream_2 if #2 fails
+  #
+  # fast_fallback=1 makes the secondary start only after the primary fails
+  # (or after a 1 ms fallback threshold), rather than racing both upstreams.
+  - tag: sequential_failover
+    type: sequence
+    args:
+      exec:
+        - primary:
+            - upstream_0
+          secondary:
+            - primary:
+                - upstream_1
+              secondary:
+                - upstream_2
+              fast_fallback: 1
+              always_standby: false
+          fast_fallback: 1
+          always_standby: false
 
   - tag: forward
     type: sequence
@@ -40,7 +75,7 @@ plugins:
         - client_limit
         - _misc_optm
         - mem_cache
-        - forward_upstream
+        - sequential_failover
         - _return
 
 servers:
