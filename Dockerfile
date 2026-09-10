@@ -4,12 +4,13 @@ WORKDIR /src
 RUN apk add --no-cache git ca-certificates perl
 RUN git clone --depth 1 --branch v4.5.3 https://github.com/IrineSistiana/mosdns.git .
 COPY content/warm_backend.go /src/plugin/executable/cache/warm_backend.go
-COPY content/upstream_probe.go /src/upstream_probe.go
+RUN mkdir -p /src/probe
+COPY content/upstream_probe.go /src/probe/main.go
 RUN perl -0pi -e 's/(WhenHit\s+string\s+`yaml:"when_hit"`)/$1\n\tDumpFile          string `yaml:"dump_file"`\n\tDumpInterval      int    `yaml:"dump_interval"`/' /src/plugin/executable/cache/cache.go \
  && perl -0pi -e 's/c = mem_cache\.NewMemCache\(args\.Size, 0\)/c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())/' /src/plugin/executable/cache/cache.go \
  && gofmt -w /src/plugin/executable/cache/cache.go /src/plugin/executable/cache/warm_backend.go \
  && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/mosdns . \
- && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/mosdns-probe /src/upstream_probe.go \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/mosdns-probe ./probe \
  && /out/mosdns version
 
 FROM --platform=linux/amd64 alpine:3.22
