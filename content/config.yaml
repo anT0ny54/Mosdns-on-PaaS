@@ -9,25 +9,27 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
-  # Hot RAM cache plus bounded warm-start snapshot.
+  # Bounded hot cache. 4096 is a safer default for 512 MiB/0.1 vCPU;
+  # increase only after measuring hit rate and memory.
   - tag: mem_cache
     type: cache
     args:
       size: CACHE_SIZE_PLACEHOLDER
-      lazy_cache_ttl: 86400
-      lazy_cache_reply_ttl: 30
+      lazy_cache_ttl: 43200
+      lazy_cache_reply_ttl: 20
       dump_file: CACHE_DUMP_FILE_PLACEHOLDER
       dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
 
-  # Three ordered upstream slots. The entrypoint rewrites their order so the
-  # selected upstream is always tried first, followed by the other two.
   - tag: upstream_0
     type: fast_forward
     args:
       upstream:
         - addr: UPSTREAM_0_PLACEHOLDER
           trusted: true
+          timeout: UPSTREAM_TIMEOUT_PLACEHOLDER
+          idle_timeout: UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER
           enable_pipeline: true
+          max_conns: 1
 
   - tag: upstream_1
     type: fast_forward
@@ -35,7 +37,10 @@ plugins:
       upstream:
         - addr: UPSTREAM_1_PLACEHOLDER
           trusted: true
+          timeout: UPSTREAM_TIMEOUT_PLACEHOLDER
+          idle_timeout: UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER
           enable_pipeline: true
+          max_conns: 1
 
   - tag: upstream_2
     type: fast_forward
@@ -43,15 +48,12 @@ plugins:
       upstream:
         - addr: UPSTREAM_2_PLACEHOLDER
           trusted: true
+          timeout: UPSTREAM_TIMEOUT_PLACEHOLDER
+          idle_timeout: UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER
           enable_pipeline: true
+          max_conns: 1
 
-  # Sequential failover:
-  #   1) upstream_0
-  #   2) upstream_1 if #1 fails
-  #   3) upstream_2 if #2 fails
-  #
-  # fast_fallback=1 makes the secondary start only after the primary fails
-  # (or after a 1 ms fallback threshold), rather than racing both upstreams.
+  # Strictly sequential failover. No parallel upstream fan-out on the hot path.
   - tag: sequential_failover
     type: sequence
     args:
@@ -63,9 +65,9 @@ plugins:
                 - upstream_1
               secondary:
                 - upstream_2
-              fast_fallback: 1
+              fast_fallback: 0
               always_standby: false
-          fast_fallback: 1
+          fast_fallback: 0
           always_standby: false
 
   - tag: forward
@@ -80,7 +82,7 @@ plugins:
 
 servers:
   - exec: forward
-    timeout: 3
+    timeout: SERVER_TIMEOUT_PLACEHOLDER
     listeners:
       - protocol: http
         addr: ":PORT_PLACEHOLDER"
