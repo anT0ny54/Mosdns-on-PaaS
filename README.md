@@ -8,6 +8,7 @@ The configuration is intentionally conservative:
 
 - MosDNS v4.5.3
 - one active DoH upstream at a time
+- per-query sequential failover across all three HaGeZi endpoints
 - three HaGeZi endpoints rotated every 30 minutes by default
 - deterministic round-robin rotation (`rotate`) so all three endpoints are used without random repeats
 - DNS pipelining enabled
@@ -36,6 +37,28 @@ The warm-cache file is only a warm-start optimization. Koyeb local storage is ep
 | `ROTATE_INTERVAL` | `1800` | Rotation interval in seconds; minimum 60 |
 | `GOMEMLIMIT` | `384MiB` | Go runtime memory limit |
 
+## Sequential failover
+
+Each running MosDNS instance has an ordered upstream chain:
+
+```text
+selected upstream -> second upstream -> third upstream
+```
+
+The selected upstream is tried first. The second upstream is started only when
+the first fails, and the third is tried only when the second also fails. This is
+implemented with nested v4.5.3 `fallback` execution blocks rather than sending
+all three queries in parallel.
+
+This matters because `fast_forward` with multiple upstreams is a parallel
+mechanism in MosDNS v4.5.3; it is not a sequential failover mechanism. The
+project therefore uses three one-upstream `fast_forward` plugins and composes
+them with nested fallback nodes.
+
+A successful upstream stops the chain, so healthy queries normally use only
+one upstream. The failover path is primarily for transport/server failures.
+A valid DNS response such as NXDOMAIN is not treated as a transport failure.
+
 ## Three-upstream rotation
 
 `HAGEZI_UPSTREAM=rotate` uses these three endpoints in order:
@@ -46,7 +69,7 @@ The warm-cache file is only a warm-start optimization. Koyeb local storage is ep
 
 After the third endpoint, it returns to the first. This is preferable to pure random selection when the requirement is to continuously rotate among exactly three upstreams because random selection can choose the same endpoint repeatedly.
 
-The active MosDNS process is gracefully stopped at each rotation. The warm-cache backend writes a final bounded snapshot during shutdown and the next process reloads it. The RAM cache therefore does not intentionally start empty after a normal rotation, provided the local cache file is still present.
+The active MosDNS process is gracefully stopped at each rotation. The next process rebuilds the failover order with the newly selected upstream first. The warm-cache backend writes a final bounded snapshot during shutdown and the next process reloads it. The RAM cache therefore does not intentionally start empty after a normal rotation, provided the local cache file is still present.
 
 If you prefer random selection, set:
 
