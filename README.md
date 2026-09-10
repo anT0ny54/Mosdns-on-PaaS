@@ -406,3 +406,49 @@ MAX_QPS=20
 If measurements show high cache churn, increase `CACHE_SIZE` to 8192 before
 increasing the Go memory limit. If memory pressure appears, keep 4096 or reduce
 it to 2048.
+
+## Adaptive v5
+
+This build adds failure-aware, smoothed upstream selection while preserving strictly sequential failover.
+
+- EWMA latency smoothing prevents one noisy probe from causing unnecessary switching.
+- Consecutive failures add a strong score penalty and move failed endpoints behind healthy ones.
+- Hysteresis prevents upstream churn unless the alternative is materially better.
+- The selected failover order is now the same order actually written into the runtime MosDNS config.
+- `rotate` remains adaptive: it rotates away from the current endpoint when another endpoint is meaningfully better, rather than blindly switching every interval.
+- `random` only randomizes among near-equal healthy endpoints.
+- Health state is kept in `/tmp/mosdns-upstream-state.tsv` and remains bounded to the small configured upstream set.
+- No unsupported `timeout` field is added to `fast_forward`; MosDNS v4.5.3 uses its built-in transport timeout behavior.
+
+Tunable environment variables: `HEALTH_EWMA_ALPHA` (default `0.35`), `HEALTH_FAILURE_PENALTY_MS` (default `1500`), `HEALTH_SWITCH_MARGIN_PCT` (default `0.20`), and `HEALTH_SWITCH_MARGIN_MS` (default `25`).
+
+## Free DNS services
+
+The following public DNS-over-HTTPS services use HaGeZi blocklists, including Multi Pro and TIF.
+
+| Service | DNS-over-HTTPS endpoint |
+| --- | --- |
+| Recommended | `https://freedns.koyeb.app/dns-query` |
+| Recommended | `https://freedns-six.vercel.app/api/doh/dns-query` |
+| Alternative | `https://dnssix.netlify.app/api/doh/dns-query` |
+
+Public services may have usage limits, performance differences, or availability changes. Use them at your own discretion.
+
+## Bandwidth Hero Server
+
+[Bandwidth Hero Server](https://github.com/ayastreb/bandwidth-hero) is a lightweight image optimization proxy designed to reduce bandwidth usage and improve browsing performance.
+
+It fetches remote images, compresses them on the fly, and delivers optimized versions to clients.
+
+**Live demo:** [bhserv.netlify.app](https://bhserv.netlify.app/)
+
+## Supporting the project
+
+If you find this project useful, donations are appreciated.
+
+**Bitcoin:**
+
+```text
+1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
+```
+
