@@ -23,7 +23,6 @@ plugins:
   - tag: upstream_0
     type: fast_forward
     args:
-      timeout: UPSTREAM_TIMEOUT_PLACEHOLDER
       upstream:
         - addr: UPSTREAM_0_PLACEHOLDER
           trusted: true
@@ -34,7 +33,6 @@ plugins:
   - tag: upstream_1
     type: fast_forward
     args:
-      timeout: UPSTREAM_TIMEOUT_PLACEHOLDER
       upstream:
         - addr: UPSTREAM_1_PLACEHOLDER
           trusted: true
@@ -45,7 +43,6 @@ plugins:
   - tag: upstream_2
     type: fast_forward
     args:
-      timeout: UPSTREAM_TIMEOUT_PLACEHOLDER
       upstream:
         - addr: UPSTREAM_2_PLACEHOLDER
           trusted: true

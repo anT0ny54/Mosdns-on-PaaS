@@ -9,7 +9,6 @@ set -eu
 : "${MAX_QPS:=20}"
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${ROTATE_INTERVAL:=900}"
-: "${UPSTREAM_TIMEOUT:=2}"
 : "${UPSTREAM_IDLE_TIMEOUT:=15}"
 : "${SERVER_TIMEOUT:=5}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
@@ -27,7 +26,6 @@ validate_uint CACHE_SIZE "$CACHE_SIZE"
 validate_uint CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL"
 validate_uint MAX_QPS "$MAX_QPS"
 validate_uint ROTATE_INTERVAL "$ROTATE_INTERVAL"
-validate_uint UPSTREAM_TIMEOUT "$UPSTREAM_TIMEOUT"
 validate_uint UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT"
 validate_uint SERVER_TIMEOUT "$SERVER_TIMEOUT"
 validate_uint HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS"
@@ -36,8 +34,6 @@ validate_uint HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS"
 [ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
 [ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
 [ "$ROTATE_INTERVAL" -ge 60 ] || { echo "ROTATE_INTERVAL must be at least 60 seconds" >&2; exit 1; }
-[ "$UPSTREAM_TIMEOUT" -ge 1 ] || { echo "UPSTREAM_TIMEOUT must be at least 1 second" >&2; exit 1; }
-[ "$SERVER_TIMEOUT" -gt "$UPSTREAM_TIMEOUT" ] || { echo "SERVER_TIMEOUT must be greater than UPSTREAM_TIMEOUT" >&2; exit 1; }
 
 case "$DOH_PATH" in
   /*) ;;
@@ -153,7 +149,6 @@ CACHE_SIZE_ESCAPED=$(sed_escape_replacement "$CACHE_SIZE")
 CACHE_DUMP_FILE_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_FILE")
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
 MAX_QPS_ESCAPED=$(sed_escape_replacement "$MAX_QPS")
-UPSTREAM_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_TIMEOUT")
 UPSTREAM_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
 
@@ -184,7 +179,7 @@ echo "======================"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Failover: sequential (selected -> next -> next)"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
-echo "Upstream timeout: ${UPSTREAM_TIMEOUT}s, idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
+echo "Upstream transport: MosDNS v4.5.3 fast_forward default request timeout; idle timeout ${UPSTREAM_IDLE_TIMEOUT}s"
 echo "Rotation: every ${ROTATE_INTERVAL}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 
@@ -203,7 +198,6 @@ while :; do
     -e "s|CACHE_DUMP_FILE_PLACEHOLDER|${CACHE_DUMP_FILE_ESCAPED}|g" \
     -e "s|CACHE_DUMP_INTERVAL_PLACEHOLDER|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
     -e "s|MAX_QPS_PLACEHOLDER|${MAX_QPS_ESCAPED}|g" \
-    -e "s|UPSTREAM_TIMEOUT_PLACEHOLDER|${UPSTREAM_TIMEOUT_ESCAPED}|g" \
     -e "s|UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
     -e "s|SERVER_TIMEOUT_PLACEHOLDER|${SERVER_TIMEOUT_ESCAPED}|g" \
     -e "s|UPSTREAM_0_PLACEHOLDER|${U0_ESCAPED}|g" \
