@@ -422,33 +422,3 @@ This build adds failure-aware, smoothed upstream selection while preserving stri
 
 Tunable environment variables: `HEALTH_EWMA_ALPHA` (default `0.35`), `HEALTH_FAILURE_PENALTY_MS` (default `1500`), `HEALTH_SWITCH_MARGIN_PCT` (default `0.20`), and `HEALTH_SWITCH_MARGIN_MS` (default `25`).
 
-## Free DNS services
-
-The following public DNS-over-HTTPS services use HaGeZi blocklists, including Multi Pro and TIF.
-
-| Service | DNS-over-HTTPS endpoint |
-| --- | --- |
-| Recommended | `https://freedns.koyeb.app/dns-query` |
-| Recommended | `https://freedns-six.vercel.app/api/doh/dns-query` |
-| Alternative | `https://dnssix.netlify.app/api/doh/dns-query` |
-
-Public services may have usage limits, performance differences, or availability changes. Use them at your own discretion.
-
-## Bandwidth Hero Server
-
-[Bandwidth Hero Server](https://github.com/ayastreb/bandwidth-hero) is a lightweight image optimization proxy designed to reduce bandwidth usage and improve browsing performance.
-
-It fetches remote images, compresses them on the fly, and delivers optimized versions to clients.
-
-**Live demo:** [bhserv.netlify.app](https://bhserv.netlify.app/)
-
-## Supporting the project
-
-If you find this project useful, donations are appreciated.
-
-**Bitcoin:**
-
-```text
-1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP
-```
-
