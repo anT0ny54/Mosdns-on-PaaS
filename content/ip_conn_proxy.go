@@ -115,13 +115,17 @@ func main() {
 		log.Fatal(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	// Never inherit HTTP(S)_PROXY from the Koyeb/container environment.
+	// The public DoH path must go directly to the private MosDNS listener;
+	// an ambient proxy can otherwise create an unexpected network path.
 	proxy.Transport = &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   16,
-		IdleConnTimeout:       120 * time.Second,
+		MaxConnsPerHost:       32,
+		IdleConnTimeout:       180 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -171,8 +175,8 @@ func main() {
 	srv := &http.Server{
 		Addr:              listenAddr,
 		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       180 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       300 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			state := lim.registerConn(c)

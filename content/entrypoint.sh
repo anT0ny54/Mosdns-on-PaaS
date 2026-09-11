@@ -22,7 +22,7 @@ set -eu
 : "${HEALTH_SWITCH_MARGIN_MS:=25}"
 : "${HEALTH_STATE_FILE:=/tmp/mosdns-upstream-state.tsv}"
 : "${GOMEMLIMIT:=384MiB}"
-: "${DOH_IDLE_TIMEOUT:=120}"
+: "${DOH_IDLE_TIMEOUT:=180}"
 : "${UPSTREAM_0_IP:=188.34.161.210}"
 : "${UPSTREAM_1_IP:=159.69.155.94}"
 : "${UPSTREAM_2_IP:=95.217.163.17}"
@@ -131,6 +131,7 @@ DOH_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$DOH_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
 CACHE_DIR=$(dirname "$CACHE_DUMP_FILE")
 mkdir -p "$CACHE_DIR" 2>/dev/null || echo "Warning: unable to create cache directory $CACHE_DIR" >&2
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy 2>/dev/null || true
 export GOMEMLIMIT
 
 TEMPLATE=/etc/mosdns/config.yaml
@@ -164,7 +165,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.7 (Cromite DoH-compatible GET/POST proxy + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
+echo "Build: stable-v7.8 (Cromite DoH-compatible GET/POST proxy + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
@@ -175,7 +176,8 @@ echo "Connection idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
 echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: disabled; Koyeb manages lifecycle"
-echo "Cromite/Firefox DoH compatibility: GET + POST application/dns-message"
+echo "Cromite/Firefox DoH compatibility: GET + POST application/dns-message
+echo "Firefox Max Protection target: ${DOH_PATH} (server-side plain DNS disabled)""
 echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
 echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
