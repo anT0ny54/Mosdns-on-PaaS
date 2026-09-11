@@ -31,7 +31,7 @@ RUN chmod 0755 ./entrypoint.sh \
  && chown -R mosdns:mosdns /etc/mosdns /var/cache/mosdns
 ENV PORT=8080
 ENV MOSDNS_BACKEND_PORT=18080
-ENV IP_CONN_LIMIT=16
+ENV IP_CONN_LIMIT=0
 ENV HEALTH_PATH=/health
 ENV DOH_PATH=/dns-query
 ENV GOMEMLIMIT=384MiB
