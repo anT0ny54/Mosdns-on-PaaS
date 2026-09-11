@@ -148,20 +148,19 @@ func (r *rateLimiter) allow(ip string, now time.Time) bool {
 }
 
 func clientIP(r *http.Request) string {
-	// Koyeb's edge normally provides the original client in X-Real-IP.
-	// Prefer it because it is a single address and cannot be confused with
-	// a client-supplied comma-separated chain. Fall back to the first valid
-	// X-Forwarded-For address for deployments where only XFF is provided.
-	if x := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(x) != nil {
-		return x
-	}
+	// Koyeb's public proxy supplies X-Forwarded-For. Use the first address,
+	// which is the original client when the proxy appends rather than replaces.
 	if x := r.Header.Get("X-Forwarded-For"); x != "" {
-		for _, part := range strings.Split(x, ",") {
-			ip := strings.TrimSpace(part)
+		parts := strings.Split(x, ",")
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
 			if net.ParseIP(ip) != nil {
 				return ip
 			}
 		}
+	}
+	if x := r.Header.Get("X-Real-IP"); net.ParseIP(strings.TrimSpace(x)) != nil {
+		return strings.TrimSpace(x)
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && net.ParseIP(host) != nil {
@@ -201,9 +200,9 @@ func main() {
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          12,
-		MaxIdleConnsPerHost:   8,
-		MaxConnsPerHost:       12,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
+		MaxConnsPerHost:       32,
 		IdleConnTimeout:       180 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -274,7 +273,7 @@ func main() {
 	srv := &http.Server{
 		Addr:              listenAddr,
 		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       300 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
