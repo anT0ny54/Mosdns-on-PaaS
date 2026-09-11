@@ -1,4 +1,4 @@
-# Custom MosDNS v4.5.3 build. Keep the v4.5.3 toolchain for compatibility.
+# MosDNS v4.5.3 stable Koyeb build. Long-running supervisor; no scheduled process rotation.
 FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates perl
