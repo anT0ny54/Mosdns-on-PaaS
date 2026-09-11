@@ -149,7 +149,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.4 (strict DoH-only upstreams + no plain-DNS listener + collision-proof templating + health + supervisor + per-IP limiter)"
+echo "Build: stable-v7.5 (strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle + per-IP limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
@@ -159,7 +159,7 @@ echo "Health model: EWMA alpha ${HEALTH_EWMA_ALPHA}, failure penalty ${HEALTH_FA
 echo "Connection idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
 echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
-echo "Automatic process restart: enabled; no scheduled rotation"
+echo "Automatic process restart: disabled; Koyeb manages lifecycle"
 echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
 echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
@@ -204,38 +204,8 @@ echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${MOSDNS_BACKE
 LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
 PROXY_PID=$!
 
-# Long-running supervisor. A crashed MosDNS process is restarted in-place
-# instead of terminating PID 1 and waiting for Koyeb to recreate the instance.
-# Exponential backoff avoids a CPU spin if a bad deployment/config is supplied.
-backoff=1
-while :; do
-  echo "Starting MosDNS..."
-  mosdns start -c "$RUNTIME_CONFIG" &
-  MOSDNS_PID=$!
-
-  if wait "$MOSDNS_PID"; then
-    status=0
-  else
-    status=$?
-  fi
-  MOSDNS_PID=
-
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-    echo "Limiter proxy exited; restarting it." >&2
-    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
-    PROXY_PID=$!
-  fi
-
-  if [ "$status" -eq 0 ]; then
-    echo "MosDNS exited normally; restarting in 2 seconds."
-    backoff=2
-  else
-    echo "MosDNS exited with status ${status}; restarting in ${backoff}s." >&2
-  fi
-
-  sleep "$backoff"
-  if [ "$backoff" -lt 30 ]; then
-    backoff=$((backoff * 2))
-    [ "$backoff" -gt 30 ] && backoff=30
-  fi
-done
+# Run MosDNS in the foreground. Koyeb is the process supervisor: if MosDNS exits,
+# the instance is recreated rather than hiding a crash behind an in-container
+# restart loop. This avoids silent restart cycles and makes failures visible.
+echo "Starting MosDNS in foreground..."
+exec mosdns start -c "$RUNTIME_CONFIG"
