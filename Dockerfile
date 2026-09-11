@@ -1,4 +1,4 @@
-# v7.5 stable build: placeholder-safe runtime config generation
+# v7.6 stable Cromite DoH build: placeholder-safe runtime config generation
 # MosDNS v4.5.3 stable Koyeb build. Foreground MosDNS; Koyeb-managed lifecycle; no in-container restart loop.
 FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 WORKDIR /src
@@ -31,7 +31,7 @@ RUN chmod 0755 ./entrypoint.sh \
  && chown -R mosdns:mosdns /etc/mosdns /var/cache/mosdns
 ENV PORT=8080
 ENV MOSDNS_BACKEND_PORT=18080
-ENV IP_CONN_LIMIT=4
+ENV IP_CONN_LIMIT=16
 ENV HEALTH_PATH=/health
 ENV DOH_PATH=/dns-query
 ENV GOMEMLIMIT=384MiB
