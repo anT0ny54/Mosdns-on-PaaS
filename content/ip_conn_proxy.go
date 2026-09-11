@@ -1,10 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -172,29 +169,19 @@ func main() {
 			http.Error(w, "per-IP connection limit exceeded", http.StatusTooManyRequests)
 			return
 		}
-		// Normalize RFC 8484 GET requests to POST before MosDNS. This avoids
-		// relying on version-specific GET handling in the v4.5.3 HTTP listener.
-		// Firefox may use GET or POST; both become the same wire-format request.
-		if r.Method == http.MethodGet {
-			dnsParam := r.URL.Query().Get("dns")
-			if dnsParam == "" {
-				http.Error(w, "missing dns parameter", http.StatusBadRequest)
-				return
-			}
-			dnsWire, err := base64.RawURLEncoding.DecodeString(dnsParam)
-			if err != nil || len(dnsWire) < 12 || len(dnsWire) > 65535 {
-				http.Error(w, "invalid dns message", http.StatusBadRequest)
-				return
-			}
-			r.Method = http.MethodPost
-			r.URL.RawQuery = ""
-			r.Body = io.NopCloser(bytes.NewReader(dnsWire))
-			r.ContentLength = int64(len(dnsWire))
-			r.Header.Set("Content-Type", "application/dns-message")
+		// IMPORTANT: keep RFC 8484 GET requests intact. MosDNS v4.5.3's HTTP
+		// listener implements the DoH GET form (dns=base64url) itself. Rewriting
+		// Firefox GET requests to POST here can break provider validation and is
+		// unnecessary. Only normalize the Accept header; preserve method, query,
+		// body, and Content-Type exactly as supplied by Firefox/Cromite.
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
-		// Firefox/DoH clients expect RFC 8484 media types. Normalize these
-		// headers on both GET and POST paths so the backend always sees a valid
-		// application/dns-message request.
+		if r.Method == http.MethodGet && r.URL.Query().Get("dns") == "" {
+			http.Error(w, "missing dns parameter", http.StatusBadRequest)
+			return
+		}
 		r.Header.Set("Accept", "application/dns-message")
 		proxy.ServeHTTP(w, r)
 	})
