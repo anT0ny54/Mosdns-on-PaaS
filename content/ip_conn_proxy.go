@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -105,6 +104,7 @@ func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
 	max := getenvInt("IP_CONN_LIMIT", 4)
+	healthPath := getenv("HEALTH_PATH", "/health")
 	if max < 1 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 1")
 	}
@@ -120,6 +120,13 @@ func main() {
 
 	lim := newLimiter(max)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Koyeb health checks must not depend on MosDNS readiness or consume a client slot.
+		if r.URL.Path == healthPath {
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
 		v := r.Context().Value(connStateKey{})
 		state, _ := v.(*connState)
 		if state == nil {
@@ -152,7 +159,7 @@ func main() {
 		},
 	}
 
-	log.Printf("IP connection limiter listening on %s -> %s (limit=%d/IP)", listenAddr, backendAddr, max)
+	log.Printf("IP connection limiter listening on %s -> %s (limit=%d/IP, health=%s)", listenAddr, backendAddr, max, healthPath)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -173,5 +180,3 @@ func getenvInt(k string, d int) int {
 	}
 	return v
 }
-
-var _ = fmt.Sprintf

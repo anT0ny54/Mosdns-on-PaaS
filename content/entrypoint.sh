@@ -4,6 +4,7 @@ set -eu
 : "${PORT:=8080}"
 : "${BACKEND_PORT:=18080}"
 : "${IP_CONN_LIMIT:=4}"
+: "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=4096}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
@@ -137,7 +138,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7 (long-running supervisor + per-IP connection limiter)"
+echo "Build: stable-v7.1 (Koyeb health-safe listener + long-running supervisor + per-IP connection limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
@@ -147,6 +148,7 @@ echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: enabled; no scheduled rotation"
 echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
+echo "Koyeb health endpoint: ${HEALTH_PATH}"
 
 select_order
 
@@ -154,7 +156,7 @@ U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
 U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
 U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
 sed \
-  -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g"
+  -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g" \
   -e "s|BACKEND_PORT_PLACEHOLDER|${BACKEND_PORT_ESCAPED}|g" \
   -e "s|PATH_PLACEHOLDER|${DOH_PATH_ESCAPED}|g" \
   -e "s|CACHE_SIZE_PLACEHOLDER|${CACHE_SIZE_ESCAPED}|g" \
@@ -176,7 +178,7 @@ echo "  3. ${ORDER_2}"
 # Public HTTP listener is the lightweight limiter proxy. MosDNS stays private
 # on 127.0.0.1 so every public request passes through the per-IP limiter.
 echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${BACKEND_PORT}"
-LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" ip-conn-proxy &
+LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
 PROXY_PID=$!
 
 # Long-running supervisor. A crashed MosDNS process is restarted in-place
@@ -197,7 +199,7 @@ while :; do
 
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "Limiter proxy exited; restarting it." >&2
-    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" ip-conn-proxy &
+    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
     PROXY_PID=$!
   fi
 
