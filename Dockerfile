@@ -1,4 +1,4 @@
-# v7.8.6 Firefox/Fennec Max-Protection / anti-abuse DoH build
+# v7.8.7 Firefox/Fennec-safe Max-Protection / anti-abuse DoH build
 # MosDNS v4.5.3 stable Koyeb build. Foreground MosDNS; Koyeb-managed lifecycle; no in-container restart loop.
 FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 WORKDIR /src
@@ -38,7 +38,7 @@ ENV DOH_RATE_MAX_IPS=4096
 ENV HEALTH_PATH=/health
 ENV DOH_PATH=/dns-query
 ENV GOMEMLIMIT=384MiB
-ENV DOH_IDLE_TIMEOUT=180
+ENV DOH_IDLE_TIMEOUT=300
 ENV UPSTREAM_0_IP=188.34.161.210
 ENV UPSTREAM_1_IP=159.69.155.94
 ENV UPSTREAM_2_IP=95.217.163.17
