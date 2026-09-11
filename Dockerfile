@@ -1,5 +1,5 @@
-# v7.2 build: placeholder-safe runtime config generation
-# MosDNS v4.5.3 stable Koyeb build. Long-running supervisor; no scheduled process rotation.
+# v7.5 stable build: placeholder-safe runtime config generation
+# MosDNS v4.5.3 stable Koyeb build. Foreground MosDNS; Koyeb-managed lifecycle; no in-container restart loop.
 FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates perl
@@ -30,7 +30,7 @@ RUN chmod 0755 ./entrypoint.sh \
  && mkdir -p /var/cache/mosdns \
  && chown -R mosdns:mosdns /etc/mosdns /var/cache/mosdns
 ENV PORT=8080
-ENV BACKEND_PORT=18080
+ENV MOSDNS_BACKEND_PORT=18080
 ENV IP_CONN_LIMIT=4
 ENV HEALTH_PATH=/health
 ENV DOH_PATH=/dns-query
