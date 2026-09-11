@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -169,6 +172,30 @@ func main() {
 			http.Error(w, "per-IP connection limit exceeded", http.StatusTooManyRequests)
 			return
 		}
+		// Normalize RFC 8484 GET requests to POST before MosDNS. This avoids
+		// relying on version-specific GET handling in the v4.5.3 HTTP listener.
+		// Firefox may use GET or POST; both become the same wire-format request.
+		if r.Method == http.MethodGet {
+			dnsParam := r.URL.Query().Get("dns")
+			if dnsParam == "" {
+				http.Error(w, "missing dns parameter", http.StatusBadRequest)
+				return
+			}
+			dnsWire, err := base64.RawURLEncoding.DecodeString(dnsParam)
+			if err != nil || len(dnsWire) < 12 || len(dnsWire) > 65535 {
+				http.Error(w, "invalid dns message", http.StatusBadRequest)
+				return
+			}
+			r.Method = http.MethodPost
+			r.URL.RawQuery = ""
+			r.Body = io.NopCloser(bytes.NewReader(dnsWire))
+			r.ContentLength = int64(len(dnsWire))
+			r.Header.Set("Content-Type", "application/dns-message")
+		}
+		// Firefox/DoH clients expect RFC 8484 media types. Normalize these
+		// headers on both GET and POST paths so the backend always sees a valid
+		// application/dns-message request.
+		r.Header.Set("Accept", "application/dns-message")
 		proxy.ServeHTTP(w, r)
 	})
 

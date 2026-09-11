@@ -1,7 +1,7 @@
 log:
   level: warn
 
-# v7.8 LEAK-RESISTANT POLICY:
+# v7.8.2 LEAK-RESISTANT POLICY:
 # There is intentionally NO plain UDP/TCP DNS listener.
 # All recursive queries leave MosDNS only through HTTPS DoH upstreams.
 
