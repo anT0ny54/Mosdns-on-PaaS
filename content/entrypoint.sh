@@ -2,6 +2,8 @@
 set -eu
 
 : "${PORT:=8080}"
+: "${BACKEND_PORT:=18080}"
+: "${IP_CONN_LIMIT:=4}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=4096}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
@@ -25,6 +27,8 @@ validate_float01() {
 }
 
 validate_uint PORT "$PORT"
+validate_uint BACKEND_PORT "$BACKEND_PORT"
+validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint CACHE_SIZE "$CACHE_SIZE"
 validate_uint CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL"
 validate_uint MAX_QPS "$MAX_QPS"
@@ -37,6 +41,8 @@ validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
 validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
 
 [ "$PORT" -gt 0 ] || { echo "PORT must be > 0" >&2; exit 1; }
+[ "$BACKEND_PORT" -gt 0 ] || { echo "BACKEND_PORT must be > 0" >&2; exit 1; }
+[ "$IP_CONN_LIMIT" -gt 0 ] || { echo "IP_CONN_LIMIT must be > 0" >&2; exit 1; }
 [ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
 [ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
@@ -93,6 +99,7 @@ CACHE_SIZE_ESCAPED=$(sed_escape_replacement "$CACHE_SIZE")
 CACHE_DUMP_FILE_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_FILE")
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
 MAX_QPS_ESCAPED=$(sed_escape_replacement "$MAX_QPS")
+BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$BACKEND_PORT")
 UPSTREAM_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
 CACHE_DIR=$(dirname "$CACHE_DUMP_FILE")
@@ -102,9 +109,14 @@ export GOMEMLIMIT
 TEMPLATE=/etc/mosdns/config.yaml
 RUNTIME_CONFIG=/tmp/mosdns-config.yaml
 MOSDNS_PID=""
+PROXY_PID=""
 
 cleanup() {
   trap - TERM INT EXIT
+  if [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill -TERM "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+  fi
   if [ -n "${MOSDNS_PID:-}" ] && kill -0 "$MOSDNS_PID" 2>/dev/null; then
     echo "Stopping MosDNS..."
     kill -TERM "$MOSDNS_PID" 2>/dev/null || true
@@ -125,7 +137,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v6 (long-running supervisor)"
+echo "Build: stable-v7 (long-running supervisor + per-IP connection limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
@@ -134,6 +146,7 @@ echo "Connection idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
 echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: enabled; no scheduled rotation"
+echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
 
 select_order
 
@@ -141,7 +154,8 @@ U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
 U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
 U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
 sed \
-  -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g" \
+  -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g"
+  -e "s|BACKEND_PORT_PLACEHOLDER|${BACKEND_PORT_ESCAPED}|g" \
   -e "s|PATH_PLACEHOLDER|${DOH_PATH_ESCAPED}|g" \
   -e "s|CACHE_SIZE_PLACEHOLDER|${CACHE_SIZE_ESCAPED}|g" \
   -e "s|CACHE_DUMP_FILE_PLACEHOLDER|${CACHE_DUMP_FILE_ESCAPED}|g" \
@@ -159,6 +173,12 @@ echo "  1. ${ORDER_0}"
 echo "  2. ${ORDER_1}"
 echo "  3. ${ORDER_2}"
 
+# Public HTTP listener is the lightweight limiter proxy. MosDNS stays private
+# on 127.0.0.1 so every public request passes through the per-IP limiter.
+echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${BACKEND_PORT}"
+LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" ip-conn-proxy &
+PROXY_PID=$!
+
 # Long-running supervisor. A crashed MosDNS process is restarted in-place
 # instead of terminating PID 1 and waiting for Koyeb to recreate the instance.
 # Exponential backoff avoids a CPU spin if a bad deployment/config is supplied.
@@ -174,6 +194,12 @@ while :; do
     status=$?
   fi
   MOSDNS_PID=
+
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "Limiter proxy exited; restarting it." >&2
+    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" ip-conn-proxy &
+    PROXY_PID=$!
+  fi
 
   if [ "$status" -eq 0 ]; then
     echo "MosDNS exited normally; restarting in 2 seconds."

@@ -82,6 +82,6 @@ servers:
     timeout: SERVER_TIMEOUT_PLACEHOLDER
     listeners:
       - protocol: http
-        addr: ":PORT_PLACEHOLDER"
+        addr: "127.0.0.1:BACKEND_PORT_PLACEHOLDER"
         url_path: "PATH_PLACEHOLDER"
         get_user_ip_from_header: "X-Forwarded-For"
