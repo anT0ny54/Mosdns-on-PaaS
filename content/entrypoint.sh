@@ -13,6 +13,7 @@ set -eu
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${UPSTREAM_IDLE_TIMEOUT:=15}"
 : "${SERVER_TIMEOUT:=5}"
+: "${UPSTREAM_MODE:=doh-only}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_CHECK:=true}"
 : "${HEALTH_EWMA_ALPHA:=0.35}"
@@ -51,9 +52,19 @@ validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
 case "$DOH_PATH" in /*) ;; *) echo "DOH_PATH must start with /" >&2; exit 1 ;; esac
 case "$HAGEZI_UPSTREAM" in rotate|random|https://*) ;; *) echo "HAGEZI_UPSTREAM must be 'rotate', 'random', or an https:// endpoint" >&2; exit 1 ;; esac
 
+# Fail-closed upstream policy: every configured upstream MUST be HTTPS DoH.
 UPSTREAM_0="https://root.hagezi.org/dns-query"
 UPSTREAM_1="https://wurzn.hagezi.org/dns-query"
 UPSTREAM_2="https://juuri.hagezi.org/dns-query"
+
+case "$UPSTREAM_MODE" in
+  doh-only) ;;
+  *) echo "UPSTREAM_MODE must be doh-only" >&2; exit 1 ;;
+esac
+
+case "$UPSTREAM_0 $UPSTREAM_1 $UPSTREAM_2" in
+  *http://*|*udp://*|*tcp://*) echo "ERROR: plain-DNS upstream blocked (HTTPS DoH only)" >&2; exit 1 ;;
+esac
 
 # Select a healthy order once at boot. MosDNS itself then provides sequential
 # failover continuously; we deliberately do NOT restart MosDNS on a timer.
@@ -138,9 +149,11 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.3 (collision-proof listener templating + backend-ready health + long-running supervisor + per-IP connection limiter)"
+echo "Build: stable-v7.4 (strict DoH-only upstreams + no plain-DNS listener + collision-proof templating + health + supervisor + per-IP limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
-echo "Sequential failover: enabled"
+echo "Sequential failover: enabled (fail-closed DoH-only)"
+echo "Plain DNS listener: disabled"
+echo "Upstream transport policy: ${UPSTREAM_MODE}"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
 echo "Health model: EWMA alpha ${HEALTH_EWMA_ALPHA}, failure penalty ${HEALTH_FAILURE_PENALTY_MS}ms"
 echo "Connection idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
@@ -188,7 +201,7 @@ echo "  3. ${ORDER_2}"
 # Public HTTP listener is the lightweight limiter proxy. MosDNS stays private
 # on 127.0.0.1 so every public request passes through the per-IP limiter.
 echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${MOSDNS_BACKEND_PORT}"
-LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
+LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
 PROXY_PID=$!
 
 # Long-running supervisor. A crashed MosDNS process is restarted in-place
@@ -209,7 +222,7 @@ while :; do
 
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "Limiter proxy exited; restarting it." >&2
-    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
+    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
     PROXY_PID=$!
   fi
 

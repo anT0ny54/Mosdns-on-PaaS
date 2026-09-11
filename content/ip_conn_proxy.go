@@ -121,6 +121,14 @@ func main() {
 
 	lim := newLimiter(max)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only expose the configured DoH path plus the health endpoint.
+		// Rejecting arbitrary paths reduces accidental proxy use and prevents
+		// this public listener from becoming a generic HTTP forwarder.
+		if r.URL.Path != healthPath && r.URL.Path != getenv("DOH_PATH", "/dns-query") {
+			http.NotFound(w, r)
+			return
+		}
+
 		// Health is successful only when the private MosDNS listener is reachable.
 		// This prevents Koyeb from marking an instance healthy while MosDNS is down.
 		if r.URL.Path == healthPath {
