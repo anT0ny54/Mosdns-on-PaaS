@@ -117,11 +117,11 @@ func main() {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   16,
-		IdleConnTimeout:       60 * time.Second,
+		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -172,7 +172,7 @@ func main() {
 		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       90 * time.Second,
+		IdleTimeout:       180 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			state := lim.registerConn(c)

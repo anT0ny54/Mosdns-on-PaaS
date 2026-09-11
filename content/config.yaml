@@ -29,9 +29,10 @@ plugins:
     args:
       upstream:
         - addr: __UPSTREAM_0__
+          dial_addr: __UPSTREAM_0_IP__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: false
+          enable_pipeline: true
           max_conns: 2
 
   - tag: upstream_1
@@ -39,9 +40,10 @@ plugins:
     args:
       upstream:
         - addr: __UPSTREAM_1__
+          dial_addr: __UPSTREAM_1_IP__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: false
+          enable_pipeline: true
           max_conns: 2
 
   - tag: upstream_2
@@ -49,9 +51,10 @@ plugins:
     args:
       upstream:
         - addr: __UPSTREAM_2__
+          dial_addr: __UPSTREAM_2_IP__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: false
+          enable_pipeline: true
           max_conns: 2
 
   # Strictly sequential failover. No parallel upstream fan-out on the hot path.
@@ -87,5 +90,6 @@ servers:
     listeners:
       - protocol: http
         addr: "127.0.0.1:__MOSDNS_BACKEND_PORT__"
+        idle_timeout: __DOH_IDLE_TIMEOUT__
         url_path: "__DOH_PATH__"
         get_user_ip_from_header: "X-Forwarded-For"

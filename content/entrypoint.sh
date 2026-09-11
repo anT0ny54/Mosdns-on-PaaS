@@ -11,8 +11,8 @@ set -eu
 : "${CACHE_DUMP_INTERVAL:=900}"
 : "${MAX_QPS:=20}"
 : "${HAGEZI_UPSTREAM:=rotate}"
-: "${UPSTREAM_IDLE_TIMEOUT:=30}"
-: "${SERVER_TIMEOUT:=30}"
+: "${UPSTREAM_IDLE_TIMEOUT:=90}"
+: "${SERVER_TIMEOUT:=8}"
 : "${UPSTREAM_MODE:=doh-only}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_CHECK:=true}"
@@ -22,6 +22,10 @@ set -eu
 : "${HEALTH_SWITCH_MARGIN_MS:=25}"
 : "${HEALTH_STATE_FILE:=/tmp/mosdns-upstream-state.tsv}"
 : "${GOMEMLIMIT:=384MiB}"
+: "${DOH_IDLE_TIMEOUT:=120}"
+: "${UPSTREAM_0_IP:=188.34.161.210}"
+: "${UPSTREAM_1_IP:=159.69.155.94}"
+: "${UPSTREAM_2_IP:=95.217.163.17}"
 
 validate_uint() { case "$2" in ''|*[!0-9]*) echo "Invalid $1: $2" >&2; exit 1 ;; esac; }
 validate_float01() {
@@ -37,6 +41,7 @@ validate_uint MAX_QPS "$MAX_QPS"
 validate_uint UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT"
 validate_uint SERVER_TIMEOUT "$SERVER_TIMEOUT"
 validate_uint HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS"
+validate_uint DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT"
 validate_uint HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS"
 validate_uint HEALTH_SWITCH_MARGIN_MS "$HEALTH_SWITCH_MARGIN_MS"
 validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
@@ -104,6 +109,15 @@ select_order() {
   esac
 }
 
+upstream_ip_for_url() {
+  case "$1" in
+    "$UPSTREAM_0") printf '%s' "$UPSTREAM_0_IP" ;;
+    "$UPSTREAM_1") printf '%s' "$UPSTREAM_1_IP" ;;
+    "$UPSTREAM_2") printf '%s' "$UPSTREAM_2_IP" ;;
+    *) printf '' ;;
+  esac
+}
+
 sed_escape_replacement() { printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }
 PORT_ESCAPED=$(sed_escape_replacement "$PORT")
 DOH_PATH_ESCAPED=$(sed_escape_replacement "$DOH_PATH")
@@ -113,6 +127,7 @@ CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
 MAX_QPS_ESCAPED=$(sed_escape_replacement "$MAX_QPS")
 MOSDNS_BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$MOSDNS_BACKEND_PORT")
 UPSTREAM_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_IDLE_TIMEOUT")
+DOH_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$DOH_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
 CACHE_DIR=$(dirname "$CACHE_DUMP_FILE")
 mkdir -p "$CACHE_DIR" 2>/dev/null || echo "Warning: unable to create cache directory $CACHE_DIR" >&2
@@ -149,7 +164,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.6 (Cromite DoH-compatible GET/POST proxy + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
+echo "Build: stable-v7.7 (Cromite DoH-compatible GET/POST proxy + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
@@ -160,8 +175,8 @@ echo "Connection idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
 echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: disabled; Koyeb manages lifecycle"
-echo "Cromite DoH compatibility: GET + POST application/dns-message
-echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}""
+echo "Cromite/Firefox DoH compatibility: GET + POST application/dns-message"
+echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
 echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
 
@@ -170,6 +185,12 @@ select_order
 U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
 U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
 U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
+ORDER_0_IP=$(upstream_ip_for_url "$ORDER_0")
+ORDER_1_IP=$(upstream_ip_for_url "$ORDER_1")
+ORDER_2_IP=$(upstream_ip_for_url "$ORDER_2")
+U0_IP_ESCAPED=$(sed_escape_replacement "$ORDER_0_IP")
+U1_IP_ESCAPED=$(sed_escape_replacement "$ORDER_1_IP")
+U2_IP_ESCAPED=$(sed_escape_replacement "$ORDER_2_IP")
 sed \
   -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
   -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
@@ -182,7 +203,15 @@ sed \
   -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
   -e "s|__UPSTREAM_1__|${U1_ESCAPED}|g" \
   -e "s|__UPSTREAM_2__|${U2_ESCAPED}|g" \
+  -e "s|__UPSTREAM_0_IP__|${U0_IP_ESCAPED}|g" \
+  -e "s|__UPSTREAM_1_IP__|${U1_IP_ESCAPED}|g" \
+  -e "s|__UPSTREAM_2_IP__|${U2_IP_ESCAPED}|g" \
+  -e "s|__DOH_IDLE_TIMEOUT__|${DOH_IDLE_TIMEOUT_ESCAPED}|g" \
   "$TEMPLATE" > "$RUNTIME_CONFIG"
+
+# For a user-supplied custom HAGEZI_UPSTREAM, no pinned IP is known. Remove
+# empty dial_addr fields rather than emitting an invalid/ambiguous address.
+sed -i '/^[[:space:]]*dial_addr:[[:space:]]*$/d' "$RUNTIME_CONFIG"
 
 # Hard-fail on any unresolved template token.
 if grep -Eq "(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER" "$RUNTIME_CONFIG"; then
@@ -205,8 +234,21 @@ echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${MOSDNS_BACKE
 LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
 PROXY_PID=$!
 
-# Run MosDNS in the foreground. Koyeb is the process supervisor: if MosDNS exits,
-# the instance is recreated rather than hiding a crash behind an in-container
-# restart loop. This avoids silent restart cycles and makes failures visible.
-echo "Starting MosDNS in foreground..."
-exec mosdns start -c "$RUNTIME_CONFIG"
+# Keep both public proxy and MosDNS supervised. If either process dies, terminate
+# the sibling and exit so Koyeb restarts the whole instance. This avoids the
+# previous failure mode where the proxy could die while MosDNS stayed alive.
+echo "Starting MosDNS..."
+mosdns start -c "$RUNTIME_CONFIG" &
+MOSDNS_PID=$!
+
+while :; do
+  if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
+    echo "MosDNS exited; restarting instance via Koyeb" >&2
+    exit 1
+  fi
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "DoH proxy exited; restarting instance via Koyeb" >&2
+    exit 1
+  fi
+  sleep 2
+done
