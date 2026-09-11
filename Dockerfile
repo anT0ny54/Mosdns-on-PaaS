@@ -1,4 +1,4 @@
-# v7.8.7 Firefox/Fennec Max-Protection / anti-abuse DoH build
+# v7.8.6 Firefox/Fennec Max-Protection / anti-abuse DoH build
 # MosDNS v4.5.3 stable Koyeb build. Foreground MosDNS; Koyeb-managed lifecycle; no in-container restart loop.
 FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 WORKDIR /src
@@ -32,8 +32,8 @@ RUN chmod 0755 ./entrypoint.sh \
 ENV PORT=8080
 ENV MOSDNS_BACKEND_PORT=18080
 ENV IP_CONN_LIMIT=0
-ENV DOH_RATE_LIMIT=30
-ENV DOH_RATE_BURST=60
+ENV DOH_RATE_LIMIT=10
+ENV DOH_RATE_BURST=30
 ENV DOH_RATE_MAX_IPS=1024
 ENV HEALTH_PATH=/health
 ENV DOH_PATH=/dns-query
