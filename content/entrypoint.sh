@@ -3,7 +3,7 @@ set -eu
 
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
-: "${IP_CONN_LIMIT:=16}"
+: "${IP_CONN_LIMIT:=0}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=4096}"
@@ -49,7 +49,7 @@ validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
 
 [ "$PORT" -gt 0 ] || { echo "PORT must be > 0" >&2; exit 1; }
 [ "$MOSDNS_BACKEND_PORT" -gt 0 ] || { echo "MOSDNS_BACKEND_PORT must be > 0" >&2; exit 1; }
-[ "$IP_CONN_LIMIT" -gt 0 ] || { echo "IP_CONN_LIMIT must be > 0" >&2; exit 1; }
+[ "$IP_CONN_LIMIT" -ge 0 ] || { echo "IP_CONN_LIMIT must be >= 0 (0 = unlimited)" >&2; exit 1; }
 [ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
 [ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
@@ -165,7 +165,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.8.3 (Cromite DoH-compatible GET/POST proxy + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
+echo "Build: stable-v7.8.4 (Firefox/Fennec/Cromite DoH-compatible GET/POST proxy + no-429 DoH path + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
@@ -178,7 +178,7 @@ echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: disabled; Koyeb manages lifecycle"
 echo "Cromite/Firefox DoH compatibility: GET + POST application/dns-message"
 echo "Firefox Max Protection target: ${DOH_PATH} (server-side plain DNS disabled)"
-echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
+echo "Per-IP concurrent connection cap: ${IP_CONN_LIMIT} (0 = unlimited for DoH compatibility)"
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
 echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
 

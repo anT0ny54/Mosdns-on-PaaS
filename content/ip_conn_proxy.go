@@ -69,7 +69,7 @@ func (l *limiter) allow(ip string, s *connState) bool {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.active[ip] >= l.max {
+	if l.max > 0 && l.active[ip] >= l.max {
 		return false
 	}
 	l.active[ip]++
@@ -103,11 +103,11 @@ func clientIP(r *http.Request) string {
 func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
-	max := getenvInt("IP_CONN_LIMIT", 16)
+	max := getenvInt("IP_CONN_LIMIT", 0)
 	healthPath := getenv("HEALTH_PATH", "/health")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
-	if max < 1 {
-		log.Fatalf("IP_CONN_LIMIT must be >= 1")
+	if max < 0 {
+		log.Fatalf("IP_CONN_LIMIT must be >= 0 (0 = unlimited)")
 	}
 
 	target, err := url.Parse("http://" + backendAddr)
@@ -203,7 +203,11 @@ func main() {
 		},
 	}
 
-	log.Printf("IP connection limiter listening on %s -> %s (limit=%d/IP, health=%s)", listenAddr, backendAddr, max, healthPath)
+	if max == 0 {
+		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=unlimited, health=%s)", listenAddr, backendAddr, healthPath)
+	} else {
+		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=%d, health=%s)", listenAddr, backendAddr, max, healthPath)
+	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
