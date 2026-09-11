@@ -5,7 +5,7 @@ plugins:
   - tag: client_limit
     type: client_limiter
     args:
-      max_qps: MAX_QPS_PLACEHOLDER
+      max_qps: __MAX_QPS__
       v4_mask: 32
       v6_mask: 48
 
@@ -14,19 +14,19 @@ plugins:
   - tag: mem_cache
     type: cache
     args:
-      size: CACHE_SIZE_PLACEHOLDER
+      size: __CACHE_SIZE__
       lazy_cache_ttl: 43200
       lazy_cache_reply_ttl: 20
-      dump_file: CACHE_DUMP_FILE_PLACEHOLDER
-      dump_interval: CACHE_DUMP_INTERVAL_PLACEHOLDER
+      dump_file: __CACHE_DUMP_FILE__
+      dump_interval: __CACHE_DUMP_INTERVAL__
 
   - tag: upstream_0
     type: fast_forward
     args:
       upstream:
-        - addr: UPSTREAM_0_PLACEHOLDER
+        - addr: __UPSTREAM_0__
           trusted: true
-          idle_timeout: UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER
+          idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
           max_conns: 1
 
@@ -34,9 +34,9 @@ plugins:
     type: fast_forward
     args:
       upstream:
-        - addr: UPSTREAM_1_PLACEHOLDER
+        - addr: __UPSTREAM_1__
           trusted: true
-          idle_timeout: UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER
+          idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
           max_conns: 1
 
@@ -44,9 +44,9 @@ plugins:
     type: fast_forward
     args:
       upstream:
-        - addr: UPSTREAM_2_PLACEHOLDER
+        - addr: __UPSTREAM_2__
           trusted: true
-          idle_timeout: UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER
+          idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
           max_conns: 1
 
@@ -79,9 +79,9 @@ plugins:
 
 servers:
   - exec: forward
-    timeout: SERVER_TIMEOUT_PLACEHOLDER
+    timeout: __SERVER_TIMEOUT__
     listeners:
       - protocol: http
-        addr: "127.0.0.1:BACKEND_PORT_PLACEHOLDER"
-        url_path: "PATH_PLACEHOLDER"
+        addr: "127.0.0.1:__MOSDNS_BACKEND_PORT__"
+        url_path: "__DOH_PATH__"
         get_user_ip_from_header: "X-Forwarded-For"

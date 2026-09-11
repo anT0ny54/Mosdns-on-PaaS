@@ -2,7 +2,7 @@
 set -eu
 
 : "${PORT:=8080}"
-: "${BACKEND_PORT:=18080}"
+: "${MOSDNS_BACKEND_PORT:=18080}"
 : "${IP_CONN_LIMIT:=4}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
@@ -28,7 +28,7 @@ validate_float01() {
 }
 
 validate_uint PORT "$PORT"
-validate_uint BACKEND_PORT "$BACKEND_PORT"
+validate_uint MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint CACHE_SIZE "$CACHE_SIZE"
 validate_uint CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL"
@@ -42,7 +42,7 @@ validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
 validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
 
 [ "$PORT" -gt 0 ] || { echo "PORT must be > 0" >&2; exit 1; }
-[ "$BACKEND_PORT" -gt 0 ] || { echo "BACKEND_PORT must be > 0" >&2; exit 1; }
+[ "$MOSDNS_BACKEND_PORT" -gt 0 ] || { echo "MOSDNS_BACKEND_PORT must be > 0" >&2; exit 1; }
 [ "$IP_CONN_LIMIT" -gt 0 ] || { echo "IP_CONN_LIMIT must be > 0" >&2; exit 1; }
 [ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
 [ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
@@ -100,7 +100,7 @@ CACHE_SIZE_ESCAPED=$(sed_escape_replacement "$CACHE_SIZE")
 CACHE_DUMP_FILE_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_FILE")
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
 MAX_QPS_ESCAPED=$(sed_escape_replacement "$MAX_QPS")
-BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$BACKEND_PORT")
+MOSDNS_BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$MOSDNS_BACKEND_PORT")
 UPSTREAM_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
 CACHE_DIR=$(dirname "$CACHE_DUMP_FILE")
@@ -138,7 +138,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.2 (Koyeb health-safe listener + long-running supervisor + per-IP connection limiter)"
+echo "Build: stable-v7.3 (collision-proof listener templating + backend-ready health + long-running supervisor + per-IP connection limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
@@ -149,6 +149,7 @@ echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: enabled; no scheduled rotation"
 echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
+echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
 
 select_order
 
@@ -156,24 +157,23 @@ U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
 U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
 U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
 sed \
-  -e "s|PORT_PLACEHOLDER|${PORT_ESCAPED}|g" \
-  -e "s|BACKEND_PORT_PLACEHOLDER|${BACKEND_PORT_ESCAPED}|g" \
-  -e "s|PATH_PLACEHOLDER|${DOH_PATH_ESCAPED}|g" \
-  -e "s|CACHE_SIZE_PLACEHOLDER|${CACHE_SIZE_ESCAPED}|g" \
-  -e "s|CACHE_DUMP_FILE_PLACEHOLDER|${CACHE_DUMP_FILE_ESCAPED}|g" \
-  -e "s|CACHE_DUMP_INTERVAL_PLACEHOLDER|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
-  -e "s|MAX_QPS_PLACEHOLDER|${MAX_QPS_ESCAPED}|g" \
-  -e "s|UPSTREAM_IDLE_TIMEOUT_PLACEHOLDER|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
-  -e "s|SERVER_TIMEOUT_PLACEHOLDER|${SERVER_TIMEOUT_ESCAPED}|g" \
-  -e "s|UPSTREAM_0_PLACEHOLDER|${U0_ESCAPED}|g" \
-  -e "s|UPSTREAM_1_PLACEHOLDER|${U1_ESCAPED}|g" \
-  -e "s|UPSTREAM_2_PLACEHOLDER|${U2_ESCAPED}|g" \
+  -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
+  -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
+  -e "s|__DOH_PATH__|${DOH_PATH_ESCAPED}|g" \
+  -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
+  -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
+  -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
+  -e "s|__MAX_QPS__|${MAX_QPS_ESCAPED}|g" \
+  -e "s|__UPSTREAM_IDLE_TIMEOUT__|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
+  -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
+  -e "s|__UPSTREAM_1__|${U1_ESCAPED}|g" \
+  -e "s|__UPSTREAM_2__|${U2_ESCAPED}|g" \
   "$TEMPLATE" > "$RUNTIME_CONFIG"
 
-# Hard-fail on unresolved listener placeholders.
-if grep -Eq "(PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER|BACKEND_[0-9]+)" "$RUNTIME_CONFIG"; then
-  echo "ERROR: unresolved listener placeholder in generated MosDNS config:" >&2
-  grep -nE "(PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER|BACKEND_[0-9]+)" "$RUNTIME_CONFIG" >&2 || true
+# Hard-fail on any unresolved template token.
+if grep -Eq "(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER" "$RUNTIME_CONFIG"; then
+  echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
+  grep -nE "(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER" "$RUNTIME_CONFIG" >&2 || true
   exit 1
 fi
 
@@ -187,8 +187,8 @@ echo "  3. ${ORDER_2}"
 
 # Public HTTP listener is the lightweight limiter proxy. MosDNS stays private
 # on 127.0.0.1 so every public request passes through the per-IP limiter.
-echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${BACKEND_PORT}"
-LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
+echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${MOSDNS_BACKEND_PORT}"
+LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
 PROXY_PID=$!
 
 # Long-running supervisor. A crashed MosDNS process is restarted in-place
@@ -209,7 +209,7 @@ while :; do
 
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "Limiter proxy exited; restarting it." >&2
-    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
+    LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" ip-conn-proxy &
     PROXY_PID=$!
   fi
 

@@ -105,6 +105,7 @@ func main() {
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
 	max := getenvInt("IP_CONN_LIMIT", 4)
 	healthPath := getenv("HEALTH_PATH", "/health")
+	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 500)) * time.Millisecond
 	if max < 1 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 1")
 	}
@@ -120,9 +121,16 @@ func main() {
 
 	lim := newLimiter(max)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Koyeb health checks must not depend on MosDNS readiness or consume a client slot.
+		// Health is successful only when the private MosDNS listener is reachable.
+		// This prevents Koyeb from marking an instance healthy while MosDNS is down.
 		if r.URL.Path == healthPath {
 			w.Header().Set("Cache-Control", "no-store")
+			c, err := net.DialTimeout("tcp", backendAddr, healthTimeout)
+			if err != nil {
+				http.Error(w, "mosdns unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			_ = c.Close()
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok\n"))
 			return
