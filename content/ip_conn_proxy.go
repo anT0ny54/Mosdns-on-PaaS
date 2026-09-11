@@ -14,6 +14,23 @@ import (
 	"time"
 )
 
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *loggingResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *loggingResponseWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
 type connState struct {
 	mu      sync.Mutex
 	ip      string
@@ -176,6 +193,7 @@ func main() {
 	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 30)
 	rateBurst := getenvInt("DOH_RATE_BURST", 60)
 	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 4096)
+	debugRequests := getenvBool("DEBUG_DOH_REQUESTS", false)
 	healthPath := getenv("HEALTH_PATH", "/health")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 0 {
@@ -214,6 +232,19 @@ func main() {
 	connLim := newLimiter(max)
 	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		var lw *loggingResponseWriter
+		if debugRequests {
+			lw = &loggingResponseWriter{ResponseWriter: w}
+			w = lw
+			defer func() {
+				status := lw.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				log.Printf("DOH DEBUG method=%s path=%s status=%d duration=%s client=%s", r.Method, r.URL.Path, status, time.Since(started).Round(time.Millisecond), clientIP(r))
+			}()
+		}
 		dohPath := getenv("DOH_PATH", "/dns-query")
 		if r.URL.Path != healthPath && r.URL.Path != dohPath {
 			http.NotFound(w, r)
@@ -312,6 +343,21 @@ func getenvInt(k string, d int) int {
 		return d
 	}
 	return v
+}
+
+func getenvBool(k string, d bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
+	if v == "" {
+		return d
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return d
+	}
 }
 
 func getenvFloat(k string, d float64) float64 {
