@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -105,9 +103,9 @@ func clientIP(r *http.Request) string {
 func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
-	max := getenvInt("IP_CONN_LIMIT", 4)
+	max := getenvInt("IP_CONN_LIMIT", 16)
 	healthPath := getenv("HEALTH_PATH", "/health")
-	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 500)) * time.Millisecond
+	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 1 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 1")
 	}
@@ -117,6 +115,16 @@ func main() {
 		log.Fatal(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
@@ -157,47 +165,6 @@ func main() {
 			http.Error(w, "per-IP connection limit exceeded", http.StatusTooManyRequests)
 			return
 		}
-
-		// RFC 8484 / Cromite compatibility:
-		// accept both GET ?dns= and POST application/dns-message.  Do not
-		// rewrite the request body or query; the reverse proxy forwards them
-		// unchanged to MosDNS.  Explicitly advertise the DoH media type.
-		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			w.Header().Set("Allow", "GET, POST")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if r.Method == http.MethodPost {
-			ct := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
-			if ct != "application/dns-message" {
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				http.Error(w, "unsupported DoH content type", http.StatusUnsupportedMediaType)
-				return
-			}
-		}
-		if r.Method == http.MethodGet {
-			if r.URL.Query().Get("dns") == "" {
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				http.Error(w, "missing dns query", http.StatusBadRequest)
-				return
-			}
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		if r.Method == http.MethodPost && r.Body != nil {
-			// Keep a bounded body in the request stream and ensure the proxy can
-			// replay it if its transport retries internally.
-			const maxDoHBody = 64 << 10
-			b, err := io.ReadAll(io.LimitReader(r.Body, maxDoHBody+1))
-			if err != nil {
-				http.Error(w, "invalid DoH request body", http.StatusBadRequest)
-				return
-			}
-			if len(b) > maxDoHBody {
-				http.Error(w, "DoH request body too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			r.Body = io.NopCloser(bytes.NewReader(b))
-		}
 		proxy.ServeHTTP(w, r)
 	})
 
@@ -205,7 +172,7 @@ func main() {
 		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       65 * time.Second,
+		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			state := lim.registerConn(c)

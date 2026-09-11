@@ -3,7 +3,7 @@ set -eu
 
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
-: "${IP_CONN_LIMIT:=4}"
+: "${IP_CONN_LIMIT:=16}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=4096}"
@@ -11,8 +11,8 @@ set -eu
 : "${CACHE_DUMP_INTERVAL:=900}"
 : "${MAX_QPS:=20}"
 : "${HAGEZI_UPSTREAM:=rotate}"
-: "${UPSTREAM_IDLE_TIMEOUT:=15}"
-: "${SERVER_TIMEOUT:=5}"
+: "${UPSTREAM_IDLE_TIMEOUT:=30}"
+: "${SERVER_TIMEOUT:=10}"
 : "${UPSTREAM_MODE:=doh-only}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_CHECK:=true}"
@@ -149,7 +149,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.6 (Cromite DoH compatibility + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle + per-IP limiter)"
+echo "Build: stable-v7.6 (Cromite DoH-compatible GET/POST proxy + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
@@ -160,7 +160,8 @@ echo "Connection idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s"
 echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: disabled; Koyeb manages lifecycle"
-echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}"
+echo "Cromite DoH compatibility: GET + POST application/dns-message
+echo "Per-IP concurrent connection limit: ${IP_CONN_LIMIT}""
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
 echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
 
