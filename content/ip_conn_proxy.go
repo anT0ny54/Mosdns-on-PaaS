@@ -14,23 +14,6 @@ import (
 	"time"
 )
 
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *loggingResponseWriter) WriteHeader(status int) {
-	w.status = status
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *loggingResponseWriter) Write(b []byte) (int, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
-	return w.ResponseWriter.Write(b)
-}
-
 type connState struct {
 	mu      sync.Mutex
 	ip      string
@@ -165,19 +148,20 @@ func (r *rateLimiter) allow(ip string, now time.Time) bool {
 }
 
 func clientIP(r *http.Request) string {
-	// Koyeb's public proxy supplies X-Forwarded-For. Use the first address,
-	// which is the original client when the proxy appends rather than replaces.
+	// Koyeb's edge normally provides the original client in X-Real-IP.
+	// Prefer it because it is a single address and cannot be confused with
+	// a client-supplied comma-separated chain. Fall back to the first valid
+	// X-Forwarded-For address for deployments where only XFF is provided.
+	if x := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(x) != nil {
+		return x
+	}
 	if x := r.Header.Get("X-Forwarded-For"); x != "" {
-		parts := strings.Split(x, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
+		for _, part := range strings.Split(x, ",") {
+			ip := strings.TrimSpace(part)
 			if net.ParseIP(ip) != nil {
 				return ip
 			}
 		}
-	}
-	if x := r.Header.Get("X-Real-IP"); net.ParseIP(strings.TrimSpace(x)) != nil {
-		return strings.TrimSpace(x)
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && net.ParseIP(host) != nil {
@@ -193,7 +177,6 @@ func main() {
 	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 30)
 	rateBurst := getenvInt("DOH_RATE_BURST", 60)
 	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 4096)
-	debugRequests := getenvBool("DEBUG_DOH_REQUESTS", false)
 	healthPath := getenv("HEALTH_PATH", "/health")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 0 {
@@ -218,9 +201,9 @@ func main() {
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   16,
-		MaxConnsPerHost:       32,
+		MaxIdleConns:          12,
+		MaxIdleConnsPerHost:   8,
+		MaxConnsPerHost:       12,
 		IdleConnTimeout:       180 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -232,19 +215,6 @@ func main() {
 	connLim := newLimiter(max)
 	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		started := time.Now()
-		var lw *loggingResponseWriter
-		if debugRequests {
-			lw = &loggingResponseWriter{ResponseWriter: w}
-			w = lw
-			defer func() {
-				status := lw.status
-				if status == 0 {
-					status = http.StatusOK
-				}
-				log.Printf("DOH DEBUG method=%s path=%s status=%d duration=%s client=%s", r.Method, r.URL.Path, status, time.Since(started).Round(time.Millisecond), clientIP(r))
-			}()
-		}
 		dohPath := getenv("DOH_PATH", "/dns-query")
 		if r.URL.Path != healthPath && r.URL.Path != dohPath {
 			http.NotFound(w, r)
@@ -304,7 +274,7 @@ func main() {
 	srv := &http.Server{
 		Addr:              listenAddr,
 		Handler:           mux,
-		ReadHeaderTimeout: 15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       300 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
@@ -343,21 +313,6 @@ func getenvInt(k string, d int) int {
 		return d
 	}
 	return v
-}
-
-func getenvBool(k string, d bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
-	if v == "" {
-		return d
-	}
-	switch v {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return d
-	}
 }
 
 func getenvFloat(k string, d float64) float64 {
