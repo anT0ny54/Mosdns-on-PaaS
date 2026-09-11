@@ -1,20 +1,16 @@
-# MosDNS on Koyeb v7
+# MosDNS on Koyeb v7.8.7
 
-This revision is tuned for a Koyeb 512 MB / 0.1 vCPU Free Instance that must
-remain responsive for long periods.
+This revision is tuned for a Koyeb 512 MB / 0.1 vCPU / 2 GB SSD Free Instance serving **public DoH** while aggressively limiting abuse.
 
-- MosDNS is now a **long-running process**. The previous timed upstream rotation
-  restarted MosDNS every 15 minutes by default; that is removed because repeated
-  process replacement is unnecessary and can create avoidable connection gaps.
-- All three HaGeZi DoH endpoints remain available through **sequential failover**
-  in the same MosDNS process.
-- A small supervisor automatically restarts MosDNS if the child process exits,
-  with exponential backoff up to 30 seconds.
-- The bounded warm cache is retained.
-- Koyeb's TCP health check can still restart the instance if the listener stops
-  accepting connections.
-- This does **not** override Koyeb Free Instance scale-to-zero: Koyeb currently
-  scales a Free Instance to zero after 1 hour without Internet traffic.
+- MosDNS remains a long-running process; if MosDNS or the public proxy exits, the container exits so Koyeb can restart the Instance.
+- All three HaGeZi DoH endpoints remain available through **strict sequential failover**.
+- The bounded warm cache is retained and snapshots every **55 minutes (3300 seconds)**.
+- Public requests pass through a lightweight Go proxy before reaching MosDNS.
+- Abuse protection uses **per-IP rate limiting + global rate limiting + global connection limiting + request-size limits**.
+- Per-IP connection limiting remains disabled for Firefox/Fennec compatibility; the global connection ceiling remains enabled.
+- Plain UDP/TCP DNS is not exposed; upstream resolution is **DoH-only**.
+- Koyeb health checks can restart unhealthy Instances. Koyeb documents that liveness health-check failures can cause an Instance restart.
+- Koyeb Free Instances are limited to 512 MB RAM, 0.1 vCPU and 2 GB SSD and can scale to zero after one hour without traffic.
 
 # MosDNS on Koyeb
 
@@ -30,14 +26,14 @@ The configuration is intentionally conservative:
 - three HaGeZi endpoints kept available through sequential failover
 - health-aware startup ordering; all three endpoints remain in the failover chain
 - DNS pipelining enabled
-- 8,192-entry RAM cache by default
+- 2,048-entry RAM cache by default
 - bounded disk warm-cache snapshot
 - warm cache survives graceful rotation/restart as long as Koyeb's local storage remains available
 - no GeoIP/Geosite downloads
 - no additional resident cache/database process
 - non-root runtime user
 - Go memory limit of 384 MiB
-- 3-second DNS server timeout
+- 8-second DNS server timeout
 
 The warm-cache file is only a warm-start optimization. Koyeb local storage is ephemeral, so a new/replaced instance may still start without the previous snapshot.
 
@@ -47,12 +43,21 @@ The warm-cache file is only a warm-start optimization. Koyeb local storage is ep
 | --- | --- | --- |
 | `PORT` | `8080` | Koyeb HTTP port |
 | `DOH_PATH` | `/dns-query` | DoH endpoint path |
-| `CACHE_SIZE` | `8192` | Maximum RAM cache entries |
+| `CACHE_SIZE` | `2048` | Maximum RAM cache entries |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot |
-| `CACHE_DUMP_INTERVAL` | `900` | Snapshot interval in seconds |
-| `MAX_QPS` | `20` | Per-client QPS limit |
+| `CACHE_DUMP_INTERVAL` | `3300` | Snapshot interval: 55 minutes |
+| `MAX_QPS` | `15` | MosDNS client QPS ceiling |
+| `DOH_RATE_LIMIT` | `5` | Per-IP public DoH request rate |
+| `DOH_RATE_BURST` | `12` | Per-IP burst allowance |
+| `DOH_RATE_MAX_IPS` | `512` | Maximum tracked client IPs |
+| `GLOBAL_RATE_LIMIT` | `40` | Global public DoH request rate |
+| `GLOBAL_RATE_BURST` | `80` | Global burst allowance |
+| `GLOBAL_CONN_LIMIT` | `128` | Global concurrent connection ceiling |
+| `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET dns parameter |
+| `IP_CONN_LIMIT` | `0` | Per-IP connection limit; 0 preserves Firefox/Fennec reuse |
+| `UPSTREAM_IDLE_TIMEOUT` | `60` | Upstream idle timeout in seconds |
+| `DOH_IDLE_TIMEOUT` | `120` | Local DoH listener idle timeout |
 | `HAGEZI_UPSTREAM` | `rotate` | `rotate`, `random`, or one fixed `https://` endpoint |
-| `ROTATE_INTERVAL` | `1800` | Rotation interval in seconds; minimum 60 |
 | `GOMEMLIMIT` | `384MiB` | Go runtime memory limit |
 
 ## Sequential failover
@@ -79,7 +84,7 @@ A valid DNS response such as NXDOMAIN is not treated as a transport failure.
 
 ## Three-upstream rotation
 
-`HAGEZI_UPSTREAM=rotate` uses these three endpoints in order:
+`HAGEZI_UPSTREAM=rotate` selects among these three endpoints at startup; the selected endpoint is then first in the sequential failover chain:
 
 1. `https://root.hagezi.org/dns-query`
 2. `https://wurzn.hagezi.org/dns-query`
@@ -105,11 +110,11 @@ HAGEZI_UPSTREAM=https://root.hagezi.org/dns-query
 
 The hot path is always the RAM cache. The custom cache backend maintains a bounded second copy for warm starts.
 
-Default:
+Recommended v7.8.7 defaults:
 
 ```text
-CACHE_SIZE=8192
-CACHE_DUMP_INTERVAL=900
+CACHE_SIZE=2048
+CACHE_DUMP_INTERVAL=3300
 CACHE_DUMP_FILE=/var/cache/mosdns/cache.dump
 ```
 
@@ -119,13 +124,23 @@ The cache uses atomic replacement when writing the snapshot. Expired entries are
 
 On a 0.1-vCPU instance, avoiding unnecessary resident processes and large databases matters more than maximizing cache size. The deployment therefore does not install GeoIP/Geosite data, SQLite, dnsmasq, BIND, or another cache daemon.
 
-8,192 entries is a good starting point for 512 MB RAM. If measurements show the cache is too small, increase `CACHE_SIZE`; otherwise leave it unchanged.
+2,048 entries is the recommended starting point for 512 MB RAM / 0.1 vCPU. Increase it only after measuring memory and cache-hit behavior.
 
 ## DoH security
 
-A public DoH service can be abused. `MAX_QPS` is rate limiting, not authentication. Keep the DoH URL private and consider additional access control if the endpoint is intended only for personal use.
+A public DoH service can be abused, so v7.8.7 uses layered controls before traffic reaches MosDNS:
 
-The service expects Koyeb's proxy to provide the client address through `X-Forwarded-For` for the client limiter.
+```text
+per-IP:   5 req/s, burst 12, max 512 tracked IPs
+global:  40 req/s, burst 80
+connections: 128 global
+request body / dns parameter: 4096 bytes
+MosDNS: 15 QPS client ceiling
+```
+
+Per-IP connection limiting remains `0` because Firefox/Fennec benefit from persistent DoH connections. The global connection ceiling still protects the tiny Koyeb instance from connection floods. POST requests must use `application/dns-message`; only GET and POST are accepted.
+
+The service expects Koyeb's proxy to provide the client address through `X-Forwarded-For`/`X-Real-IP` for the client limiter.
 
 
 ## Requirements
