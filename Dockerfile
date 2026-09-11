@@ -1,4 +1,4 @@
-# v7.8 Firefox Max-Protection / no-DNS-leak build: placeholder-safe runtime config generation
+# v7.8.2 Firefox Max-Protection / no-DNS-leak build: placeholder-safe runtime config generation
 # MosDNS v4.5.3 stable Koyeb build. Foreground MosDNS; Koyeb-managed lifecycle; no in-container restart loop.
 FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 WORKDIR /src
