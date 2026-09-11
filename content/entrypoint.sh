@@ -138,7 +138,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.1 (Koyeb health-safe listener + long-running supervisor + per-IP connection limiter)"
+echo "Build: stable-v7.2 (Koyeb health-safe listener + long-running supervisor + per-IP connection limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
@@ -169,6 +169,16 @@ sed \
   -e "s|UPSTREAM_1_PLACEHOLDER|${U1_ESCAPED}|g" \
   -e "s|UPSTREAM_2_PLACEHOLDER|${U2_ESCAPED}|g" \
   "$TEMPLATE" > "$RUNTIME_CONFIG"
+
+# Hard-fail on unresolved listener placeholders.
+if grep -Eq "(PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER|BACKEND_[0-9]+)" "$RUNTIME_CONFIG"; then
+  echo "ERROR: unresolved listener placeholder in generated MosDNS config:" >&2
+  grep -nE "(PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER|BACKEND_[0-9]+)" "$RUNTIME_CONFIG" >&2 || true
+  exit 1
+fi
+
+echo "Generated MosDNS listener:"
+grep -n "addr:" "$RUNTIME_CONFIG" || true
 
 echo "Failover order:"
 echo "  1. ${ORDER_0}"
