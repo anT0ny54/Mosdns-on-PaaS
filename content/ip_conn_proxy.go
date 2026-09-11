@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -154,6 +156,47 @@ func main() {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "per-IP connection limit exceeded", http.StatusTooManyRequests)
 			return
+		}
+
+		// RFC 8484 / Cromite compatibility:
+		// accept both GET ?dns= and POST application/dns-message.  Do not
+		// rewrite the request body or query; the reverse proxy forwards them
+		// unchanged to MosDNS.  Explicitly advertise the DoH media type.
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Method == http.MethodPost {
+			ct := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+			if ct != "application/dns-message" {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				http.Error(w, "unsupported DoH content type", http.StatusUnsupportedMediaType)
+				return
+			}
+		}
+		if r.Method == http.MethodGet {
+			if r.URL.Query().Get("dns") == "" {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				http.Error(w, "missing dns query", http.StatusBadRequest)
+				return
+			}
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Method == http.MethodPost && r.Body != nil {
+			// Keep a bounded body in the request stream and ensure the proxy can
+			// replay it if its transport retries internally.
+			const maxDoHBody = 64 << 10
+			b, err := io.ReadAll(io.LimitReader(r.Body, maxDoHBody+1))
+			if err != nil {
+				http.Error(w, "invalid DoH request body", http.StatusBadRequest)
+				return
+			}
+			if len(b) > maxDoHBody {
+				http.Error(w, "DoH request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(b))
 		}
 		proxy.ServeHTTP(w, r)
 	})

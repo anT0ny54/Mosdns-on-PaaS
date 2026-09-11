@@ -149,7 +149,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.5 (strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle + per-IP limiter)"
+echo "Build: stable-v7.6 (Cromite DoH compatibility + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle + per-IP limiter)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
