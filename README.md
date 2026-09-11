@@ -1,4 +1,4 @@
-# Stability update (v6)
+# MosDNS on Koyeb v7
 
 This revision is tuned for a Koyeb 512 MB / 0.1 vCPU Free Instance that must
 remain responsive for long periods.
