@@ -4,6 +4,9 @@ set -eu
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
 : "${IP_CONN_LIMIT:=0}"
+: "${DOH_RATE_LIMIT:=30}"
+: "${DOH_RATE_BURST:=60}"
+: "${DOH_RATE_MAX_IPS:=4096}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=4096}"
@@ -35,6 +38,8 @@ validate_float01() {
 validate_uint PORT "$PORT"
 validate_uint MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
+validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
+validate_uint DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS"
 validate_uint CACHE_SIZE "$CACHE_SIZE"
 validate_uint CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL"
 validate_uint MAX_QPS "$MAX_QPS"
@@ -45,11 +50,14 @@ validate_uint DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT"
 validate_uint HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS"
 validate_uint HEALTH_SWITCH_MARGIN_MS "$HEALTH_SWITCH_MARGIN_MS"
 validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
+case "$DOH_RATE_LIMIT" in *[!0-9.]*|"" ) echo "Invalid DOH_RATE_LIMIT: $DOH_RATE_LIMIT" >&2; exit 1 ;; esac
 validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
 
 [ "$PORT" -gt 0 ] || { echo "PORT must be > 0" >&2; exit 1; }
 [ "$MOSDNS_BACKEND_PORT" -gt 0 ] || { echo "MOSDNS_BACKEND_PORT must be > 0" >&2; exit 1; }
-[ "$IP_CONN_LIMIT" -ge 0 ] || { echo "IP_CONN_LIMIT must be >= 0 (0 = unlimited)" >&2; exit 1; }
+[ "$IP_CONN_LIMIT" -ge 0 ] || { echo "IP_CONN_LIMIT must be >= 0 (0 = unlimited; recommended for Firefox/Fennec)" >&2; exit 1; }
+[ "$DOH_RATE_BURST" -gt 0 ] || { echo "DOH_RATE_BURST must be > 0" >&2; exit 1; }
+[ "$DOH_RATE_MAX_IPS" -gt 0 ] || { echo "DOH_RATE_MAX_IPS must be > 0" >&2; exit 1; }
 [ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
 [ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
@@ -165,7 +173,7 @@ trap cleanup TERM INT EXIT
 echo "=== MosDNS runtime ==="
 mosdns version
 echo "======================"
-echo "Build: stable-v7.8.4 (Firefox/Fennec/Cromite DoH-compatible GET/POST proxy + no-429 DoH path + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
+echo "Build: stable-v7.8.5 (Firefox/Fennec/Cromite DoH-compatible GET/POST proxy + per-IP anti-abuse request rate limiting + strict DoH-only upstreams + no plain-DNS listener + Koyeb-managed lifecycle)"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled (fail-closed DoH-only)"
 echo "Plain DNS listener: disabled"
@@ -178,7 +186,8 @@ echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Automatic process restart: disabled; Koyeb manages lifecycle"
 echo "Cromite/Firefox DoH compatibility: GET + POST application/dns-message"
 echo "Firefox Max Protection target: ${DOH_PATH} (server-side plain DNS disabled)"
-echo "Per-IP concurrent connection cap: ${IP_CONN_LIMIT} (0 = unlimited for DoH compatibility)"
+echo "Per-IP connection cap: ${IP_CONN_LIMIT} (0 = unlimited; request rate limiter handles abuse)"
+echo "DoH anti-abuse rate limit: ${DOH_RATE_LIMIT}/s, burst ${DOH_RATE_BURST}, max tracked IPs ${DOH_RATE_MAX_IPS}"
 echo "Koyeb health endpoint: ${HEALTH_PATH}"
 echo "MosDNS backend port: ${MOSDNS_BACKEND_PORT}"
 
@@ -232,8 +241,8 @@ echo "  3. ${ORDER_2}"
 
 # Public HTTP listener is the lightweight limiter proxy. MosDNS stays private
 # on 127.0.0.1 so every public request passes through the per-IP limiter.
-echo "Starting per-IP connection limiter on :${PORT} -> 127.0.0.1:${MOSDNS_BACKEND_PORT}"
-LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
+echo "Starting Firefox-safe DoH anti-abuse proxy on :${PORT} -> 127.0.0.1:${MOSDNS_BACKEND_PORT}"
+LISTEN_ADDR=":${PORT}" BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" IP_CONN_LIMIT="${IP_CONN_LIMIT}" DOH_RATE_LIMIT="${DOH_RATE_LIMIT}" DOH_RATE_BURST="${DOH_RATE_BURST}" DOH_RATE_MAX_IPS="${DOH_RATE_MAX_IPS}" HEALTH_PATH="${HEALTH_PATH}" DOH_PATH="${DOH_PATH}" ip-conn-proxy &
 PROXY_PID=$!
 
 # Keep both public proxy and MosDNS supervised. If either process dies, terminate

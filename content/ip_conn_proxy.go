@@ -78,6 +78,75 @@ func (l *limiter) allow(ip string, s *connState) bool {
 	return true
 }
 
+// rateBucket is a small standard-library-only token bucket. It deliberately
+// avoids an external dependency so the tiny Koyeb image remains simple.
+type rateBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	rate     float64
+	burst    float64
+	buckets  map[string]*rateBucket
+	maxPeers int
+}
+
+func newRateLimiter(ratePerSecond float64, burst, maxPeers int) *rateLimiter {
+	return &rateLimiter{
+		rate:     ratePerSecond,
+		burst:    float64(burst),
+		buckets:  make(map[string]*rateBucket),
+		maxPeers: maxPeers,
+	}
+}
+
+func (r *rateLimiter) allow(ip string, now time.Time) bool {
+	if r.rate <= 0 || r.burst <= 0 {
+		return true
+	}
+	if ip == "" {
+		ip = "unknown"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b := r.buckets[ip]
+	if b == nil {
+		if len(r.buckets) >= r.maxPeers {
+			// The map is only a bounded anti-abuse cache. If it fills, evict one
+			// old bucket; active clients immediately get a fresh burst allowance.
+			var oldestIP string
+			var oldest time.Time
+			for k, v := range r.buckets {
+				if oldestIP == "" || v.last.Before(oldest) {
+					oldestIP, oldest = k, v.last
+				}
+			}
+			if oldestIP != "" {
+				delete(r.buckets, oldestIP)
+			}
+		}
+		b = &rateBucket{tokens: r.burst, last: now}
+		r.buckets[ip] = b
+	}
+
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.tokens += elapsed * r.rate
+		if b.tokens > r.burst {
+			b.tokens = r.burst
+		}
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
 func clientIP(r *http.Request) string {
 	// Koyeb's public proxy supplies X-Forwarded-For. Use the first address,
 	// which is the original client when the proxy appends rather than replaces.
@@ -104,10 +173,22 @@ func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
 	max := getenvInt("IP_CONN_LIMIT", 0)
+	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 30)
+	rateBurst := getenvInt("DOH_RATE_BURST", 60)
+	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 4096)
 	healthPath := getenv("HEALTH_PATH", "/health")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 0 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 0 (0 = unlimited)")
+	}
+	if ratePerSecond < 0 {
+		log.Fatalf("DOH_RATE_LIMIT must be >= 0 (0 = unlimited)")
+	}
+	if rateBurst < 0 {
+		log.Fatalf("DOH_RATE_BURST must be >= 0")
+	}
+	if ratePeers < 1 {
+		log.Fatalf("DOH_RATE_MAX_IPS must be >= 1")
 	}
 
 	target, err := url.Parse("http://" + backendAddr)
@@ -115,9 +196,6 @@ func main() {
 		log.Fatal(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	// Never inherit HTTP(S)_PROXY from the Koyeb/container environment.
-	// The public DoH path must go directly to the private MosDNS listener;
-	// an ambient proxy can otherwise create an unexpected network path.
 	proxy.Transport = &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
@@ -133,18 +211,15 @@ func main() {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
 
-	lim := newLimiter(max)
+	connLim := newLimiter(max)
+	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only expose the configured DoH path plus the health endpoint.
-		// Rejecting arbitrary paths reduces accidental proxy use and prevents
-		// this public listener from becoming a generic HTTP forwarder.
-		if r.URL.Path != healthPath && r.URL.Path != getenv("DOH_PATH", "/dns-query") {
+		dohPath := getenv("DOH_PATH", "/dns-query")
+		if r.URL.Path != healthPath && r.URL.Path != dohPath {
 			http.NotFound(w, r)
 			return
 		}
 
-		// Health is successful only when the private MosDNS listener is reachable.
-		// This prevents Koyeb from marking an instance healthy while MosDNS is down.
 		if r.URL.Path == healthPath {
 			w.Header().Set("Cache-Control", "no-store")
 			c, err := net.DialTimeout("tcp", backendAddr, healthTimeout)
@@ -157,23 +232,25 @@ func main() {
 			_, _ = w.Write([]byte("ok\n"))
 			return
 		}
-		v := r.Context().Value(connStateKey{})
-		state, _ := v.(*connState)
-		if state == nil {
+
+		state := r.Context().Value(connStateKey{})
+		connStateValue, _ := state.(*connState)
+		if connStateValue == nil {
 			http.Error(w, "internal limiter error", http.StatusInternalServerError)
 			return
 		}
 		ip := clientIP(r)
-		if !lim.allow(ip, state) {
+
+		// Keep the connection cap disabled by default for Firefox/Fennec DoH.
+		// The abuse control is request-rate based instead of connection based.
+		if max > 0 && !connLim.allow(ip, connStateValue) {
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "per-IP connection limit exceeded", http.StatusTooManyRequests)
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
 			return
 		}
-		// IMPORTANT: keep RFC 8484 GET requests intact. MosDNS v4.5.3's HTTP
-		// listener implements the DoH GET form (dns=base64url) itself. Rewriting
-		// Firefox GET requests to POST here can break provider validation and is
-		// unnecessary. Only normalize the Accept header; preserve method, query,
-		// body, and Content-Type exactly as supplied by Firefox/Cromite.
+
+		// Keep RFC 8484 GET requests intact. MosDNS handles the dns=base64url
+		// GET form itself. Preserve method, query, body and Content-Type.
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -182,6 +259,13 @@ func main() {
 			http.Error(w, "missing dns parameter", http.StatusBadRequest)
 			return
 		}
+
+		if !rateLim.allow(ip, time.Now()) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+
 		r.Header.Set("Accept", "application/dns-message")
 		proxy.ServeHTTP(w, r)
 	})
@@ -193,20 +277,20 @@ func main() {
 		IdleTimeout:       300 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			state := lim.registerConn(c)
+			state := connLim.registerConn(c)
 			return context.WithValue(ctx, connStateKey{}, state)
 		},
 		ConnState: func(c net.Conn, state http.ConnState) {
 			if state == http.StateClosed {
-				lim.closeConn(c)
+				connLim.closeConn(c)
 			}
 		},
 	}
 
 	if max == 0 {
-		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=unlimited, health=%s)", listenAddr, backendAddr, healthPath)
+		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=unlimited, rate=%g/s burst=%d max-IPs=%d, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, healthPath)
 	} else {
-		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=%d, health=%s)", listenAddr, backendAddr, max, healthPath)
+		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=%d, rate=%g/s burst=%d max-IPs=%d, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, healthPath)
 	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
@@ -221,8 +305,17 @@ func getenv(k, d string) string {
 	}
 	return d
 }
+
 func getenvInt(k string, d int) int {
 	v, err := strconv.Atoi(getenv(k, strconv.Itoa(d)))
+	if err != nil {
+		return d
+	}
+	return v
+}
+
+func getenvFloat(k string, d float64) float64 {
+	v, err := strconv.ParseFloat(getenv(k, strconv.FormatFloat(d, 'f', -1, 64)), 64)
 	if err != nil {
 		return d
 	}
