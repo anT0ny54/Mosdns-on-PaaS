@@ -31,8 +31,8 @@ plugins:
         - addr: __UPSTREAM_0__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: true
-          max_conns: 1
+          enable_pipeline: false
+          max_conns: 2
 
   - tag: upstream_1
     type: fast_forward
@@ -41,8 +41,8 @@ plugins:
         - addr: __UPSTREAM_1__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: true
-          max_conns: 1
+          enable_pipeline: false
+          max_conns: 2
 
   - tag: upstream_2
     type: fast_forward
@@ -51,8 +51,8 @@ plugins:
         - addr: __UPSTREAM_2__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: true
-          max_conns: 1
+          enable_pipeline: false
+          max_conns: 2
 
   # Strictly sequential failover. No parallel upstream fan-out on the hot path.
   - tag: sequential_failover

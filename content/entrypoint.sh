@@ -12,7 +12,7 @@ set -eu
 : "${MAX_QPS:=20}"
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${UPSTREAM_IDLE_TIMEOUT:=30}"
-: "${SERVER_TIMEOUT:=10}"
+: "${SERVER_TIMEOUT:=30}"
 : "${UPSTREAM_MODE:=doh-only}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_CHECK:=true}"
