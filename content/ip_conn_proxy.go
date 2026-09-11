@@ -78,6 +78,38 @@ func (l *limiter) allow(ip string, s *connState) bool {
 	return true
 }
 
+type globalConnLimiter struct {
+	mu     sync.Mutex
+	max    int
+	active map[net.Conn]struct{}
+}
+
+func newGlobalConnLimiter(max int) *globalConnLimiter {
+	return &globalConnLimiter{max: max, active: make(map[net.Conn]struct{})}
+}
+
+func (g *globalConnLimiter) add(c net.Conn) bool {
+	if g.max <= 0 {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.active) >= g.max {
+		return false
+	}
+	g.active[c] = struct{}{}
+	return true
+}
+
+func (g *globalConnLimiter) remove(c net.Conn) {
+	if g.max <= 0 {
+		return
+	}
+	g.mu.Lock()
+	delete(g.active, c)
+	g.mu.Unlock()
+}
+
 // rateBucket is a small standard-library-only token bucket. It deliberately
 // avoids an external dependency so the tiny Koyeb image remains simple.
 type rateBucket struct {
@@ -176,7 +208,11 @@ func main() {
 	max := getenvInt("IP_CONN_LIMIT", 0)
 	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 30)
 	rateBurst := getenvInt("DOH_RATE_BURST", 60)
-	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 4096)
+	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 512)
+	globalRatePerSecond := getenvFloat("GLOBAL_RATE_LIMIT", 40)
+	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 80)
+	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 128)
+	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthPath := getenv("HEALTH_PATH", "/health")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 0 {
@@ -190,6 +226,18 @@ func main() {
 	}
 	if ratePeers < 1 {
 		log.Fatalf("DOH_RATE_MAX_IPS must be >= 1")
+	}
+	if globalRatePerSecond < 0 {
+		log.Fatalf("GLOBAL_RATE_LIMIT must be >= 0 (0 = unlimited)")
+	}
+	if globalRateBurst < 0 {
+		log.Fatalf("GLOBAL_RATE_BURST must be >= 0")
+	}
+	if globalConnLimit < 0 {
+		log.Fatalf("GLOBAL_CONN_LIMIT must be >= 0 (0 = unlimited)")
+	}
+	if maxBodyBytes < 1 {
+		log.Fatalf("DOH_MAX_BODY_BYTES must be >= 1")
 	}
 
 	target, err := url.Parse("http://" + backendAddr)
@@ -213,7 +261,9 @@ func main() {
 	}
 
 	connLim := newLimiter(max)
+	globalConnLim := newGlobalConnLimiter(globalConnLimit)
 	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
+	globalRateLim := newRateLimiter(globalRatePerSecond, globalRateBurst, 1)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dohPath := getenv("DOH_PATH", "/dns-query")
 		if r.URL.Path != healthPath && r.URL.Path != dohPath {
@@ -250,18 +300,42 @@ func main() {
 			return
 		}
 
-		// Keep RFC 8484 GET requests intact. MosDNS handles the dns=base64url
-		// GET form itself. Preserve method, query, body and Content-Type.
+		// Only RFC 8484 GET/POST DoH requests are accepted. Reject malformed
+		// or oversized requests before they reach MosDNS.
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if r.Method == http.MethodGet && r.URL.Query().Get("dns") == "" {
-			http.Error(w, "missing dns parameter", http.StatusBadRequest)
-			return
+		if r.Method == http.MethodGet {
+			dnsParam := r.URL.Query().Get("dns")
+			if dnsParam == "" {
+				http.Error(w, "missing dns parameter", http.StatusBadRequest)
+				return
+			}
+			if len(dnsParam) > int(maxBodyBytes) {
+				http.Error(w, "dns query too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+		} else {
+			contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0]))
+			if contentType != "application/dns-message" {
+				http.Error(w, "unsupported content type", http.StatusUnsupportedMediaType)
+				return
+			}
+			if r.ContentLength > maxBodyBytes {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		}
 
-		if !rateLim.allow(ip, time.Now()) {
+		now := time.Now()
+		if !globalRateLim.allow("global", now) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "service rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		if !rateLim.allow(ip, now) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
@@ -282,16 +356,22 @@ func main() {
 			return context.WithValue(ctx, connStateKey{}, state)
 		},
 		ConnState: func(c net.Conn, state http.ConnState) {
-			if state == http.StateClosed {
+			switch state {
+			case http.StateNew:
+				if !globalConnLim.add(c) {
+					_ = c.Close()
+				}
+			case http.StateClosed:
+				globalConnLim.remove(c)
 				connLim.closeConn(c)
 			}
 		},
 	}
 
 	if max == 0 {
-		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=unlimited, rate=%g/s burst=%d max-IPs=%d, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, healthPath)
+		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=unlimited, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPath)
 	} else {
-		log.Printf("DoH compatibility proxy listening on %s -> %s (per-IP connection cap=%d, rate=%g/s burst=%d max-IPs=%d, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, healthPath)
+		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPath)
 	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)

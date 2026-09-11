@@ -1,7 +1,7 @@
 log:
   level: warn
 
-# v7.8.2 LEAK-RESISTANT POLICY:
+# v7.8.7 STRICT PUBLIC DoH POLICY:
 # There is intentionally NO plain UDP/TCP DNS listener.
 # All recursive queries leave MosDNS only through HTTPS DoH upstreams.
 
@@ -13,8 +13,7 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
-  # Bounded hot cache. 4096 is a safer default for 512 MiB/0.1 vCPU;
-  # increase only after measuring hit rate and memory.
+  # Bounded hot cache. 2048 is the recommended size for 512 MiB/0.1 vCPU.
   - tag: mem_cache
     type: cache
     args:
