@@ -1,6 +1,24 @@
+# Stability update (v6)
+
+This revision is tuned for a Koyeb 512 MB / 0.1 vCPU Free Instance that must
+remain responsive for long periods.
+
+- MosDNS is now a **long-running process**. The previous timed upstream rotation
+  restarted MosDNS every 15 minutes by default; that is removed because repeated
+  process replacement is unnecessary and can create avoidable connection gaps.
+- All three HaGeZi DoH endpoints remain available through **sequential failover**
+  in the same MosDNS process.
+- A small supervisor automatically restarts MosDNS if the child process exits,
+  with exponential backoff up to 30 seconds.
+- The bounded warm cache is retained.
+- Koyeb's TCP health check can still restart the instance if the listener stops
+  accepting connections.
+- This does **not** override Koyeb Free Instance scale-to-zero: Koyeb currently
+  scales a Free Instance to zero after 1 hour without Internet traffic.
+
 # MosDNS on Koyeb
 
-A lightweight Koyeb deployment of MosDNS v4.5.3 with DNS-over-HTTPS (DoH), three rotating HaGeZi upstreams, and a bounded warm-start cache.
+A lightweight Koyeb deployment of MosDNS v4.5.3 with DNS-over-HTTPS (DoH), three HaGeZi upstreams with sequential failover, and a bounded warm-start cache.
 
 ## Optimized for Koyeb 512 MB / 0.1 vCPU
 
@@ -9,8 +27,8 @@ The configuration is intentionally conservative:
 - MosDNS v4.5.3
 - one active DoH upstream at a time
 - per-query sequential failover across all three HaGeZi endpoints
-- three HaGeZi endpoints rotated every 30 minutes by default
-- deterministic round-robin rotation (`rotate`) so all three endpoints are used without random repeats
+- three HaGeZi endpoints kept available through sequential failover
+- health-aware startup ordering; all three endpoints remain in the failover chain
 - DNS pipelining enabled
 - 8,192-entry RAM cache by default
 - bounded disk warm-cache snapshot
@@ -67,17 +85,17 @@ A valid DNS response such as NXDOMAIN is not treated as a transport failure.
 2. `https://wurzn.hagezi.org/dns-query`
 3. `https://juuri.hagezi.org/dns-query`
 
-After the third endpoint, it returns to the first. This is preferable to pure random selection when the requirement is to continuously rotate among exactly three upstreams because random selection can choose the same endpoint repeatedly.
+The selected endpoint is preferred initially, while the other two remain immediate sequential fallbacks. There is no periodic process restart.
 
-The active MosDNS process is gracefully stopped at each rotation. The next process rebuilds the failover order with the newly selected upstream first. The warm-cache backend writes a final bounded snapshot during shutdown and the next process reloads it. The RAM cache therefore does not intentionally start empty after a normal rotation, provided the local cache file is still present.
+The active MosDNS process is not periodically restarted. The initial order is health-scored once at boot, then MosDNS continuously handles sequential failover. The warm-cache backend writes a final bounded snapshot during shutdown and the next process reloads it. The RAM cache therefore does not intentionally start empty after a normal rotation, provided the local cache file is still present.
 
-If you prefer random selection, set:
+If you prefer random ordering at startup, set:
 
 ```text
 HAGEZI_UPSTREAM=random
 ```
 
-For no rotation, set one fixed endpoint and the supervisor exits after MosDNS starts normally:
+For a fixed preferred endpoint, set one fixed endpoint; the two HaGeZi endpoints remain fallbacks:
 
 ```text
 HAGEZI_UPSTREAM=https://root.hagezi.org/dns-query
