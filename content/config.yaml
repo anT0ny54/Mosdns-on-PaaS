@@ -60,12 +60,11 @@ plugins:
   - tag: main
     type: sequence
     args:
-      exec:
-        - cache
-        - matches: has_resp
-          exec: accept
-        - fallback_2
-        - _return
+      - exec: $cache
+      - matches: has_resp
+        exec: accept
+      - exec: $fallback_2
+      - exec: _return
 
   - tag: doh_server
     type: http_server
