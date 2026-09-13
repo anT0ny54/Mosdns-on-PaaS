@@ -1,6 +1,6 @@
 # MosDNS v4.5.3, tuned for a tiny Koyeb Web Service.
 # Runtime target: 512 MiB RAM / 0.1 vCPU / 2 GiB SSD.
-FROM --platform=linux/amd64 golang:1.24-alpine3.22 AS build
+FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 
 WORKDIR /src
 ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
