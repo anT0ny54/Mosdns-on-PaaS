@@ -1,10 +1,7 @@
 log:
   level: warn
 
-# v7.8.7 STRICT PUBLIC DoH POLICY:
-# There is intentionally NO plain UDP/TCP DNS listener.
-# All recursive queries leave MosDNS only through HTTPS DoH upstreams.
-
+# Public DoH only. No UDP/TCP DNS listener is exposed.
 plugins:
   - tag: client_limit
     type: client_limiter
@@ -13,13 +10,14 @@ plugins:
       v4_mask: 32
       v6_mask: 48
 
-  # Bounded hot cache. 2048 is the recommended size for 512 MiB/0.1 vCPU.
+  # Small hot cache plus bounded disk-backed warm-start copy.
   - tag: mem_cache
     type: cache
     args:
       size: __CACHE_SIZE__
       lazy_cache_ttl: 43200
       lazy_cache_reply_ttl: 20
+      cache_everything: true
       dump_file: __CACHE_DUMP_FILE__
       dump_interval: __CACHE_DUMP_INTERVAL__
 
@@ -32,7 +30,7 @@ plugins:
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
-          max_conns: 2
+          max_conns: __UPSTREAM_MAX_CONNS__
 
   - tag: upstream_1
     type: fast_forward
@@ -43,7 +41,7 @@ plugins:
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
-          max_conns: 2
+          max_conns: __UPSTREAM_MAX_CONNS__
 
   - tag: upstream_2
     type: fast_forward
@@ -54,9 +52,10 @@ plugins:
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
-          max_conns: 2
+          max_conns: __UPSTREAM_MAX_CONNS__
 
-  # Strictly sequential failover. No parallel upstream fan-out on the hot path.
+  # Strict ordered failover: only contact the next resolver after failure.
+  # This avoids parallel fan-out and saves CPU/bandwidth on the hot path.
   - tag: sequential_failover
     type: sequence
     args:

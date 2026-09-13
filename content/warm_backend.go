@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bufio"
+	"container/list"
 	"encoding/gob"
 	"os"
 	"path/filepath"
@@ -18,6 +19,11 @@ type warmEntry struct {
 	ExpirationTime time.Time
 }
 
+type warmNode struct {
+	Key   string
+	Entry warmEntry
+}
+
 type warmDisk struct {
 	Entries map[string]warmEntry
 }
@@ -30,7 +36,8 @@ type warmBackend struct {
 	logger     *zap.Logger
 
 	mu      sync.RWMutex
-	entries map[string]warmEntry
+	entries map[string]*list.Element
+	order   *list.List // newest first; oldest entry is Back
 	stop    chan struct{}
 	done    chan struct{}
 	once    sync.Once
@@ -43,7 +50,8 @@ func newWarmBackend(inner cachepkg.Backend, path string, intervalSeconds int, ma
 		interval:   time.Duration(intervalSeconds) * time.Second,
 		maxEntries: maxEntries,
 		logger:     logger,
-		entries:    make(map[string]warmEntry),
+		entries:    make(map[string]*list.Element),
+		order:      list.New(),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
@@ -65,35 +73,48 @@ func (w *warmBackend) Get(key string) ([]byte, time.Time, time.Time) {
 		return v, st, exp
 	}
 
-	w.mu.RLock()
-	e, ok := w.entries[key]
-	if ok && (!e.ExpirationTime.IsZero() && !e.ExpirationTime.After(time.Now())) {
-		ok = false
-	}
-	w.mu.RUnlock()
+	w.mu.Lock()
+	el, ok := w.entries[key]
 	if !ok {
+		w.mu.Unlock()
 		return nil, time.Time{}, time.Time{}
 	}
+	n := el.Value.(warmNode)
+	e := n.Entry
+	if !e.ExpirationTime.IsZero() && !e.ExpirationTime.After(time.Now()) {
+		w.removeElementLocked(el)
+		w.mu.Unlock()
+		return nil, time.Time{}, time.Time{}
+	}
+	w.order.MoveToFront(el)
+	w.mu.Unlock()
 
-	// Backend.Get promises a value that the caller will not modify. The inner
-	// backend copies the value on Store, so there is no need for another
-	// allocation here.
 	w.inner.Store(key, e.Value, e.StoredTime, e.ExpirationTime)
 	return e.Value, e.StoredTime, e.ExpirationTime
 }
 
 func (w *warmBackend) Store(key string, v []byte, storedTime, expirationTime time.Time) {
-	if expirationTime.IsZero() || expirationTime.After(time.Now()) {
-		w.inner.Store(key, v, storedTime, expirationTime)
-		cp := append([]byte(nil), v...)
-		w.mu.Lock()
-		w.pruneLocked(time.Now())
-		if _, exists := w.entries[key]; !exists && w.maxEntries > 0 && len(w.entries) >= w.maxEntries {
-			w.evictOneLocked()
-		}
-		w.entries[key] = warmEntry{Value: cp, StoredTime: storedTime, ExpirationTime: expirationTime}
-		w.mu.Unlock()
+	if !expirationTime.IsZero() && !expirationTime.After(time.Now()) {
+		return
 	}
+
+	w.inner.Store(key, v, storedTime, expirationTime)
+	cp := append([]byte(nil), v...)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if el, ok := w.entries[key]; ok {
+		el.Value = warmNode{Key: key, Entry: warmEntry{Value: cp, StoredTime: storedTime, ExpirationTime: expirationTime}}
+		w.order.MoveToFront(el)
+		return
+	}
+
+	if w.maxEntries > 0 && w.order.Len() >= w.maxEntries {
+		w.removeElementLocked(w.order.Back())
+	}
+	el := w.order.PushFront(warmNode{Key: key, Entry: warmEntry{Value: cp, StoredTime: storedTime, ExpirationTime: expirationTime}})
+	w.entries[key] = el
 }
 
 func (w *warmBackend) Len() int { return w.inner.Len() }
@@ -137,44 +158,50 @@ func (w *warmBackend) load() {
 		w.warn("failed to decode warm cache; starting empty", zap.Error(err))
 		return
 	}
+
 	now := time.Now()
 	for k, e := range d.Entries {
-		if e.ExpirationTime.IsZero() || e.ExpirationTime.After(now) {
-			w.entries[k] = e
-			w.inner.Store(k, e.Value, e.StoredTime, e.ExpirationTime)
+		if !e.ExpirationTime.IsZero() && !e.ExpirationTime.After(now) {
+			continue
 		}
+		if _, exists := w.entries[k]; exists {
+			continue
+		}
+		if w.maxEntries > 0 && w.order.Len() >= w.maxEntries {
+			w.removeElementLocked(w.order.Back())
+		}
+		cp := append([]byte(nil), e.Value...)
+		el := w.order.PushBack(warmNode{Key: k, Entry: warmEntry{Value: cp, StoredTime: e.StoredTime, ExpirationTime: e.ExpirationTime}})
+		w.entries[k] = el
+		w.inner.Store(k, cp, e.StoredTime, e.ExpirationTime)
 	}
-	w.mu.Lock()
 	w.pruneLocked(now)
-	w.mu.Unlock()
-	w.info("loaded warm cache", zap.Int("entries", len(w.entries)))
-}
-
-func (w *warmBackend) evictOneLocked() {
-	var oldestKey string
-	var oldest time.Time
-	for k, e := range w.entries {
-		if e.ExpirationTime.IsZero() || e.ExpirationTime.After(time.Now()) {
-			if oldestKey == "" || e.StoredTime.Before(oldest) {
-				oldestKey = k
-				oldest = e.StoredTime
-			}
-		}
-	}
-	if oldestKey != "" {
-		delete(w.entries, oldestKey)
-	}
+	w.info("loaded warm cache", zap.Int("entries", w.order.Len()))
 }
 
 func (w *warmBackend) pruneLocked(now time.Time) {
-	for k, e := range w.entries {
+	for el := w.order.Back(); el != nil; {
+		prev := el.Prev()
+		n := el.Value.(warmNode)
+		e := n.Entry
 		if !e.ExpirationTime.IsZero() && !e.ExpirationTime.After(now) {
-			delete(w.entries, k)
+			w.removeElementLocked(el)
 		}
+		el = prev
 	}
-	for w.maxEntries > 0 && len(w.entries) > w.maxEntries {
-		w.evictOneLocked()
+}
+
+func (w *warmBackend) removeElementLocked(el *list.Element) {
+	if el == nil {
+		return
 	}
+	n, ok := el.Value.(warmNode)
+	if !ok {
+		w.order.Remove(el)
+		return
+	}
+	delete(w.entries, n.Key)
+	w.order.Remove(el)
 }
 
 func (w *warmBackend) snapshot() {
@@ -182,18 +209,16 @@ func (w *warmBackend) snapshot() {
 		return
 	}
 
-	// Take a shallow snapshot. warmEntry values are immutable after Store, so
-	// retaining their byte-slice references is safe and avoids duplicating the
-	// entire cache during every disk dump.
-	w.mu.RLock()
-	now := time.Now()
-	entries := make(map[string]warmEntry, len(w.entries))
-	for k, e := range w.entries {
-		if e.ExpirationTime.IsZero() || e.ExpirationTime.After(now) {
-			entries[k] = e
-		}
+	w.mu.Lock()
+	w.pruneLocked(time.Now())
+	entries := make(map[string]warmEntry, w.order.Len())
+	for el := w.order.Front(); el != nil; el = el.Next() {
+		n := el.Value.(warmNode)
+		e := n.Entry
+		e.Value = append([]byte(nil), e.Value...)
+		entries[n.Key] = e
 	}
-	w.mu.RUnlock()
+	w.mu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(w.path), 0755); err != nil {
 		w.warn("failed to create warm cache directory", zap.Error(err))
@@ -205,13 +230,10 @@ func (w *warmBackend) snapshot() {
 		w.warn("failed to create warm cache snapshot", zap.Error(err))
 		return
 	}
-	bw := bufio.NewWriter(f)
+	bw := bufio.NewWriterSize(f, 32<<10)
 	encErr := gob.NewEncoder(bw).Encode(warmDisk{Entries: entries})
 	if encErr == nil {
 		encErr = bw.Flush()
-	}
-	if encErr == nil {
-		encErr = f.Sync()
 	}
 	closeErr := f.Close()
 	if encErr == nil {
@@ -235,6 +257,7 @@ func (w *warmBackend) warn(msg string, fields ...zap.Field) {
 		w.logger.Warn(msg, fields...)
 	}
 }
+
 func (w *warmBackend) info(msg string, fields ...zap.Field) {
 	if w.logger != nil {
 		w.logger.Info(msg, fields...)

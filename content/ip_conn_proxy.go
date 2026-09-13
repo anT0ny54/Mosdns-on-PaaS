@@ -213,7 +213,6 @@ func main() {
 	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 80)
 	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 128)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
-	healthPath := getenv("HEALTH_PATH", "/health")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 0 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 0 (0 = unlimited)")
@@ -249,10 +248,10 @@ func main() {
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          12,
-		MaxIdleConnsPerHost:   8,
-		MaxConnsPerHost:       12,
-		IdleConnTimeout:       180 * time.Second,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+		MaxConnsPerHost:       8,
+		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -264,14 +263,15 @@ func main() {
 	globalConnLim := newGlobalConnLimiter(globalConnLimit)
 	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
 	globalRateLim := newRateLimiter(globalRatePerSecond, globalRateBurst, 1)
+	dohPath := getenv("DOH_PATH", "/dns-query")
+	healthPathValue := getenv("HEALTH_PATH", "/health")
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dohPath := getenv("DOH_PATH", "/dns-query")
-		if r.URL.Path != healthPath && r.URL.Path != dohPath {
+		if r.URL.Path != healthPathValue && r.URL.Path != dohPath {
 			http.NotFound(w, r)
 			return
 		}
 
-		if r.URL.Path == healthPath {
+		if r.URL.Path == healthPathValue {
 			w.Header().Set("Cache-Control", "no-store")
 			c, err := net.DialTimeout("tcp", backendAddr, healthTimeout)
 			if err != nil {
@@ -291,6 +291,11 @@ func main() {
 			return
 		}
 		ip := clientIP(r)
+
+		// Strip client-controlled forwarding headers before MosDNS sees the request.
+		// This keeps the server-side client_limiter aligned with the IP used here.
+		r.Header.Del("X-Real-IP")
+		r.Header.Set("X-Forwarded-For", ip)
 
 		// Keep the connection cap disabled by default for Firefox/Fennec DoH.
 		// The abuse control is request-rate based instead of connection based.
@@ -349,8 +354,8 @@ func main() {
 		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       300 * time.Second,
-		MaxHeaderBytes:    32 << 10,
+		IdleTimeout:       180 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			state := connLim.registerConn(c)
 			return context.WithValue(ctx, connStateKey{}, state)
@@ -369,9 +374,9 @@ func main() {
 	}
 
 	if max == 0 {
-		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=unlimited, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPath)
+		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=unlimited, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
 	} else {
-		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPath)
+		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
 	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
