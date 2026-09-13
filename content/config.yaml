@@ -20,8 +20,6 @@ plugins:
       upstreams:
         - addr: __UPSTREAM_0__
           dial_addr: __UPSTREAM_0_IP__
-          trusted: true
-          enable_pipeline: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
 
   - tag: upstream_1
@@ -31,8 +29,6 @@ plugins:
       upstreams:
         - addr: __UPSTREAM_1__
           dial_addr: __UPSTREAM_1_IP__
-          trusted: true
-          enable_pipeline: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
 
   - tag: upstream_2
@@ -42,8 +38,6 @@ plugins:
       upstreams:
         - addr: __UPSTREAM_2__
           dial_addr: __UPSTREAM_2_IP__
-          trusted: true
-          enable_pipeline: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
 
   # Sequential fallback keeps CPU/network use low on the 0.1-vCPU tier.

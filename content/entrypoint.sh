@@ -18,7 +18,6 @@ set -eu
 : "${IP_CONN_LIMIT:=0}"
 : "${UPSTREAM_IDLE_TIMEOUT:=30}"
 : "${DOH_IDLE_TIMEOUT:=90}"
-: "${SERVER_TIMEOUT:=5}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_CHECK:=true}"
 : "${HAGEZI_UPSTREAM:=health}"
@@ -48,7 +47,6 @@ is_uint DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES"
 is_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 is_uint UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT"
 is_uint DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT"
-is_uint SERVER_TIMEOUT "$SERVER_TIMEOUT"
 is_uint HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS"
 is_uint HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS"
 is_float DOH_RATE_LIMIT "$DOH_RATE_LIMIT"
@@ -63,7 +61,6 @@ is_float HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
 [ "$GLOBAL_RATE_BURST" -gt 0 ] || { echo "GLOBAL_RATE_BURST must be > 0" >&2; exit 1; }
 [ "$GLOBAL_CONN_LIMIT" -gt 0 ] || { echo "GLOBAL_CONN_LIMIT must be > 0" >&2; exit 1; }
 [ "$DOH_MAX_BODY_BYTES" -ge 512 ] || { echo "DOH_MAX_BODY_BYTES must be >= 512" >&2; exit 1; }
-[ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
 [ "$IP_CONN_LIMIT" -ge 0 ] || { echo "IP_CONN_LIMIT must be >= 0" >&2; exit 1; }
 
 case "$DOH_PATH" in /*) ;; *) echo "DOH_PATH must start with /" >&2; exit 1;; esac
@@ -83,7 +80,6 @@ CACHE_SIZE_E=$(esc "$CACHE_SIZE")
 CACHE_FILE_E=$(esc "$CACHE_DUMP_FILE")
 CACHE_INTERVAL_E=$(esc "$CACHE_DUMP_INTERVAL")
 UPSTREAM_IDLE_E=$(esc "$UPSTREAM_IDLE_TIMEOUT")
-SERVER_TIMEOUT_E=$(esc "$SERVER_TIMEOUT")
 DOH_IDLE_E=$(esc "$DOH_IDLE_TIMEOUT")
 U0_E=$(esc "$UPSTREAM_0")
 U1_E=$(esc "$UPSTREAM_1")
@@ -153,7 +149,6 @@ sed \
   -e "s|__UPSTREAM_2_IP__|$U2IP_E|g" \
   -e "s|__UPSTREAM_IDLE_TIMEOUT__|$UPSTREAM_IDLE_E|g" \
   -e "s|__MOSDNS_BACKEND_PORT__|$BACKEND_E|g" \
-  -e "s|__SERVER_TIMEOUT__|$SERVER_TIMEOUT_E|g" \
   -e "s|__DOH_IDLE_TIMEOUT__|$DOH_IDLE_E|g" \
   -e "s|__DOH_PATH__|$DOH_PATH_E|g" \
   /etc/mosdns/config.yaml > /tmp/mosdns-config.yaml
