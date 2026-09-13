@@ -214,6 +214,7 @@ func main() {
 	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 128)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthPath := getenv("HEALTH_PATH", "/health")
+	dohPath := getenv("DOH_PATH", "/dns-query")
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	if max < 0 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 0 (0 = unlimited)")
@@ -265,7 +266,6 @@ func main() {
 	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
 	globalRateLim := newRateLimiter(globalRatePerSecond, globalRateBurst, 1)
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dohPath := getenv("DOH_PATH", "/dns-query")
 		if r.URL.Path != healthPath && r.URL.Path != dohPath {
 			http.NotFound(w, r)
 			return
