@@ -1,77 +1,94 @@
 log:
   level: warn
 
-# MosDNS v5.3.4 configuration.
-# Public HTTP/DoH ingress is handled by the small Go proxy. MosDNS itself
-# listens only on loopback, so plain DNS is never exposed publicly.
+# v7.8.7 STRICT PUBLIC DoH POLICY:
+# There is intentionally NO plain UDP/TCP DNS listener.
+# All recursive queries leave MosDNS only through HTTPS DoH upstreams.
+
 plugins:
-  - tag: cache
+  - tag: client_limit
+    type: client_limiter
+    args:
+      max_qps: __MAX_QPS__
+      v4_mask: 32
+      v6_mask: 48
+
+  # Bounded hot cache. 2048 is the recommended size for 512 MiB/0.1 vCPU.
+  - tag: mem_cache
     type: cache
     args:
       size: __CACHE_SIZE__
       lazy_cache_ttl: 43200
+      lazy_cache_reply_ttl: 20
       dump_file: __CACHE_DUMP_FILE__
       dump_interval: __CACHE_DUMP_INTERVAL__
 
   - tag: upstream_0
-    type: forward
+    type: fast_forward
     args:
-      concurrent: 1
-      upstreams:
+      upstream:
         - addr: __UPSTREAM_0__
           dial_addr: __UPSTREAM_0_IP__
+          trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
+          enable_pipeline: true
+          max_conns: 2
 
   - tag: upstream_1
-    type: forward
+    type: fast_forward
     args:
-      concurrent: 1
-      upstreams:
+      upstream:
         - addr: __UPSTREAM_1__
           dial_addr: __UPSTREAM_1_IP__
+          trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
+          enable_pipeline: true
+          max_conns: 2
 
   - tag: upstream_2
-    type: forward
+    type: fast_forward
     args:
-      concurrent: 1
-      upstreams:
+      upstream:
         - addr: __UPSTREAM_2__
           dial_addr: __UPSTREAM_2_IP__
+          trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
+          enable_pipeline: true
+          max_conns: 2
 
-  # Sequential fallback keeps CPU/network use low on the 0.1-vCPU tier.
-  - tag: fallback_1
-    type: fallback
-    args:
-      primary: upstream_0
-      secondary: upstream_1
-      threshold: 350
-      always_standby: false
-
-  - tag: fallback_2
-    type: fallback
-    args:
-      primary: fallback_1
-      secondary: upstream_2
-      threshold: 350
-      always_standby: false
-
-  - tag: main
+  # Strictly sequential failover. No parallel upstream fan-out on the hot path.
+  - tag: sequential_failover
     type: sequence
     args:
-      - exec: $cache
-      - matches: has_resp
-        exec: accept
-      - exec: $fallback_2
-      - exec: return
+      exec:
+        - primary:
+            - upstream_0
+          secondary:
+            - primary:
+                - upstream_1
+              secondary:
+                - upstream_2
+              fast_fallback: 0
+              always_standby: false
+          fast_fallback: 0
+          always_standby: false
 
-  - tag: doh_server
-    type: http_server
+  - tag: forward
+    type: sequence
     args:
-      entries:
-        - path: __DOH_PATH__
-          exec: main
-      src_ip_header: X-Forwarded-For
-      listen: 127.0.0.1:__MOSDNS_BACKEND_PORT__
-      idle_timeout: __DOH_IDLE_TIMEOUT__
+      exec:
+        - client_limit
+        - _misc_optm
+        - mem_cache
+        - sequential_failover
+        - _return
+
+servers:
+  - exec: forward
+    timeout: __SERVER_TIMEOUT__
+    listeners:
+      - protocol: http
+        addr: "127.0.0.1:__MOSDNS_BACKEND_PORT__"
+        idle_timeout: __DOH_IDLE_TIMEOUT__
+        url_path: "__DOH_PATH__"
+        get_user_ip_from_header: "X-Forwarded-For"
