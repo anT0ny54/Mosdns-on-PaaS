@@ -383,75 +383,8 @@ If you find this project useful, donations are appreciated.
 See the repository's license file for licensing information.
 
 
-## Adaptive upstream health scoring
+## Runtime health supervisor (v8.1)
 
-The optimized build adds a tiny, statically linked `mosdns-probe` helper. At
-startup/rotation it sends a minimal DNS-over-HTTPS query to each configured
-upstream in parallel and ranks them by a simple health score:
+The health scorer now has two layers: startup scoring and a lightweight runtime supervisor. By default it probes the three configured DoH upstreams every 300 seconds (one small 3-endpoint probe cycle), keeps EWMA/failure state, and uses hysteresis before switching. A transient single failure does not restart MosDNS. The active upstream is switched only after repeated failure (`HEALTH_FAILS_TO_SWITCH=2`) or a materially better healthy endpoint is detected; restarts are rate-limited by `HEALTH_RESTART_COOLDOWN=900` seconds. The warm cache remains on disk so switching does not discard the warm-start cache.
 
-- healthy: measured request latency in milliseconds
-- failed: score `10000`, which pushes the endpoint to the end of the failover chain
-- in `rotate`/`random` mode, the selected healthy endpoint remains preferred so
-  rotation semantics are preserved without ignoring a dead resolver
-- in fixed-endpoint mode, the fixed endpoint remains first when healthy; if it
-  is down, the two healthy HaGeZi endpoints are tried first and the failed
-  fixed endpoint becomes the final fallback
-
-This is deliberately lightweight: the probe runs only at configuration
-rotation/restart rather than once per DNS query, so it adds no steady-state
-CPU cost to the request path.
-
-## Timeout and connection tuning
-
-The optimized defaults are:
-
-```text
-UPSTREAM_TIMEOUT=2
-UPSTREAM_IDLE_TIMEOUT=15
-SERVER_TIMEOUT=5
-HEALTH_TIMEOUT_MS=1200
-```
-
-The 2-second per-upstream timeout reduces long stalls while still allowing a
-normal DoH connection to complete. The 5-second server budget leaves enough
-time for sequential failover without making ordinary failures hang for the
-previous 3-second default. HTTP connection reuse is retained with a short
-15-second idle lifetime and one pooled connection per upstream, which keeps
-resident memory and idle sockets small on a 0.1-vCPU instance.
-
-## Cache / memory tuning
-
-The default RAM cache is reduced from 8192 to 4096 entries. This is a safer
-512-MiB baseline because DNS cache entries can vary substantially in memory
-cost. The warm snapshot remains bounded to the same cache size. The lazy cache
-window is 12 hours and the stale reply TTL is 20 seconds, reducing long-lived
-cache metadata while retaining useful warm-start behavior.
-
-Recommended starting environment:
-
-```text
-CACHE_SIZE=4096
-CACHE_DUMP_INTERVAL=900
-GOMEMLIMIT=384MiB
-MAX_QPS=20
-```
-
-If measurements show high cache churn, increase `CACHE_SIZE` to 8192 before
-increasing the Go memory limit. If memory pressure appears, keep 4096 or reduce
-it to 2048.
-
-## Adaptive v5
-
-This build adds failure-aware, smoothed upstream selection while preserving strictly sequential failover.
-
-- EWMA latency smoothing prevents one noisy probe from causing unnecessary switching.
-- Consecutive failures add a strong score penalty and move failed endpoints behind healthy ones.
-- Hysteresis prevents upstream churn unless the alternative is materially better.
-- The selected failover order is now the same order actually written into the runtime MosDNS config.
-- `rotate` remains adaptive: it rotates away from the current endpoint when another endpoint is meaningfully better, rather than blindly switching every interval.
-- `random` only randomizes among near-equal healthy endpoints.
-- Health state is kept in `/tmp/mosdns-upstream-state.tsv` and remains bounded to the small configured upstream set.
-- No unsupported `timeout` field is added to `fast_forward`; MosDNS v4.5.3 uses its built-in transport timeout behavior.
-
-Tunable environment variables: `HEALTH_EWMA_ALPHA` (default `0.35`), `HEALTH_FAILURE_PENALTY_MS` (default `1500`), `HEALTH_SWITCH_MARGIN_PCT` (default `0.20`), and `HEALTH_SWITCH_MARGIN_MS` (default `25`).
-
+Runtime health settings: `HEALTH_INTERVAL`, `HEALTH_FAILS_TO_SWITCH`, `HEALTH_RESTART_COOLDOWN`. For the 0.1-vCPU profile, the defaults intentionally favor low probe overhead and stability over aggressive failover.
