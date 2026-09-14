@@ -176,6 +176,56 @@ RUNTIME_CONFIG=/tmp/mosdns-config.yaml
 MOSDNS_PID=""
 PROXY_PID=""
 
+# Renders $TEMPLATE -> $RUNTIME_CONFIG using the current ORDER_0/ORDER_1/ORDER_2
+# upstream selection. Used both at startup and by the runtime health
+# supervisor, so the dial_addr cleanup and placeholder check can never drift
+# out of sync between the two call sites the way two hand-copied blocks can.
+# Renders to a temp file first and only replaces RUNTIME_CONFIG on success,
+# so a bad render never clobbers a config that is already working.
+render_config() {
+  ORDER_0_IP=$(upstream_ip_for_url "$ORDER_0")
+  ORDER_1_IP=$(upstream_ip_for_url "$ORDER_1")
+  ORDER_2_IP=$(upstream_ip_for_url "$ORDER_2")
+  U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
+  U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
+  U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
+  U0_IP_ESCAPED=$(sed_escape_replacement "$ORDER_0_IP")
+  U1_IP_ESCAPED=$(sed_escape_replacement "$ORDER_1_IP")
+  U2_IP_ESCAPED=$(sed_escape_replacement "$ORDER_2_IP")
+
+  candidate="${RUNTIME_CONFIG}.new"
+  sed \
+    -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
+    -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
+    -e "s|__DOH_PATH__|${DOH_PATH_ESCAPED}|g" \
+    -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
+    -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
+    -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
+    -e "s|__MAX_QPS__|${MAX_QPS_ESCAPED}|g" \
+    -e "s|__UPSTREAM_IDLE_TIMEOUT__|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
+    -e "s|__UPSTREAM_MAX_CONNS__|${UPSTREAM_MAX_CONNS_ESCAPED}|g" \
+    -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
+    -e "s|__UPSTREAM_1__|${U1_ESCAPED}|g" \
+    -e "s|__UPSTREAM_2__|${U2_ESCAPED}|g" \
+    -e "s|__UPSTREAM_0_IP__|${U0_IP_ESCAPED}|g" \
+    -e "s|__UPSTREAM_1_IP__|${U1_IP_ESCAPED}|g" \
+    -e "s|__UPSTREAM_2_IP__|${U2_IP_ESCAPED}|g" \
+    -e "s|__DOH_IDLE_TIMEOUT__|${DOH_IDLE_TIMEOUT_ESCAPED}|g" \
+    "$TEMPLATE" > "$candidate"
+
+  # Custom HAGEZI_UPSTREAM endpoints do not have a pinned IP in this image.
+  sed -i '/^[[:space:]]*dial_addr:[[:space:]]*$/d' "$candidate"
+
+  if grep -Eq '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$candidate"; then
+    echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
+    grep -nE '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$candidate" >&2 || true
+    rm -f "$candidate"
+    return 1
+  fi
+
+  mv "$candidate" "$RUNTIME_CONFIG"
+}
+
 cleanup() {
   trap - TERM INT EXIT
   if [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -219,41 +269,8 @@ echo "Anti-abuse: per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, global ${G
 echo "Selecting upstream order..."
 select_order
 
-U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
-U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
-U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
-ORDER_0_IP=$(upstream_ip_for_url "$ORDER_0")
-ORDER_1_IP=$(upstream_ip_for_url "$ORDER_1")
-ORDER_2_IP=$(upstream_ip_for_url "$ORDER_2")
-U0_IP_ESCAPED=$(sed_escape_replacement "$ORDER_0_IP")
-U1_IP_ESCAPED=$(sed_escape_replacement "$ORDER_1_IP")
-U2_IP_ESCAPED=$(sed_escape_replacement "$ORDER_2_IP")
-
-sed \
-  -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
-  -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
-  -e "s|__DOH_PATH__|${DOH_PATH_ESCAPED}|g" \
-  -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
-  -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
-  -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
-  -e "s|__MAX_QPS__|${MAX_QPS_ESCAPED}|g" \
-  -e "s|__UPSTREAM_IDLE_TIMEOUT__|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
-  -e "s|__UPSTREAM_MAX_CONNS__|${UPSTREAM_MAX_CONNS_ESCAPED}|g" \
-  -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
-  -e "s|__UPSTREAM_1__|${U1_ESCAPED}|g" \
-  -e "s|__UPSTREAM_2__|${U2_ESCAPED}|g" \
-  -e "s|__UPSTREAM_0_IP__|${U0_IP_ESCAPED}|g" \
-  -e "s|__UPSTREAM_1_IP__|${U1_IP_ESCAPED}|g" \
-  -e "s|__UPSTREAM_2_IP__|${U2_IP_ESCAPED}|g" \
-  -e "s|__DOH_IDLE_TIMEOUT__|${DOH_IDLE_TIMEOUT_ESCAPED}|g" \
-  "$TEMPLATE" > "$RUNTIME_CONFIG"
-
-# Custom HAGEZI_UPSTREAM endpoints do not have a pinned IP in this image.
-sed -i '/^[[:space:]]*dial_addr:[[:space:]]*$/d' "$RUNTIME_CONFIG"
-
-if grep -Eq '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$RUNTIME_CONFIG"; then
-  echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
-  grep -nE '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$RUNTIME_CONFIG" >&2 || true
+if ! render_config; then
+  echo "ERROR: failed to render initial MosDNS config; aborting startup" >&2
   exit 1
 fi
 
@@ -352,33 +369,10 @@ health_loop() {
         "$UPSTREAM_1") ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_2" ;;
         *) ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
       esac
-      U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
-      U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
-      U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
-      ORDER_0_IP=$(upstream_ip_for_url "$ORDER_0")
-      ORDER_1_IP=$(upstream_ip_for_url "$ORDER_1")
-      ORDER_2_IP=$(upstream_ip_for_url "$ORDER_2")
-      U0_IP_ESCAPED=$(sed_escape_replacement "$ORDER_0_IP")
-      U1_IP_ESCAPED=$(sed_escape_replacement "$ORDER_1_IP")
-      U2_IP_ESCAPED=$(sed_escape_replacement "$ORDER_2_IP")
-      sed \
-        -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
-        -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
-        -e "s|__DOH_PATH__|${DOH_PATH_ESCAPED}|g" \
-        -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
-        -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
-        -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
-        -e "s|__MAX_QPS__|${MAX_QPS_ESCAPED}|g" \
-        -e "s|__UPSTREAM_IDLE_TIMEOUT__|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
-        -e "s|__UPSTREAM_MAX_CONNS__|${UPSTREAM_MAX_CONNS_ESCAPED}|g" \
-        -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
-        -e "s|__UPSTREAM_1__|${U1_ESCAPED}|g" \
-        -e "s|__UPSTREAM_2__|${U2_ESCAPED}|g" \
-        -e "s|__UPSTREAM_0_IP__|${U0_IP_ESCAPED}|g" \
-        -e "s|__UPSTREAM_1_IP__|${U1_IP_ESCAPED}|g" \
-        -e "s|__UPSTREAM_2_IP__|${U2_IP_ESCAPED}|g" \
-        -e "s|__DOH_IDLE_TIMEOUT__|${DOH_IDLE_TIMEOUT_ESCAPED}|g" \
-        "$TEMPLATE" > "$RUNTIME_CONFIG"
+      if ! render_config; then
+        echo "Health supervisor: failed to render switched config; keeping current process" >&2
+        continue
+      fi
       oldpid="$MOSDNS_PID"
       mosdns start -c "$RUNTIME_CONFIG" &
       newpid=$!
