@@ -1,6 +1,11 @@
 # MosDNS v4.5.3, tuned for a tiny Koyeb Web Service.
 # Runtime target: 512 MiB RAM / 0.1 vCPU / 2 GiB SSD.
-FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
+#
+# Build-stage Go/Alpine versions are independent of the pinned mosdns v4.5.3
+# source tag below; bump them for security patches whenever convenient. A
+# newer local Go toolchain always satisfies an older go.mod's minimum
+# version, so this is safe with GOTOOLCHAIN=local.
+FROM --platform=linux/amd64 golang:1.26-alpine3.24 AS build
 
 WORKDIR /src
 ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
@@ -22,7 +27,7 @@ RUN go build -trimpath -ldflags='-s -w' -o /out/mosdns . \
  && go build -trimpath -ldflags='-s -w' -o /out/ip-conn-proxy ./probe/ip_conn_proxy.go \
  && /out/mosdns version
 
-FROM --platform=linux/amd64 alpine:3.22
+FROM --platform=linux/amd64 alpine:3.24
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S mosdns \
