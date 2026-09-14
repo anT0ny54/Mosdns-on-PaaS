@@ -232,8 +232,11 @@ See the repository's [LICENSE](LICENSE) file.
 
 ## Changelog
 
+**8.2.1**
+- Reverted the build-stage Go bump from 8.2.0 (`golang:1.19-alpine3.17` → `golang:1.26-alpine3.24`). It broke the build: mosdns v4.5.3 transitively depends on `github.com/lucas-clemente/quic-go v0.30.0` (pulled in by the built-in `forward` plugin even though this config only uses `fast_forward`), and that quic-go version has a deliberate compile-time guard refusing to build on Go 1.20+. The build stage is back on `golang:1.19-alpine3.17`; upgrading past Go 1.19 here would need replacing or vendoring that dependency first, which is out of scope for this pass. The runtime stage (`alpine:3.24`, no Go toolchain) is unaffected and stays current.
+
 **8.2.0**
 - Consolidated this README into a single, internally-consistent document (it previously carried several superseded revisions side by side, with conflicting env-var defaults and an inaccurate description of upstream rotation).
-- Bumped the build-stage Go/Alpine base images off end-of-life versions (`golang:1.19-alpine3.17` → `golang:1.26-alpine3.24`; runtime `alpine:3.22` → `alpine:3.24`, matching the build stage). The pinned `mosdns` source tag (`v4.5.3`) and all custom Go additions (warm cache backend, upstream health probe, anti-abuse proxy) are unchanged.
+- Bumped the runtime-stage Alpine image (`alpine:3.22` → `alpine:3.24`).
 - De-duplicated the config-rendering logic in `entrypoint.sh` into a single `render_config()` function used by both the startup path and the runtime health-supervisor swap path. This also fixes a latent bug: the swap path previously skipped the blank-`dial_addr` cleanup step, so a live upstream swap involving a custom (non-pinned-IP) `HAGEZI_UPSTREAM` endpoint could have rendered an invalid `dial_addr:` field into the runtime config.
 - No functional/plugin changes to the MosDNS configuration itself.

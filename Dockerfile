@@ -1,11 +1,15 @@
 # MosDNS v4.5.3, tuned for a tiny Koyeb Web Service.
 # Runtime target: 512 MiB RAM / 0.1 vCPU / 2 GiB SSD.
 #
-# Build-stage Go/Alpine versions are independent of the pinned mosdns v4.5.3
-# source tag below; bump them for security patches whenever convenient. A
-# newer local Go toolchain always satisfies an older go.mod's minimum
-# version, so this is safe with GOTOOLCHAIN=local.
-FROM --platform=linux/amd64 golang:1.26-alpine3.24 AS build
+# Build stage MUST stay on Go 1.19.x: v4.5.3 transitively depends on
+# github.com/lucas-clemente/quic-go v0.30.0 (pulled in by the built-in
+# `forward` plugin even though this config only uses `fast_forward`), and
+# that quic-go version has a deliberate compile-time guard that refuses to
+# build on Go 1.20+ ("can't be built on Go 1.20 yet"). This is a hard
+# upstream constraint, not a stale pin -- do not bump past golang:1.19 here
+# without also replacing/vendoring quic-go. The runtime stage below has no
+# Go toolchain and can be kept current independently.
+FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
 
 WORKDIR /src
 ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
