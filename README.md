@@ -192,17 +192,16 @@ Use this URL in any DNS client that supports DNS-over-HTTPS. Replace `/dns-query
 
 All three are configured as trusted resolvers with DNS pipelining enabled and are always kept in the sequential failover chain, regardless of which one is currently first.
 
-## Other free HaGeZi-backed DoH services
+## 🌐 Free DNS Services
 
-A few other public DoH endpoints that also apply HaGeZi blocklists (Multi Pro / TIF), for reference or as a fallback client configuration:
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
-| Service | DNS-over-HTTPS endpoint |
-| --- | --- |
-| `https://freedns.koyeb.app/dns-query` |
-| `https://freedns-six.vercel.app/api/doh/dns-query` |
-| `https://dnssix.netlify.app/api/doh/dns-query` |
-
-These are third-party/community services outside this project — expect usage limits and availability to vary.
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
 
 ## Health checks
 
