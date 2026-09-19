@@ -23,6 +23,7 @@ set -eu
 : "${SERVER_TIMEOUT:=8}"
 : "${UPSTREAM_MODE:=doh-only}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
+: "${HEALTH_BACKEND_TIMEOUT_MS:=1000}"
 : "${HEALTH_CHECK:=true}"
 : "${HEALTH_EWMA_ALPHA:=0.35}"
 : "${HEALTH_FAILURE_PENALTY_MS:=1500}"
@@ -45,6 +46,18 @@ validate_uint() {
   esac
 }
 
+validate_port() {
+  validate_uint "$1" "$2"
+  [ "$2" -ge 1 ] && [ "$2" -le 65535 ] || { echo "Invalid $1: $2 (must be 1-65535)" >&2; exit 1; }
+}
+
+validate_printable_ascii() {
+  LC_ALL=C; export LC_ALL
+  case "$2" in
+    ''|*[![:print:]]*) echo "Invalid $1: unsupported character(s)" >&2; exit 1 ;;
+  esac
+}
+
 validate_float01() {
   awk -v v="$2" 'BEGIN { exit !(v > 0 && v <= 1) }' 2>/dev/null || {
     echo "Invalid $1: $2 (must be >0 and <=1)" >&2
@@ -52,8 +65,20 @@ validate_float01() {
   }
 }
 
-validate_uint PORT "$PORT"
-validate_uint MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
+validate_nonnegative_float() {
+  case "$2" in
+    ''|*[!0-9.]*) echo "Invalid $1: $2 (must be a non-negative decimal)" >&2; exit 1 ;;
+  esac
+  awk -v v="$2" 'BEGIN {
+    if (v !~ /^[0-9]+([.][0-9]*)?$/ && v !~ /^[.][0-9]+$/) exit 1
+  }' 2>/dev/null || {
+    echo "Invalid $1: $2 (must be a non-negative decimal)" >&2
+    exit 1
+  }
+}
+
+validate_port PORT "$PORT"
+validate_port MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
 validate_uint DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS"
@@ -67,6 +92,7 @@ validate_uint UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT"
 validate_uint UPSTREAM_MAX_CONNS "$UPSTREAM_MAX_CONNS"
 validate_uint SERVER_TIMEOUT "$SERVER_TIMEOUT"
 validate_uint HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS"
+validate_uint HEALTH_BACKEND_TIMEOUT_MS "$HEALTH_BACKEND_TIMEOUT_MS"
 validate_uint DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT"
 validate_uint HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS"
 validate_uint HEALTH_SWITCH_MARGIN_MS "$HEALTH_SWITCH_MARGIN_MS"
@@ -75,9 +101,13 @@ validate_uint HEALTH_FAILS_TO_SWITCH "$HEALTH_FAILS_TO_SWITCH"
 validate_uint HEALTH_RESTART_COOLDOWN "$HEALTH_RESTART_COOLDOWN"
 validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
 validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
+validate_printable_ascii DOH_PATH "$DOH_PATH"
+validate_printable_ascii HEALTH_PATH "$HEALTH_PATH"
+validate_printable_ascii CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
+validate_printable_ascii HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
 
-case "$DOH_RATE_LIMIT" in *[!0-9.]*|"") echo "Invalid DOH_RATE_LIMIT: $DOH_RATE_LIMIT" >&2; exit 1 ;; esac
-case "$GLOBAL_RATE_LIMIT" in *[!0-9.]*|"") echo "Invalid GLOBAL_RATE_LIMIT: $GLOBAL_RATE_LIMIT" >&2; exit 1 ;; esac
+validate_nonnegative_float DOH_RATE_LIMIT "$DOH_RATE_LIMIT"
+validate_nonnegative_float GLOBAL_RATE_LIMIT "$GLOBAL_RATE_LIMIT"
 
 [ "$PORT" -gt 0 ] || { echo "PORT must be > 0" >&2; exit 1; }
 [ "$MOSDNS_BACKEND_PORT" -gt 0 ] || { echo "MOSDNS_BACKEND_PORT must be > 0" >&2; exit 1; }
@@ -90,6 +120,9 @@ case "$GLOBAL_RATE_LIMIT" in *[!0-9.]*|"") echo "Invalid GLOBAL_RATE_LIMIT: $GLO
 [ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
 [ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
+[ "$HEALTH_BACKEND_TIMEOUT_MS" -gt 0 ] || { echo "HEALTH_BACKEND_TIMEOUT_MS must be > 0" >&2; exit 1; }
+[ "$PORT" -ne "$MOSDNS_BACKEND_PORT" ] || { echo "PORT and MOSDNS_BACKEND_PORT must differ" >&2; exit 1; }
+[ "$HEALTH_PATH" != "$DOH_PATH" ] || { echo "HEALTH_PATH and DOH_PATH must differ" >&2; exit 1; }
 [ "$UPSTREAM_MAX_CONNS" -gt 0 ] || { echo "UPSTREAM_MAX_CONNS must be > 0" >&2; exit 1; }
 [ "$HEALTH_INTERVAL" -ge 30 ] || { echo "HEALTH_INTERVAL must be >= 30" >&2; exit 1; }
 [ "$HEALTH_FAILS_TO_SWITCH" -gt 0 ] || { echo "HEALTH_FAILS_TO_SWITCH must be > 0" >&2; exit 1; }
@@ -97,8 +130,11 @@ case "$GLOBAL_RATE_LIMIT" in *[!0-9.]*|"") echo "Invalid GLOBAL_RATE_LIMIT: $GLO
 
 case "$DOH_PATH" in /*) ;; *) echo "DOH_PATH must start with /" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in /*) ;; *) echo "HEALTH_PATH must start with /" >&2; exit 1 ;; esac
+case "$DOH_PATH" in *'?'*|*'#'*|*' '*) echo "DOH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
+case "$HEALTH_PATH" in *'?'*|*'#'*|*' '*) echo "HEALTH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HAGEZI_UPSTREAM" in rotate|random|https://*) ;; *) echo "HAGEZI_UPSTREAM must be 'rotate', 'random', or an https:// endpoint" >&2; exit 1 ;; esac
 case "$UPSTREAM_MODE" in doh-only) ;; *) echo "UPSTREAM_MODE must be doh-only" >&2; exit 1 ;; esac
+case "$HEALTH_CHECK" in true|false) ;; *) echo "HEALTH_CHECK must be true or false" >&2; exit 1 ;; esac
 
 UPSTREAM_0="https://root.hagezi.org/dns-query"
 UPSTREAM_1="https://wurzn.hagezi.org/dns-query"
@@ -109,11 +145,42 @@ case "$UPSTREAM_0 $UPSTREAM_1 $UPSTREAM_2" in
   *http://*|*udp://*|*tcp://*) echo "ERROR: plain-DNS upstream blocked (HTTPS DoH only)" >&2; exit 1 ;;
 esac
 
-probe_and_score() {
+PROBE_WARNED=0
+probe_upstreams() {
   [ "$HEALTH_CHECK" = "true" ] || return 1
-  command -v mosdns-probe >/dev/null 2>&1 || return 1
+  if ! command -v mosdns-probe >/dev/null 2>&1; then
+    if [ "$PROBE_WARNED" -eq 0 ]; then
+      echo "WARNING: mosdns-probe binary not found; upstream health checks disabled" >&2
+      PROBE_WARNED=1
+    fi
+    return 1
+  fi
   export HEALTH_TIMEOUT_MS HEALTH_EWMA_ALPHA HEALTH_FAILURE_PENALTY_MS HEALTH_SWITCH_MARGIN_PCT HEALTH_SWITCH_MARGIN_MS HEALTH_STATE_FILE HAGEZI_UPSTREAM
-  probe_output=$(mosdns-probe "$@" 2>/dev/null || true)
+  mosdns-probe "$@" 2>/dev/null
+}
+
+probe_candidate_set() {
+  case "$HAGEZI_UPSTREAM" in
+    rotate|random|"$UPSTREAM_0")
+      probe_upstreams "$UPSTREAM_0" "$UPSTREAM_1" "$UPSTREAM_2"
+      ;;
+    "$UPSTREAM_1")
+      probe_upstreams "$UPSTREAM_1" "$UPSTREAM_0" "$UPSTREAM_2"
+      ;;
+    "$UPSTREAM_2")
+      probe_upstreams "$UPSTREAM_2" "$UPSTREAM_0" "$UPSTREAM_1"
+      ;;
+    *)
+      # A fixed custom endpoint replaces the first built-in slot. Keep the
+      # other two built-ins as fallbacks so all three built-in locations remain
+      # represented across the built-in/fixed modes.
+      probe_upstreams "$HAGEZI_UPSTREAM" "$UPSTREAM_1" "$UPSTREAM_2"
+      ;;
+  esac
+}
+
+probe_and_score() {
+  probe_output=$(probe_candidate_set || true)
   [ -n "$probe_output" ] || return 1
 
   ORDER_0=$(printf '%s\n' "$probe_output" | sed -n '1p' | cut -f2)
@@ -125,23 +192,35 @@ probe_and_score() {
     awk -F '\t' '{ printf "  %s: raw=%sms ok=%s score=%s ewma=%sms failures=%s\n", $2,$3,$4,$5,$6,$7 }'
 }
 
-select_order() {
+set_default_order() {
   case "$HAGEZI_UPSTREAM" in
-    rotate|random)
-      if ! probe_and_score "$UPSTREAM_0" "$UPSTREAM_1" "$UPSTREAM_2"; then
-        ORDER_0="$UPSTREAM_0"
-        ORDER_1="$UPSTREAM_1"
-        ORDER_2="$UPSTREAM_2"
-      fi
+    rotate|random|"$UPSTREAM_0")
+      ORDER_0="$UPSTREAM_0"
+      ORDER_1="$UPSTREAM_1"
+      ORDER_2="$UPSTREAM_2"
+      ;;
+    "$UPSTREAM_1")
+      ORDER_0="$UPSTREAM_1"
+      ORDER_1="$UPSTREAM_0"
+      ORDER_2="$UPSTREAM_2"
+      ;;
+    "$UPSTREAM_2")
+      ORDER_0="$UPSTREAM_2"
+      ORDER_1="$UPSTREAM_0"
+      ORDER_2="$UPSTREAM_1"
       ;;
     *)
-      if ! probe_and_score "$HAGEZI_UPSTREAM" "$UPSTREAM_0" "$UPSTREAM_1"; then
-        ORDER_0="$HAGEZI_UPSTREAM"
-        ORDER_1="$UPSTREAM_0"
-        ORDER_2="$UPSTREAM_1"
-      fi
+      ORDER_0="$HAGEZI_UPSTREAM"
+      ORDER_1="$UPSTREAM_1"
+      ORDER_2="$UPSTREAM_2"
       ;;
   esac
+}
+
+select_order() {
+  if ! probe_and_score; then
+    set_default_order
+  fi
 }
 
 upstream_ip_for_url() {
@@ -154,11 +233,10 @@ upstream_ip_for_url() {
 }
 
 sed_escape_replacement() { printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }
+yaml_single_quote() { escaped=$(printf '%s' "$1" | sed "s/'/''/g"); printf "'%s'" "$escaped"; }
 
-DOH_PATH_ESCAPED=$(sed_escape_replacement "$DOH_PATH")
-HEALTH_PATH_ESCAPED=$(sed_escape_replacement "$HEALTH_PATH")
 CACHE_SIZE_ESCAPED=$(sed_escape_replacement "$CACHE_SIZE")
-CACHE_DUMP_FILE_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_FILE")
+CACHE_DUMP_FILE_ESCAPED=$(yaml_single_quote "$CACHE_DUMP_FILE" | sed 's/[\\&|]/\\&/g')
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
 MAX_QPS_ESCAPED=$(sed_escape_replacement "$MAX_QPS")
 MOSDNS_BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$MOSDNS_BACKEND_PORT")
@@ -186,9 +264,9 @@ render_config() {
   ORDER_0_IP=$(upstream_ip_for_url "$ORDER_0")
   ORDER_1_IP=$(upstream_ip_for_url "$ORDER_1")
   ORDER_2_IP=$(upstream_ip_for_url "$ORDER_2")
-  U0_ESCAPED=$(sed_escape_replacement "$ORDER_0")
-  U1_ESCAPED=$(sed_escape_replacement "$ORDER_1")
-  U2_ESCAPED=$(sed_escape_replacement "$ORDER_2")
+  U0_ESCAPED=$(yaml_single_quote "$ORDER_0" | sed 's/[\\&|]/\\&/g')
+  U1_ESCAPED=$(yaml_single_quote "$ORDER_1" | sed 's/[\\&|]/\\&/g')
+  U2_ESCAPED=$(yaml_single_quote "$ORDER_2" | sed 's/[\\&|]/\\&/g')
   U0_IP_ESCAPED=$(sed_escape_replacement "$ORDER_0_IP")
   U1_IP_ESCAPED=$(sed_escape_replacement "$ORDER_1_IP")
   U2_IP_ESCAPED=$(sed_escape_replacement "$ORDER_2_IP")
@@ -197,7 +275,7 @@ render_config() {
   sed \
     -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
     -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
-    -e "s|__DOH_PATH__|${DOH_PATH_ESCAPED}|g" \
+    -e "s|__DOH_PATH__|$(yaml_single_quote "$DOH_PATH" | sed 's/[\\&|]/\\&/g')|" \
     -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
@@ -267,6 +345,7 @@ echo "DoH endpoint: ${DOH_PATH}"
 echo "Anti-abuse: per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
 
 echo "Selecting upstream order..."
+unset HEALTH_ACTIVE_UPSTREAM 2>/dev/null || true
 select_order
 
 if ! render_config; then
@@ -291,6 +370,7 @@ GLOBAL_RATE_BURST="${GLOBAL_RATE_BURST}" \
 GLOBAL_CONN_LIMIT="${GLOBAL_CONN_LIMIT}" \
 DOH_MAX_BODY_BYTES="${DOH_MAX_BODY_BYTES}" \
 HEALTH_PATH="${HEALTH_PATH}" \
+HEALTH_BACKEND_TIMEOUT_MS="${HEALTH_BACKEND_TIMEOUT_MS}" \
 DOH_PATH="${DOH_PATH}" \
 GOMAXPROCS="${GOMAXPROCS}" \
 ip-conn-proxy &
@@ -300,97 +380,120 @@ echo "Starting MosDNS..."
 mosdns start -c "$RUNTIME_CONFIG" &
 MOSDNS_PID=$!
 
-# Lightweight runtime health loop:
-# - probes the three upstreams only every HEALTH_INTERVAL seconds
+# Lightweight runtime health supervisor:
+# - probes the active candidate set only once per HEALTH_INTERVAL
 # - never restarts for a single transient failure
-# - restarts MosDNS only when the active upstream is repeatedly bad or a materially
-#   better healthy upstream appears, preserving the warm cache on disk
-HEALTH_LOOP_PID=""
-health_loop() {
-  [ "$HEALTH_CHECK" = "true" ] || return 0
-  failures=0
-  last_restart=0
-  while :; do
-    sleep "$HEALTH_INTERVAL" || exit 0
-
-    now=$(date +%s)
-    [ $((now - last_restart)) -ge "$HEALTH_RESTART_COOLDOWN" ] || continue
-
-    tmp_probe=$(mktemp /tmp/mosdns-probe.XXXXXX) || continue
-    if ! probe_and_score "$UPSTREAM_0" "$UPSTREAM_1" "$UPSTREAM_2" >"$tmp_probe" 2>/dev/null; then
-      rm -f "$tmp_probe"
-      continue
-    fi
-
-    current="${ORDER_0:-$UPSTREAM_0}"
-    best=$(sed -n 's/^  \([^:]*\):.*/\1/p' "$tmp_probe" | sed -n '1p')
-    rm -f "$tmp_probe"
-    [ -n "$best" ] || continue
-
-    current_ok=0
-    current_failures=0
-    best_score=999999
-    current_score=999999
-    # Re-run the compact probe output once and parse tab-separated data from the
-    # state-producing helper; this costs only three DoH probes per interval.
-    raw=$(mosdns-probe "$UPSTREAM_0" "$UPSTREAM_1" "$UPSTREAM_2" 2>/dev/null || true)
-    [ -n "$raw" ] || continue
-    current_line=$(printf '%s\n' "$raw" | awk -F '\t' -v u="$current" '$2==u {print; exit}')
-    best_line=$(printf '%s\n' "$raw" | sed -n '1p')
-    current_ok=$(printf '%s\n' "$current_line" | awk -F '\t' '{print ($4=="true") ? 1 : 0}')
-    current_failures=$(printf '%s\n' "$current_line" | awk -F '\t' '{print $7+0}')
-    current_score=$(printf '%s\n' "$current_line" | awk -F '\t' '{print $5+0}')
-    best=$(printf '%s\n' "$best_line" | cut -f2)
-    best_score=$(printf '%s\n' "$best_line" | cut -f5)
-
-    if [ "$current_ok" -ne 1 ]; then
-      failures=$((failures + 1))
-    else
-      failures=0
-    fi
-
-    switch=0
-    if [ "$current" != "$best" ]; then
-      if [ "$current_ok" -ne 1 ] && [ "$failures" -ge "$HEALTH_FAILS_TO_SWITCH" ]; then
-        switch=1
-      elif [ "$current_score" -gt 0 ] && [ "$best_score" -gt 0 ]; then
-        improvement=$(( (current_score - best_score) * 100 ))
-        if [ "$improvement" -ge $((current_score * 30)) ] || [ $((current_score - best_score)) -ge 100 ]; then
-          switch=1
-        fi
-      fi
-    fi
-
-    if [ "$switch" -eq 1 ]; then
-      echo "Health supervisor: switching active upstream ${current} -> ${best}" >&2
-      ORDER_0="$best"
+# - applies the probe helper's configured hysteresis before changing order
+# - runs in the main shell so MOSDNS_PID and ORDER_* updates remain authoritative
+# - stops the current MosDNS process before starting the replacement, avoiding
+#   a second listener binding to the same 127.0.0.1:${MOSDNS_BACKEND_PORT}
+set_failover_order() {
+  best="$1"
+  case "$HAGEZI_UPSTREAM" in
+    rotate|random|"$UPSTREAM_0")
       case "$best" in
-        "$UPSTREAM_0") ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_1") ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_2" ;;
-        *) ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
+        "$UPSTREAM_0") ORDER_0="$UPSTREAM_0"; ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
+        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_2" ;;
+        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
+        *) return 1 ;;
       esac
-      if ! render_config; then
-        echo "Health supervisor: failed to render switched config; keeping current process" >&2
-        continue
-      fi
-      oldpid="$MOSDNS_PID"
-      mosdns start -c "$RUNTIME_CONFIG" &
-      newpid=$!
-      sleep 1
-      if kill -0 "$newpid" 2>/dev/null; then
-        kill -TERM "$oldpid" 2>/dev/null || true
-        MOSDNS_PID="$newpid"
-        last_restart=$(date +%s)
-        failures=0
-      else
-        echo "Health supervisor: new MosDNS config failed to start; keeping current process" >&2
-      fi
-    fi
-  done
+      ;;
+    "$UPSTREAM_1")
+      case "$best" in
+        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_2" ;;
+        "$UPSTREAM_0") ORDER_0="$UPSTREAM_0"; ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
+        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "$UPSTREAM_2")
+      case "$best" in
+        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
+        "$UPSTREAM_0") ORDER_0="$UPSTREAM_0"; ORDER_1="$UPSTREAM_2"; ORDER_2="$UPSTREAM_1" ;;
+        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$UPSTREAM_2"; ORDER_2="$UPSTREAM_0" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      case "$best" in
+        "$HAGEZI_UPSTREAM") ORDER_0="$HAGEZI_UPSTREAM"; ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
+        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$HAGEZI_UPSTREAM"; ORDER_2="$UPSTREAM_2" ;;
+        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$HAGEZI_UPSTREAM"; ORDER_2="$UPSTREAM_1" ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
 }
-health_loop &
-HEALTH_LOOP_PID=$!
 
+health_check_once() {
+  [ "$HEALTH_CHECK" = "true" ] || return 0
+
+  now=$(date +%s)
+  [ $((now - last_restart)) -ge "$HEALTH_RESTART_COOLDOWN" ] || return 0
+
+  current="${ORDER_0:-$UPSTREAM_0}"
+  raw=$(HEALTH_ACTIVE_UPSTREAM="$current" probe_candidate_set || true)
+  [ -n "$raw" ] || return 0
+
+  current_line=$(printf '%s\n' "$raw" | awk -F '\t' -v u="$current" '$2==u {print; exit}')
+  best_line=$(printf '%s\n' "$raw" | sed -n '1p')
+  [ -n "$current_line" ] && [ -n "$best_line" ] || return 0
+
+  current_ok=$(printf '%s\n' "$current_line" | awk -F '\t' '{print ($4=="true") ? 1 : 0}')
+  current_failures=$(printf '%s\n' "$current_line" | awk -F '\t' '{print $7+0}')
+  best=$(printf '%s\n' "$best_line" | cut -f2)
+  best_ok=$(printf '%s\n' "$best_line" | awk -F '\t' '{print ($4=="true") ? 1 : 0}')
+
+  switch=0
+  if [ "$current" != "$best" ] && [ "$best_ok" -eq 1 ]; then
+    if [ "$current_ok" -ne 1 ] && [ "$current_failures" -ge "$HEALTH_FAILS_TO_SWITCH" ]; then
+      switch=1
+    elif [ "$current_ok" -eq 1 ]; then
+      # When healthy, upstream_probe.go only moves a different endpoint to
+      # row 1 after HEALTH_SWITCH_MARGIN_PCT and HEALTH_SWITCH_MARGIN_MS
+      # both justify the change. No duplicate threshold logic belongs here.
+      switch=1
+    fi
+  fi
+
+  if [ "$switch" -ne 1 ]; then
+    return 0
+  fi
+
+  echo "Health supervisor: switching active upstream ${current} -> ${best}" >&2
+  set_failover_order "$best" || return 0
+  if ! render_config; then
+    echo "Health supervisor: failed to render switched config; keeping current process" >&2
+    return 0
+  fi
+
+  oldpid="$MOSDNS_PID"
+  kill -TERM "$oldpid" 2>/dev/null || true
+  i=0
+  while kill -0 "$oldpid" 2>/dev/null && [ "$i" -lt 10 ]; do
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$oldpid" 2>/dev/null; then
+    kill -KILL "$oldpid" 2>/dev/null || true
+  fi
+  wait "$oldpid" 2>/dev/null || true
+  MOSDNS_PID=""
+
+  mosdns start -c "$RUNTIME_CONFIG" &
+  newpid=$!
+  sleep 1
+  if kill -0 "$newpid" 2>/dev/null; then
+    MOSDNS_PID="$newpid"
+    last_restart=$(date +%s)
+  else
+    echo "Health supervisor: replacement MosDNS failed to start; exiting for instance restart" >&2
+    exit 1
+  fi
+}
+
+last_health_check=$(date +%s)
+last_restart=0
 while :; do
   if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
     echo "MosDNS exited; restarting instance via Koyeb" >&2
@@ -399,6 +502,12 @@ while :; do
   if ! kill -0 "$PROXY_PID" 2>/dev/null; then
     echo "DoH proxy exited; restarting instance via Koyeb" >&2
     exit 1
+  fi
+
+  now=$(date +%s)
+  if [ "$HEALTH_CHECK" = "true" ] && [ $((now - last_health_check)) -ge "$HEALTH_INTERVAL" ]; then
+    last_health_check="$now"
+    health_check_once
   fi
   sleep 2
 done

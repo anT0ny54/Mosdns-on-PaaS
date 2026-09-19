@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -40,6 +41,11 @@ func dnsQuery(id uint16) []byte {
 	return b
 }
 
+// probeClient is shared across probes so keep-alive connections are reused
+// between the parallel per-cycle probes and across probe cycles, instead of
+// paying a fresh TCP+TLS handshake for every single probe on a 0.1 vCPU box.
+var probeClient = &http.Client{}
+
 func probe(url string, timeout time.Duration) (int64, bool) {
 	var idBytes [2]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
@@ -52,9 +58,10 @@ func probe(url string, timeout time.Duration) (int64, bool) {
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	client := &http.Client{Timeout: timeout}
 	start := time.Now()
-	resp, err := client.Do(req)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	resp, err := probeClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return 0, false
 	}
@@ -152,19 +159,22 @@ func main() {
 
 	st := loadState(statePath)
 	out := make([]result, len(urls))
-	done := make(chan result, len(urls))
 	var wg sync.WaitGroup
 	for i, u := range urls {
 		wg.Add(1)
 		go func(i int, u string) {
 			defer wg.Done()
 			ms, ok := probe(u, timeout)
-			done <- result{idx: i, ok: ok, ms: ms, url: u}
+			out[i] = result{idx: i, ok: ok, ms: ms, url: u}
 		}(i, u)
 	}
 	wg.Wait()
-	close(done)
-	for r := range done {
+
+	// Update the shared state map serially after all probes complete. This keeps
+	// the allocation-free per-result slice optimization while avoiding concurrent
+	// map reads/writes (and preserving deterministic state updates by input order).
+	for i := range out {
+		r := &out[i]
 		s := st[r.url]
 		if r.ok {
 			if s.ewma <= 0 {
@@ -188,7 +198,6 @@ func main() {
 		}
 		r.ewma, r.failures, r.score = s.ewma, s.failures, score
 		st[r.url] = s
-		out[r.idx] = r
 	}
 	saveState(statePath, st)
 
@@ -206,6 +215,7 @@ func main() {
 	// Hysteresis: don't churn the active upstream for a small/temporary win.
 	// Switch only if the active endpoint is failed, or the best alternative is
 	// both materially faster and at least HEALTH_SWITCH_MARGIN_MS better.
+	keptActive := false
 	if active != "" && len(out) > 1 {
 		activePos, bestPos := -1, -1
 		for i := range out {
@@ -223,6 +233,7 @@ func main() {
 			absolute := cur.score - best.score
 			if improvement < switchPct || absolute < switchMs {
 				// Keep active first; retain the health ordering for the remainder.
+				keptActive = true
 				keep := out[activePos]
 				copy(out[1:activePos+1], out[0:activePos])
 				out[0] = keep
@@ -232,7 +243,7 @@ func main() {
 
 	// Random mode only randomizes near-equal healthy candidates. This preserves
 	// health awareness while avoiding deterministic pinning when requested.
-	if mode == "random" && len(out) > 1 && out[0].ok {
+	if mode == "random" && !keptActive && len(out) > 1 && out[0].ok {
 		best := out[0].score
 		cutoff := int64(float64(best) * 1.10)
 		if cutoff < best+10 {
@@ -245,8 +256,7 @@ func main() {
 			}
 		}
 		if candidates > 1 {
-			// A tiny deterministic rotation is enough; the outer process already
-			// rotates every interval, so no crypto RNG is needed here.
+			// A tiny time-based rotation is enough; no crypto RNG is needed here.
 			shift := int(time.Now().UnixNano() % int64(candidates))
 			if shift > 0 {
 				tmp := append([]result(nil), out[:candidates]...)

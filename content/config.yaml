@@ -21,8 +21,13 @@ plugins:
       dump_file: __CACHE_DUMP_FILE__
       dump_interval: __CACHE_DUMP_INTERVAL__
 
-  - tag: upstream_0
-    type: fast_forward
+  # True ordered failover: one upstream is contacted at a time, and the next
+  # upstream is used on the same query only when the previous exchange fails.
+  # This avoids the parallel behavior of fast_forward and avoids the v4.5.3
+  # fallback-node semantics, which otherwise do not provide immediate
+  # sequential retry when fast_fallback/stat tracking are disabled.
+  - tag: sequential_failover
+    type: sequential_forward
     args:
       upstream:
         - addr: __UPSTREAM_0__
@@ -32,10 +37,6 @@ plugins:
           enable_pipeline: true
           max_conns: __UPSTREAM_MAX_CONNS__
 
-  - tag: upstream_1
-    type: fast_forward
-    args:
-      upstream:
         - addr: __UPSTREAM_1__
           dial_addr: __UPSTREAM_1_IP__
           trusted: true
@@ -43,34 +44,12 @@ plugins:
           enable_pipeline: true
           max_conns: __UPSTREAM_MAX_CONNS__
 
-  - tag: upstream_2
-    type: fast_forward
-    args:
-      upstream:
         - addr: __UPSTREAM_2__
           dial_addr: __UPSTREAM_2_IP__
           trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           enable_pipeline: true
           max_conns: __UPSTREAM_MAX_CONNS__
-
-  # Strict ordered failover: only contact the next resolver after failure.
-  # This avoids parallel fan-out and saves CPU/bandwidth on the hot path.
-  - tag: sequential_failover
-    type: sequence
-    args:
-      exec:
-        - primary:
-            - upstream_0
-          secondary:
-            - primary:
-                - upstream_1
-              secondary:
-                - upstream_2
-              fast_fallback: 0
-              always_standby: false
-          fast_fallback: 0
-          always_standby: false
 
   - tag: forward
     type: sequence
@@ -89,5 +68,5 @@ servers:
       - protocol: http
         addr: "127.0.0.1:__MOSDNS_BACKEND_PORT__"
         idle_timeout: __DOH_IDLE_TIMEOUT__
-        url_path: "__DOH_PATH__"
+        url_path: __DOH_PATH__
         get_user_ip_from_header: "X-Forwarded-For"

@@ -180,19 +180,15 @@ func (r *rateLimiter) allow(ip string, now time.Time) bool {
 }
 
 func clientIP(r *http.Request) string {
-	// Koyeb's edge normally provides the original client in X-Real-IP.
-	// Prefer it because it is a single address and cannot be confused with
-	// a client-supplied comma-separated chain. Fall back to the first valid
-	// X-Forwarded-For address for deployments where only XFF is provided.
-	if x := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(x) != nil {
-		return x
-	}
+	// Koyeb appends the IP used to connect to the edge to X-Forwarded-For.
+	// Only the final XFF element is certifiable. Never walk backwards through
+	// the header: if the final element is malformed, an earlier element can
+	// still be attacker-controlled. In that case, fall back to RemoteAddr.
 	if x := r.Header.Get("X-Forwarded-For"); x != "" {
-		for _, part := range strings.Split(x, ",") {
-			ip := strings.TrimSpace(part)
-			if net.ParseIP(ip) != nil {
-				return ip
-			}
+		parts := strings.Split(x, ",")
+		ip := strings.TrimSpace(parts[len(parts)-1])
+		if net.ParseIP(ip) != nil {
+			return ip
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -293,9 +289,15 @@ func main() {
 		ip := clientIP(r)
 
 		// Strip client-controlled forwarding headers before MosDNS sees the request.
-		// This keeps the server-side client_limiter aligned with the IP used here.
+		// ReverseProxy will append its request RemoteAddr to X-Forwarded-For, so
+		// remove the inbound header and replace RemoteAddr with the already-validated
+		// client IP. This makes the backend receive exactly one trusted XFF value
+		// instead of "client,127.0.0.1".
 		r.Header.Del("X-Real-IP")
-		r.Header.Set("X-Forwarded-For", ip)
+		r.Header.Del("X-Forwarded-For")
+		if net.ParseIP(ip) != nil {
+			r.RemoteAddr = net.JoinHostPort(ip, "0")
+		}
 
 		// Keep the connection cap disabled by default for Firefox/Fennec DoH.
 		// The abuse control is request-rate based instead of connection based.
