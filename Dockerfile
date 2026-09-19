@@ -3,7 +3,8 @@
 #
 # Build stage MUST stay on Go 1.19.x: v4.5.3 transitively depends on
 # github.com/lucas-clemente/quic-go v0.30.0 (pulled in by the built-in
-# `forward` plugin even though this config only uses `fast_forward`), and
+# `forward` plugin even though this deployment config does not use the
+# built-in `forward` or `fast_forward` executables for the query path), and
 # that quic-go version has a deliberate compile-time guard that refuses to
 # build on Go 1.20+ ("can't be built on Go 1.20 yet"). This is a hard
 # upstream constraint, not a stale pin -- do not bump past golang:1.19 here
@@ -24,6 +25,7 @@ RUN perl -0pi -e 's/(WhenHit\s+string\s+`yaml:"when_hit"`)/$1\n\tDumpFile       
  && gofmt -w /src/plugin/executable/cache/cache.go /src/plugin/executable/cache/warm_backend.go
 
 COPY content/upstream_probe.go /src/probe/main.go
+COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
 COPY content/ip_conn_proxy.go /src/probe/ip_conn_proxy.go
 
 RUN go build -trimpath -ldflags='-s -w' -o /out/mosdns . \
@@ -65,6 +67,7 @@ ENV PORT=8080 \
     CACHE_DUMP_INTERVAL=3300 \
     MAX_QPS=15 \
     HEALTH_TIMEOUT_MS=1200 \
+    HEALTH_BACKEND_TIMEOUT_MS=1000 \
     HEALTH_CHECK=true \
     HEALTH_EWMA_ALPHA=0.35 \
     HEALTH_FAILURE_PENALTY_MS=1500 \

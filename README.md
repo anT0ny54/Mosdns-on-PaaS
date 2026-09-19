@@ -6,7 +6,7 @@ A lightweight [Koyeb](https://www.koyeb.com/) deployment of [MosDNS v4.5.3](http
 - Three [HaGeZi](https://github.com/hagezi/dns-blocklists) DoH upstreams with strict sequential failover (never parallel fan-out).
 - A small in-memory cache backed by a bounded, atomic-write disk snapshot for warm restarts.
 - A lightweight Go reverse proxy sits in front of MosDNS and enforces per-IP + global rate limits, a global connection cap, and request-size limits before anything reaches MosDNS.
-- A background health supervisor periodically re-probes the three upstreams and performs a graceful hot-swap restart only when it's clearly justified, preserving the warm cache across the swap.
+- A runtime health supervisor periodically re-probes the active candidate set and restarts MosDNS only when a configured health condition justifies a change; the warm cache survives the restart.
 - If MosDNS or the proxy ever exits, the container exits too, so Koyeb restarts the Instance.
 
 ## How it works
@@ -19,7 +19,7 @@ client --DoH--> ip-conn-proxy (:PORT, rate/conn limits) --http--> mosdns (127.0.
 
 ### Sequential failover
 
-Each MosDNS process has an ordered upstream chain: the selected upstream is tried first, the second is contacted only if the first fails, and the third only if the second also fails. This is implemented with nested v4.5.3 `fallback` blocks rather than sending all three queries in parallel — `fast_forward` with multiple upstreams is a *parallel* mechanism in v4.5.3, so this project instead declares three single-upstream `fast_forward` plugins and composes them with nested fallback nodes.
+Each MosDNS process has an ordered upstream chain: the selected upstream is tried first, the second is contacted only if the first exchange fails, and the third only if the second also fails. This is implemented with a small `sequential_forward` executable added to the v4.5.3 `fast_forward` package. It deliberately avoids `fast_forward`'s parallel exchange behavior and does not treat valid DNS responses such as NXDOMAIN as failures.
 
 A successful upstream stops the chain, so a healthy query normally only touches one upstream — failover exists for transport/server failures, not for valid responses like NXDOMAIN.
 
@@ -31,14 +31,14 @@ At startup, `HAGEZI_UPSTREAM` controls how the three HaGeZi endpoints are ordere
 | --- | --- |
 | `rotate` (default) | Probes all three endpoints once and puts the healthiest first; falls back to a fixed order if the probe is unavailable. |
 | `random` | Same probing, but randomizes among near-equally-healthy candidates instead of always picking the single best. |
-| `https://...` (a fixed URL) | Prefers that endpoint first; the two built-in HaGeZi endpoints remain as sequential fallbacks. |
+| `https://...` (a fixed URL) | Prefers that endpoint first; `UPSTREAM_1` and `UPSTREAM_2` remain as sequential fallbacks. |
 
-After startup, a lightweight background supervisor re-probes the three upstreams every `HEALTH_INTERVAL` seconds (default 300s — a single small 3-endpoint probe). It keeps an EWMA/failure score per endpoint and uses hysteresis before acting:
+After startup, the main supervisor loop runs one health probe cycle every `HEALTH_INTERVAL` seconds (default 300s): three built-in endpoints for `rotate`/`random`, or the custom endpoint plus two built-ins for a fixed `HAGEZI_UPSTREAM`. It keeps an EWMA/failure score per endpoint and uses the configured hysteresis before acting:
 
 - A single transient failure does **not** trigger a restart.
-- The active upstream is only swapped after `HEALTH_FAILS_TO_SWITCH` consecutive failures (default 2), or when a materially healthier endpoint is detected.
+- The active upstream is only swapped after `HEALTH_FAILS_TO_SWITCH` consecutive failures (default 2), or when a materially healthier endpoint is detected according to the configured score margins.
 - Swaps are rate-limited by `HEALTH_RESTART_COOLDOWN` (default 900s) so the process can't churn.
-- A swap starts a new MosDNS process with the new order and only kills the old one once the new one is confirmed alive, so a bad config can never take down a working resolver.
+- A health-triggered reorder stops the current MosDNS process before starting the replacement, avoiding a listener-binding conflict on `127.0.0.1:MOSDNS_BACKEND_PORT`. This introduces a brief local outage during that rare restart; if the replacement fails, the container exits so Koyeb can restart the Instance.
 - The warm cache lives on disk, so a swap does not discard it.
 
 There is no blind periodic restart — MosDNS is only ever restarted when the supervisor's health data actually justifies it.
@@ -61,7 +61,7 @@ request:     DOH_MAX_BODY_BYTES max POST body / GET dns= parameter
 MosDNS:      MAX_QPS client-side ceiling
 ```
 
-Only RFC 8484 GET/POST DoH requests are accepted (`application/dns-message` for POST); anything else is rejected before it reaches MosDNS. Per-IP connection limiting (`IP_CONN_LIMIT`) defaults to `0` (disabled) because Firefox/Fennec rely on persistent DoH connections — abuse control is rate-based instead. The proxy expects Koyeb's edge to provide the client address via `X-Real-IP`/`X-Forwarded-For`, and strips any client-supplied copies of those headers before forwarding.
+Only RFC 8484 GET/POST DoH requests are accepted (`application/dns-message` for POST); anything else is rejected before it reaches MosDNS. Per-IP connection limiting (`IP_CONN_LIMIT`) defaults to `0` (disabled) because Firefox/Fennec rely on persistent DoH connections — abuse control is rate-based instead. The proxy expects Koyeb Edge's `X-Forwarded-For` header, uses only its final IP, and ignores `X-Real-IP` plus earlier client-controlled XFF entries before forwarding to MosDNS.
 
 ## Why the configuration is deliberately small
 
@@ -110,12 +110,11 @@ All of these have working defaults baked into the image; you only need to set `D
 | `HEALTH_SWITCH_MARGIN_PCT` | `0.20` | Relative score improvement required to switch without a failure. |
 | `HEALTH_SWITCH_MARGIN_MS` | `25` | Absolute score improvement required to switch without a failure. |
 | `HEALTH_STATE_FILE` | `/tmp/mosdns-upstream-state.tsv` | Where probe EWMA/failure state persists between probes. |
-| `HEALTH_BACKEND_TIMEOUT_MS`¹ | `1000` | Timeout for the proxy's own `/health` TCP check against MosDNS. |
+| `HEALTH_BACKEND_TIMEOUT_MS` | `1000` | Timeout for the proxy's own `/health` TCP check against MosDNS, in milliseconds. |
 | `UPSTREAM_0_IP` / `_1_IP` / `_2_IP` | *(pinned HaGeZi IPs)* | `dial_addr` pins for the three built-in HaGeZi endpoints; unused for a custom `HAGEZI_UPSTREAM` endpoint. |
 | `GOMEMLIMIT` | `320MiB` | Go runtime soft memory limit. |
 | `GOMAXPROCS` | `1` | Go runtime CPU limit, matched to the 0.1 vCPU Instance. |
 
-¹ Not wired into `entrypoint.sh`; set it directly as a Koyeb environment variable if you need to change it — the Go binary reads it straight from its environment.
 
 ## Requirements
 
@@ -203,6 +202,10 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
 | Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
 
+## Client IP handling
+
+The public proxy uses the last valid `X-Forwarded-For` address, matching Koyeb Edge Network's documented trust model. Client-supplied `X-Real-IP` and earlier XFF entries are not used for the anti-abuse rate/connection limits.
+
 ## Health checks
 
 Koyeb is configured with a TCP health check on port `8080`. Koyeb documents that liveness health-check failures can trigger an Instance restart. Koyeb Free Instances can also scale to zero after roughly one hour without traffic — the next request cold-starts a new Instance.
@@ -231,11 +234,4 @@ See the repository's [LICENSE](LICENSE) file.
 
 ## Changelog
 
-**8.2.1**
-- Reverted the build-stage Go bump from 8.2.0 (`golang:1.19-alpine3.17` → `golang:1.26-alpine3.24`). It broke the build: mosdns v4.5.3 transitively depends on `github.com/lucas-clemente/quic-go v0.30.0` (pulled in by the built-in `forward` plugin even though this config only uses `fast_forward`), and that quic-go version has a deliberate compile-time guard refusing to build on Go 1.20+. The build stage is back on `golang:1.19-alpine3.17`; upgrading past Go 1.19 here would need replacing or vendoring that dependency first, which is out of scope for this pass. The runtime stage (`alpine:3.24`, no Go toolchain) is unaffected and stays current.
-
-**8.2.0**
-- Consolidated this README into a single, internally-consistent document (it previously carried several superseded revisions side by side, with conflicting env-var defaults and an inaccurate description of upstream rotation).
-- Bumped the runtime-stage Alpine image (`alpine:3.22` → `alpine:3.24`).
-- De-duplicated the config-rendering logic in `entrypoint.sh` into a single `render_config()` function used by both the startup path and the runtime health-supervisor swap path. This also fixes a latent bug: the swap path previously skipped the blank-`dial_addr` cleanup step, so a live upstream swap involving a custom (non-pinned-IP) `HAGEZI_UPSTREAM` endpoint could have rendered an invalid `dial_addr:` field into the runtime config.
-- No functional/plugin changes to the MosDNS configuration itself.
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
