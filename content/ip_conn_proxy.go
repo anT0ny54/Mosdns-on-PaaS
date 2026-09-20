@@ -187,7 +187,10 @@ func clientIP(r *http.Request) string {
 	// Only the final XFF element is certifiable. Never walk backwards through
 	// the header: if the final element is malformed, an earlier element can
 	// still be attacker-controlled. In that case, fall back to RemoteAddr.
-	if x := r.Header.Get("X-Forwarded-For"); x != "" {
+	// A client may send several X-Forwarded-For header lines, and Header.Get
+	// returns the first (attacker-controlled) one, so take the last line.
+	if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
+		x := vals[len(vals)-1]
 		if i := strings.LastIndexByte(x, ','); i >= 0 {
 			x = x[i+1:]
 		}
@@ -272,6 +275,10 @@ func main() {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Without this a hung MosDNS pins all MaxConnsPerHost slots until each
+		// client gives up. Stay below the server WriteTimeout so the 502 from
+		// ErrorHandler can still be written.
+		ResponseHeaderTimeout: 12 * time.Second,
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
@@ -466,11 +473,11 @@ func main() {
 		},
 	}
 
-	if max == 0 {
-		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=unlimited, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
-	} else {
-		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
+	connLimitDesc := "unlimited"
+	if max > 0 {
+		connLimitDesc = strconv.Itoa(max)
 	}
+	log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%s, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, connLimitDesc, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

@@ -92,10 +92,27 @@ func newSequentialForward(bp *coremain.BP, args *Args) (*sequentialForward, erro
 	return f, nil
 }
 
+// attemptContext bounds a single upstream attempt so one stalled upstream
+// cannot consume the entire query deadline and leave the remaining fallbacks
+// with no time to run. The time left is split evenly across the upstreams that
+// still have to be tried; the last upstream keeps whatever budget remains. A
+// context without a deadline is returned unchanged.
+func attemptContext(ctx context.Context, remaining int) (context.Context, context.CancelFunc) {
+	if remaining > 1 {
+		if deadline, ok := ctx.Deadline(); ok {
+			if budget := time.Until(deadline); budget > 0 {
+				return context.WithTimeout(ctx, budget/time.Duration(remaining))
+			}
+		}
+	}
+	return ctx, func() {}
+}
+
 // Exec tries upstreams strictly in configured order. A later upstream is
-// contacted only when the previous exchange returns an error. A valid DNS
-// response (including NXDOMAIN or SERVFAIL) is considered a response and stops
-// the chain, which avoids duplicate upstream traffic and preserves bandwidth.
+// contacted only when the previous exchange returns an error (including a
+// per-attempt timeout). A valid DNS response (including NXDOMAIN or SERVFAIL)
+// is considered a response and stops the chain, which avoids duplicate
+// upstream traffic and preserves bandwidth.
 func (f *sequentialForward) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
 	q := qCtx.Q()
 	if q == nil {
@@ -103,13 +120,15 @@ func (f *sequentialForward) Exec(ctx context.Context, qCtx *query_context.Contex
 	}
 
 	var lastErr error
-	for _, u := range f.upstreams {
+	for i, u := range f.upstreams {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		// ExchangeContext must not retain or modify q, so reuse the same query
 		// object across fallback attempts and avoid an allocation/copy per hop.
-		r, err := u.ExchangeContext(ctx, q)
+		attemptCtx, cancel := attemptContext(ctx, len(f.upstreams)-i)
+		r, err := u.ExchangeContext(attemptCtx, q)
+		cancel()
 		if err == nil {
 			if r == nil {
 				lastErr = errors.New("upstream returned nil response")

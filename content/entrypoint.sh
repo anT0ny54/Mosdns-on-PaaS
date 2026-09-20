@@ -70,7 +70,7 @@ validate_ipv4() {
   awk -v ip="$2" 'BEGIN {
     if (split(ip, octet, ".") != 4) exit 1
     for (i = 1; i <= 4; i++) {
-      if (octet[i] !~ /^[0-9]+$/ || octet[i] < 0 || octet[i] > 255) exit 1
+      if (octet[i] !~ /^(0|[1-9][0-9]*)$/ || octet[i] + 0 > 255) exit 1
     }
   }' 2>/dev/null || {
     echo "Invalid $1: $2 (must be an IPv4 address)" >&2
@@ -147,6 +147,7 @@ validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 [ "$DOH_MAX_BODY_BYTES" -ge 512 ] || { echo "DOH_MAX_BODY_BYTES must be >= 512" >&2; exit 1; }
 [ "$CACHE_SIZE" -ge 1024 ] || { echo "CACHE_SIZE must be >= 1024" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
+[ "$HEALTH_TIMEOUT_MS" -gt 0 ] || { echo "HEALTH_TIMEOUT_MS must be > 0" >&2; exit 1; }
 [ "$HEALTH_BACKEND_TIMEOUT_MS" -gt 0 ] || { echo "HEALTH_BACKEND_TIMEOUT_MS must be > 0" >&2; exit 1; }
 [ "$PORT" -ne "$MOSDNS_BACKEND_PORT" ] || { echo "PORT and MOSDNS_BACKEND_PORT must differ" >&2; exit 1; }
 [ "$HEALTH_PATH" != "$DOH_PATH" ] || { echo "HEALTH_PATH and DOH_PATH must differ" >&2; exit 1; }
@@ -266,7 +267,7 @@ UPSTREAM_MAX_CONNS_ESCAPED=$(sed_escape_replacement "$UPSTREAM_MAX_CONNS")
 DOH_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$DOH_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
 CACHE_DIR=$(dirname "$CACHE_DUMP_FILE")
-mkdir -p "$CACHE_DIR"
+mkdir -p "$CACHE_DIR" 2>/dev/null || echo "WARNING: cannot create cache directory ${CACHE_DIR}; warm cache snapshots may be skipped" >&2
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy 2>/dev/null || true
 export GOMEMLIMIT GOMAXPROCS
 
@@ -317,9 +318,9 @@ render_config() {
   # scalar instead of letting YAML punctuation alter the generated config.
   sed -i "/^[[:space:]]*dial_addr:[[:space:]]*''[[:space:]]*$/d" "$candidate"
 
-  if grep -Eq '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$candidate"; then
+  if grep -Eq '__[A-Z0-9_]+__' "$candidate"; then
     echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
-    grep -nE '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$candidate" >&2 || true
+    grep -nE '__[A-Z0-9_]+__' "$candidate" >&2 || true
     rm -f "$candidate"
     return 1
   fi
@@ -350,7 +351,12 @@ cleanup() {
     wait "$MOSDNS_PID" 2>/dev/null || true
   fi
 }
-trap cleanup TERM INT EXIT
+# TERM/INT must end the script. A handler that merely returns would resume the
+# supervisor loop, which then reports the just-stopped MosDNS as a crash and
+# exits 1. Exiting from the signal traps runs cleanup via the EXIT trap.
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 printf '%s\n' '=== MosDNS runtime ==='
 mosdns version
@@ -411,44 +417,6 @@ MOSDNS_PID=$!
 # - runs in the main shell so MOSDNS_PID and ORDER_* updates remain authoritative
 # - stops the current MosDNS process before starting the replacement, avoiding
 #   a second listener binding to the same 127.0.0.1:${MOSDNS_BACKEND_PORT}
-set_failover_order() {
-  best="$1"
-  case "$HAGEZI_UPSTREAM" in
-    rotate|random|"$UPSTREAM_0")
-      case "$best" in
-        "$UPSTREAM_0") ORDER_0="$UPSTREAM_0"; ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
-        *) return 1 ;;
-      esac
-      ;;
-    "$UPSTREAM_1")
-      case "$best" in
-        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_0") ORDER_0="$UPSTREAM_0"; ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
-        *) return 1 ;;
-      esac
-      ;;
-    "$UPSTREAM_2")
-      case "$best" in
-        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$UPSTREAM_0"; ORDER_2="$UPSTREAM_1" ;;
-        "$UPSTREAM_0") ORDER_0="$UPSTREAM_0"; ORDER_1="$UPSTREAM_2"; ORDER_2="$UPSTREAM_1" ;;
-        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$UPSTREAM_2"; ORDER_2="$UPSTREAM_0" ;;
-        *) return 1 ;;
-      esac
-      ;;
-    *)
-      case "$best" in
-        "$HAGEZI_UPSTREAM") ORDER_0="$HAGEZI_UPSTREAM"; ORDER_1="$UPSTREAM_1"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_1") ORDER_0="$UPSTREAM_1"; ORDER_1="$HAGEZI_UPSTREAM"; ORDER_2="$UPSTREAM_2" ;;
-        "$UPSTREAM_2") ORDER_0="$UPSTREAM_2"; ORDER_1="$HAGEZI_UPSTREAM"; ORDER_2="$UPSTREAM_1" ;;
-        *) return 1 ;;
-      esac
-      ;;
-  esac
-}
-
 health_check_once() {
   [ "$HEALTH_CHECK" = "true" ] || return 0
 
@@ -488,9 +456,19 @@ health_check_once() {
     return 0
   fi
 
+  # Adopt the probe's complete measured order (exactly like startup) so the
+  # fallback positions are health-aware too, not a fixed static permutation.
+  new_0=$(printf '%s\n' "$raw" | sed -n '1p' | cut -f2)
+  new_1=$(printf '%s\n' "$raw" | sed -n '2p' | cut -f2)
+  new_2=$(printf '%s\n' "$raw" | sed -n '3p' | cut -f2)
+  [ -n "$new_0" ] && [ -n "$new_1" ] && [ -n "$new_2" ] || return 0
+
   echo "Health supervisor: switching active upstream ${current} -> ${best}" >&2
-  set_failover_order "$best" || return 0
+  prev_0="$ORDER_0"; prev_1="$ORDER_1"; prev_2="$ORDER_2"
+  ORDER_0="$new_0"; ORDER_1="$new_1"; ORDER_2="$new_2"
   if ! render_config; then
+    # Keep ORDER_* in sync with the config the running process actually uses.
+    ORDER_0="$prev_0"; ORDER_1="$prev_1"; ORDER_2="$prev_2"
     echo "Health supervisor: failed to render switched config; keeping current process" >&2
     return 0
   fi
@@ -509,10 +487,9 @@ health_check_once() {
   MOSDNS_PID=""
 
   mosdns start -c "$RUNTIME_CONFIG" &
-  newpid=$!
+  MOSDNS_PID=$!
   sleep 1
-  if kill -0 "$newpid" 2>/dev/null; then
-    MOSDNS_PID="$newpid"
+  if kill -0 "$MOSDNS_PID" 2>/dev/null; then
     last_restart=$(date +%s)
   else
     echo "Health supervisor: replacement MosDNS failed to start; exiting for instance restart" >&2
@@ -537,5 +514,7 @@ while :; do
     last_health_check="$now"
     health_check_once
   fi
-  sleep 2
+  # Interruptible sleep: `wait` returns as soon as a trapped signal arrives.
+  sleep 2 &
+  wait $! || true
 done
