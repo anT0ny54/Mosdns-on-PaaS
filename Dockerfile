@@ -29,6 +29,7 @@ RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tD
  && mv /src/plugin/executable/cache/cache.go.tmp /src/plugin/executable/cache/cache.go \
  && test "$(grep -c 'DumpFile[[:space:]]*string[[:space:]]*`yaml:\"dump_file\"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && test "$(grep -c 'DumpInterval[[:space:]]*int[[:space:]]*`yaml:\"dump_interval\"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && test "$(grep -Fxc 'c = mem_cache.NewMemCache(args.Size, 0)' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && sed -i 's|c = mem_cache.NewMemCache(args.Size, 0)|c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())|' /src/plugin/executable/cache/cache.go \
  && test "$(grep -c 'newWarmBackend(' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && gofmt -w /src/plugin/executable/cache/cache.go /src/plugin/executable/cache/warm_backend.go
