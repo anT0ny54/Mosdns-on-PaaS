@@ -281,12 +281,8 @@ func scoreState(s state, failurePenalty int64) int64 {
 }
 
 func main() {
-	timeout := 1200 * time.Millisecond
-	if v := os.Getenv("HEALTH_TIMEOUT_MS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			timeout = time.Duration(n) * time.Millisecond
-		}
-	}
+	timeout := time.Duration(envIntOrDefault("HEALTH_TIMEOUT_MS", 1200)) * time.Millisecond
+	failsToSwitch := envIntOrDefault("HEALTH_FAILS_TO_SWITCH", 2)
 	alpha := envFloat("HEALTH_EWMA_ALPHA", 0.35)
 	failurePenalty := envInt64("HEALTH_FAILURE_PENALTY_MS", 1500)
 	switchPct := envFloat("HEALTH_SWITCH_MARGIN_PCT", 0.20)
@@ -377,7 +373,7 @@ func main() {
 				// upstream. Preserve it until the configured consecutive-failure
 				// threshold is reached; this also prevents random mode from
 				// bypassing the same hysteresis rule below.
-				if cur.failures < envIntOrDefault("HEALTH_FAILS_TO_SWITCH", 2) {
+				if cur.failures < failsToSwitch {
 					keptActive = true
 					keep := out[activePos]
 					copy(out[1:activePos+1], out[0:activePos])

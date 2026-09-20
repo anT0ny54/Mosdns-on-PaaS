@@ -108,6 +108,8 @@ validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
 validate_uint DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS"
 validate_uint GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST"
+validate_uint HEALTH_RATE_BURST "$HEALTH_RATE_BURST"
+validate_uint GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST"
 validate_uint GLOBAL_CONN_LIMIT "$GLOBAL_CONN_LIMIT"
 validate_uint_max DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES" 65535
 validate_uint CACHE_SIZE "$CACHE_SIZE"
@@ -171,35 +173,36 @@ UPSTREAM_0="https://root.hagezi.org/dns-query"
 UPSTREAM_1="https://wurzn.hagezi.org/dns-query"
 UPSTREAM_2="https://juuri.hagezi.org/dns-query"
 
-# Hard fail if this file is ever changed to permit plain DNS upstreams.
-case "$UPSTREAM_0 $UPSTREAM_1 $UPSTREAM_2" in
-  *http://*|*udp://*|*tcp://*) echo "ERROR: plain-DNS upstream blocked (HTTPS DoH only)" >&2; exit 1 ;;
-esac
-
 probe_upstreams() {
   [ "$HEALTH_CHECK" = "true" ] || return 1
   export HEALTH_TIMEOUT_MS HEALTH_EWMA_ALPHA HEALTH_FAILURE_PENALTY_MS HEALTH_SWITCH_MARGIN_PCT HEALTH_SWITCH_MARGIN_MS HEALTH_FAILS_TO_SWITCH HEALTH_STATE_FILE HEALTH_ACTIVE_UPSTREAM HAGEZI_UPSTREAM UPSTREAM_0_IP UPSTREAM_1_IP UPSTREAM_2_IP
   GOMEMLIMIT=32MiB GOMAXPROCS=1 mosdns-probe "$@" 2>/dev/null
 }
 
-probe_candidate_set() {
+# Static candidate order for the selected HAGEZI_UPSTREAM mode. Writes CAND_0..2
+# only (never ORDER_*), so it is safe to call while a config is running.
+set_candidate_order() {
   case "$HAGEZI_UPSTREAM" in
     rotate|random|"$UPSTREAM_0")
-      probe_upstreams "$UPSTREAM_0" "$UPSTREAM_1" "$UPSTREAM_2"
+      CAND_0="$UPSTREAM_0"; CAND_1="$UPSTREAM_1"; CAND_2="$UPSTREAM_2"
       ;;
     "$UPSTREAM_1")
-      probe_upstreams "$UPSTREAM_1" "$UPSTREAM_0" "$UPSTREAM_2"
+      CAND_0="$UPSTREAM_1"; CAND_1="$UPSTREAM_0"; CAND_2="$UPSTREAM_2"
       ;;
     "$UPSTREAM_2")
-      probe_upstreams "$UPSTREAM_2" "$UPSTREAM_0" "$UPSTREAM_1"
+      CAND_0="$UPSTREAM_2"; CAND_1="$UPSTREAM_0"; CAND_2="$UPSTREAM_1"
       ;;
     *)
       # A fixed custom endpoint replaces the first built-in slot. Keep the
-      # other two built-ins as fallbacks so all three built-in locations remain
-      # represented across the built-in/fixed modes.
-      probe_upstreams "$HAGEZI_UPSTREAM" "$UPSTREAM_1" "$UPSTREAM_2"
+      # other two built-ins as fallbacks.
+      CAND_0="$HAGEZI_UPSTREAM"; CAND_1="$UPSTREAM_1"; CAND_2="$UPSTREAM_2"
       ;;
   esac
+}
+
+probe_candidate_set() {
+  set_candidate_order
+  probe_upstreams "$CAND_0" "$CAND_1" "$CAND_2"
 }
 
 probe_and_score() {
@@ -216,28 +219,10 @@ probe_and_score() {
 }
 
 set_default_order() {
-  case "$HAGEZI_UPSTREAM" in
-    rotate|random|"$UPSTREAM_0")
-      ORDER_0="$UPSTREAM_0"
-      ORDER_1="$UPSTREAM_1"
-      ORDER_2="$UPSTREAM_2"
-      ;;
-    "$UPSTREAM_1")
-      ORDER_0="$UPSTREAM_1"
-      ORDER_1="$UPSTREAM_0"
-      ORDER_2="$UPSTREAM_2"
-      ;;
-    "$UPSTREAM_2")
-      ORDER_0="$UPSTREAM_2"
-      ORDER_1="$UPSTREAM_0"
-      ORDER_2="$UPSTREAM_1"
-      ;;
-    *)
-      ORDER_0="$HAGEZI_UPSTREAM"
-      ORDER_1="$UPSTREAM_1"
-      ORDER_2="$UPSTREAM_2"
-      ;;
-  esac
+  set_candidate_order
+  ORDER_0="$CAND_0"
+  ORDER_1="$CAND_1"
+  ORDER_2="$CAND_2"
 }
 
 select_order() {
@@ -318,9 +303,16 @@ render_config() {
   # scalar instead of letting YAML punctuation alter the generated config.
   sed -i "/^[[:space:]]*dial_addr:[[:space:]]*''[[:space:]]*$/d" "$candidate"
 
-  if grep -q '__NAME__' "$candidate"; then
-    echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
-    grep -nF '__NAME__' "$candidate" >&2 || true
+  # Every __PLACEHOLDER__ that exists in the template must have been consumed.
+  # (Checking the template's own names avoids false hits on user-supplied values.)
+  unresolved=""
+  for placeholder in $(grep -o '__[A-Z0-9_]*__' "$TEMPLATE" | sort -u); do
+    if grep -qF -- "$placeholder" "$candidate"; then
+      unresolved="${unresolved} ${placeholder}"
+    fi
+  done
+  if [ -n "$unresolved" ]; then
+    echo "ERROR: unresolved placeholder(s) in generated MosDNS config:${unresolved}" >&2
     rm -f "$candidate"
     return 1
   fi
@@ -399,6 +391,10 @@ GLOBAL_RATE_BURST="${GLOBAL_RATE_BURST}" \
 GLOBAL_CONN_LIMIT="${GLOBAL_CONN_LIMIT}" \
 DOH_MAX_BODY_BYTES="${DOH_MAX_BODY_BYTES}" \
 HEALTH_PATH="${HEALTH_PATH}" \
+HEALTH_RATE_LIMIT="${HEALTH_RATE_LIMIT}" \
+HEALTH_RATE_BURST="${HEALTH_RATE_BURST}" \
+GLOBAL_HEALTH_RATE_LIMIT="${GLOBAL_HEALTH_RATE_LIMIT}" \
+GLOBAL_HEALTH_RATE_BURST="${GLOBAL_HEALTH_RATE_BURST}" \
 HEALTH_BACKEND_TIMEOUT_MS="${HEALTH_BACKEND_TIMEOUT_MS}" \
 DOH_PATH="${DOH_PATH}" \
 GOMEMLIMIT=64MiB \
@@ -434,16 +430,13 @@ health_check_once() {
   best=$(printf '%s\n' "$best_line" | cut -f2)
   best_ok=$(printf '%s\n' "$best_line" | awk -F '\t' '{print ($4=="true") ? 1 : 0}')
 
+  # Switch only to a healthy best candidate, and only when the active upstream
+  # is healthy-but-beaten (upstream_probe.go already applied the margins) or has
+  # failed HEALTH_FAILS_TO_SWITCH times in a row.
   switch=0
-  if [ "$current" != "$best" ] && [ "$best_ok" -eq 1 ]; then
-    if [ "$current_ok" -ne 1 ] && [ "$current_failures" -ge "$HEALTH_FAILS_TO_SWITCH" ]; then
-      switch=1
-    elif [ "$current_ok" -eq 1 ]; then
-      # When healthy, upstream_probe.go only moves a different endpoint to
-      # row 1 after HEALTH_SWITCH_MARGIN_PCT and HEALTH_SWITCH_MARGIN_MS
-      # both justify the change. No duplicate threshold logic belongs here.
-      switch=1
-    fi
+  if [ "$current" != "$best" ] && [ "$best_ok" -eq 1 ] &&
+     { [ "$current_ok" -eq 1 ] || [ "$current_failures" -ge "$HEALTH_FAILS_TO_SWITCH" ]; }; then
+    switch=1
   fi
 
   if [ "$switch" -ne 1 ]; then

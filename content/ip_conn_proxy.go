@@ -349,20 +349,20 @@ func main() {
 			return
 		}
 
-		// The global DoH budget applies only to DNS requests; health uses its own
-		// isolated limiter so platform health checks cannot be starved by clients.
-		if !globalRateLim.allow("global", now) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "service rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-
-		// Only RFC 8484 GET/POST DoH requests are accepted. Apply the per-client
-		// request-rate limit before body buffering or other parsing work so rejected
-		// floods consume as little CPU and memory as possible.
+		// Apply the per-client budget first so a single abusive client is rejected
+		// by its own bucket and cannot drain the shared global budget (which would
+		// starve well-behaved clients). The global budget applies only to DNS
+		// requests; health uses its own isolated limiters. Both run before body
+		// buffering or other parsing so rejected floods cost as little CPU and
+		// memory as possible.
 		if !rateLim.allow(ip, now) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		if !globalRateLim.allow("global", now) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "service rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
