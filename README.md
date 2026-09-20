@@ -1,218 +1,195 @@
 # MosDNS on Koyeb
 
-A lightweight [Koyeb](https://www.koyeb.com/) deployment of [MosDNS v4.5.3](https://github.com/IrineSistiana/mosdns) that serves public DNS-over-HTTPS (DoH), tuned to fit entirely inside Koyeb's **512 MB RAM / 0.1 vCPU / 2 GB SSD** Free Web Service.
+A small, DoH-only [MosDNS v4.5.3](https://github.com/IrineSistiana/mosdns/tree/v4.5.3) service for a Koyeb Web Service. The image is tuned for a deployment budget of **512 MB RAM, 0.25 vCPU, and 2 GB SSD**.
 
-- DoH-only. No plain UDP/TCP DNS listener is exposed.
-- Three [HaGeZi](https://github.com/hagezi/dns-blocklists) DoH upstreams with strict sequential failover (never parallel fan-out).
-- A small in-memory cache backed by a bounded, atomic-write disk snapshot for warm restarts.
-- A lightweight Go reverse proxy sits in front of MosDNS and enforces per-IP + global rate limits, a global connection cap, and request-size limits before anything reaches MosDNS.
-- A runtime health supervisor periodically re-probes the active candidate set and restarts MosDNS only when a configured health condition justifies a change; the warm cache survives the restart.
-- If MosDNS or the proxy ever exits, the container exits too, so Koyeb restarts the Instance.
+The container keeps the public surface deliberately narrow:
 
-## How it works
+- only HTTP DoH and the minimal health endpoint are exposed publicly;
+- three HaGeZi DoH endpoints are used in strict sequential order;
+- the upstream health probe uses the same pinned IPv4 addresses as the MosDNS `dial_addr` configuration for the built-in endpoints;
+- the DNS cache is bounded in memory and has a bounded warm-start snapshot;
+- a small Go proxy applies request-rate, connection, and request-size limits before MosDNS;
+- MosDNS and the proxy are supervised so a failed process causes the container to exit and lets Koyeb restart the Instance.
 
+## Request path
+
+```text
+client
+  │ DoH GET/POST
+  ▼
+ip-conn-proxy :8080
+  │ rate / connection / size limits
+  ▼
+127.0.0.1:18080
+  │
+  ├─ cache
+  └─ sequential failover
+       ├─ upstream 1
+       ├─ upstream 2
+       └─ upstream 3
 ```
-client --DoH--> ip-conn-proxy (:PORT, rate/conn limits) --http--> mosdns (127.0.0.1:MOSDNS_BACKEND_PORT)
-                                                                        |
-                                                          sequential failover: upstream_0 -> upstream_1 -> upstream_2
-```
+
+## Upstreams
+
+The built-in endpoints are:
+
+| Endpoint | Pinned IPv4 |
+| --- | --- |
+| `https://root.hagezi.org/dns-query` | `188.34.161.210` |
+| `https://wurzn.hagezi.org/dns-query` | `159.69.155.94` |
+| `https://juuri.hagezi.org/dns-query` | `95.217.163.17` |
+
+The pins are used as MosDNS `dial_addr` values while TLS still uses the hostname from the DoH URL. The health-probe helper applies the same mapping, so startup/runtime measurements exercise the same destinations that MosDNS will dial.
+
+Source: [HaGeZi DNS servers](https://github.com/hagezi/dns-servers).
 
 ### Sequential failover
 
-Each MosDNS process has an ordered upstream chain: the selected upstream is tried first, the second is contacted only if the first exchange fails, and the third only if the second also fails. This is implemented with a small `sequential_forward` executable added to the v4.5.3 `fast_forward` package. It deliberately avoids `fast_forward`'s parallel exchange behavior and does not treat valid DNS responses such as NXDOMAIN as failures.
+The custom `sequential_forward` plugin tries one upstream at a time. The next upstream is contacted only when the previous `ExchangeContext` returns an error. A valid DNS response, including a DNS error response such as `NXDOMAIN` or `SERVFAIL`, is returned immediately rather than causing another upstream query.
 
-A successful upstream stops the chain, so a healthy query normally only touches one upstream — failover exists for transport/server failures, not for valid responses like NXDOMAIN.
+This is intentionally different from MosDNS's parallel `fast_forward` behavior: normal traffic should produce one upstream request, with later endpoints reserved for transport/upstream exchange failures.
 
-### Upstream selection and the runtime health supervisor
+## Upstream selection and health checks
 
-At startup, `HAGEZI_UPSTREAM` controls how the three HaGeZi endpoints are ordered:
+`HAGEZI_UPSTREAM` controls the initial and runtime ordering:
 
 | Value | Behavior |
 | --- | --- |
-| `rotate` (default) | Probes all three endpoints once and puts the healthiest first; falls back to a fixed order if the probe is unavailable. |
-| `random` | Same probing, but randomizes among near-equally-healthy candidates instead of always picking the single best. |
-| `https://...` (a fixed URL) | Prefers that endpoint first; `UPSTREAM_1` and `UPSTREAM_2` remain as sequential fallbacks. |
+| `rotate` | Probe all three built-ins and place the healthiest result first. |
+| `random` | Probe all three built-ins and randomly rotate among near-equal healthy candidates. |
+| `https://...` | Use the custom endpoint as the first candidate and keep two built-in HaGeZi endpoints as fallbacks. |
 
-After startup, the main supervisor loop runs one health probe cycle every `HEALTH_INTERVAL` seconds (default 300s): three built-in endpoints for `rotate`/`random`, or the custom endpoint plus two built-ins for a fixed `HAGEZI_UPSTREAM`. It keeps an EWMA/failure score per endpoint and uses the configured hysteresis before acting:
+The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart.
 
-- A single transient failure does **not** trigger a restart.
-- The active upstream is only swapped after `HEALTH_FAILS_TO_SWITCH` consecutive failures (default 2), or when a materially healthier endpoint is detected according to the configured score margins.
-- Swaps are rate-limited by `HEALTH_RESTART_COOLDOWN` (default 900s) so the process can't churn.
-- A health-triggered reorder stops the current MosDNS process before starting the replacement, avoiding a listener-binding conflict on `127.0.0.1:MOSDNS_BACKEND_PORT`. This introduces a brief local outage during that rare restart; if the replacement fails, the container exits so Koyeb can restart the Instance.
-- The warm cache lives on disk, so a swap does not discard it.
+The three built-in IP variables are validated as IPv4 addresses before configuration is rendered. A custom `HAGEZI_UPSTREAM` is not pinned by these variables and is resolved normally.
 
-There is no blind periodic restart — MosDNS is only ever restarted when the supervisor's health data actually justifies it.
+## Warm cache
 
-### Warm cache
+The normal query path uses MosDNS's memory cache. A small custom backend keeps a second, bounded copy for warm starts and writes it atomically to disk at `CACHE_DUMP_INTERVAL`. The warm copy is limited by both `CACHE_SIZE` and an 8 KiB per-entry cap, which keeps duplicate cached response data bounded on the 512 MB instance. Warm metadata keeps insertion/restore recency for snapshot eviction and restoration; ordinary hot-cache hits stay on the fast inner-cache path and do not take the warm-metadata lock. The snapshot is limited to the same warm-entry set, and expired or oversized entries are discarded before restore.
 
-The hot path is always the in-memory cache. A custom cache backend (`content/warm_backend.go`, patched into MosDNS's `cache` plugin at build time — see the Dockerfile) additionally maintains a second, disk-backed copy bounded to the same size as the RAM cache, so it can never grow without limit. It's written atomically (write-then-rename) on `CACHE_DUMP_INTERVAL`, and again on graceful shutdown, so a process restart (including a health-supervisor swap) can reload it instead of starting cold. Expired entries are never restored.
+Koyeb local storage is ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after an Instance replacement.
 
-Koyeb's local storage is ephemeral, though — a freshly created or replaced Instance may not have a prior snapshot, so the deployment must never depend on the warm cache for correctness. It's a startup optimization only.
+## DoH proxy
 
-### DoH anti-abuse proxy
-
-A public DoH endpoint can be abused, so requests pass through a small Go reverse proxy (`content/ip_conn_proxy.go`) before reaching MosDNS:
+`content/ip_conn_proxy.go` sits in front of MosDNS and enforces:
 
 ```text
-per-IP:      DOH_RATE_LIMIT req/s, burst DOH_RATE_BURST, up to DOH_RATE_MAX_IPS tracked IPs
-global:      GLOBAL_RATE_LIMIT req/s, burst GLOBAL_RATE_BURST
-connections: GLOBAL_CONN_LIMIT concurrent, global
-request:     DOH_MAX_BODY_BYTES max POST body / GET dns= parameter
-MosDNS:      MAX_QPS client-side ceiling
+per-IP rate:      DOH_RATE_LIMIT / second, burst DOH_RATE_BURST
+tracked peers:    DOH_RATE_MAX_IPS
+service rate:     GLOBAL_RATE_LIMIT / second, burst GLOBAL_RATE_BURST
+health rate:      HEALTH_RATE_LIMIT / second, burst HEALTH_RATE_BURST
+health aggregate: GLOBAL_HEALTH_RATE_LIMIT / second, burst GLOBAL_HEALTH_RATE_BURST
+connections:      GLOBAL_CONN_LIMIT
+per-IP conn:      IP_CONN_LIMIT (0 = disabled)
+request size:     DOH_MAX_BODY_BYTES
 ```
 
-Only RFC 8484 GET/POST DoH requests are accepted (`application/dns-message` for POST); anything else is rejected before it reaches MosDNS. Per-IP connection limiting (`IP_CONN_LIMIT`) defaults to `0` (disabled) because Firefox/Fennec rely on persistent DoH connections — abuse control is rate-based instead. The proxy expects Koyeb Edge's `X-Forwarded-For` header, uses only its final IP, and ignores `X-Real-IP` plus earlier client-controlled XFF entries before forwarding to MosDNS.
+Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
 
-## Why the configuration is deliberately small
+The proxy uses the final `X-Forwarded-For` address for client limiting and removes client-controlled forwarding headers before proxying to MosDNS.
 
-On a 0.1-vCPU instance, avoiding unnecessary resident processes and large databases matters more than maximizing cache size. This deployment intentionally does **not** install:
-
-- GeoIP / Geosite databases or downloads
-- SQLite, dnsmasq, BIND, or any other resident cache/database process
-- Deployment files for other PaaS providers
-
-2,048 cache entries is a sane starting point for 512 MB RAM / 0.1 vCPU — increase it only after measuring actual memory and cache-hit behavior on your traffic.
+The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve platform health checks, while repeated health polling is still bounded.
 
 ## Environment variables
 
-All of these have working defaults baked into the image; you only need to set `DOH_PATH` to deploy.
+The image has working defaults; no environment variable is required for the default deployment. The public proxy is the externally reachable rate limiter; MosDNS is kept behind its loopback listener and does not duplicate that per-client limiter.
 
-| Variable | Default | Description |
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `PORT` | `8080` | Public port Koyeb routes to (Koyeb sets this automatically). |
-| `DOH_PATH` | `/dns-query` | Public DoH endpoint path. |
-| `HEALTH_PATH` | `/health` | Path used for Koyeb's health check. |
-| `MOSDNS_BACKEND_PORT` | `18080` | Internal loopback port between the proxy and MosDNS. |
-| `HAGEZI_UPSTREAM` | `rotate` | `rotate`, `random`, or one fixed `https://` endpoint. |
-| `CACHE_SIZE` | `2048` | Max in-memory (and warm-disk) cache entries. |
+| `PORT` | `8080` | Public Koyeb service port. |
+| `DOH_PATH` | `/dns-query` | Public DoH path. |
+| `HEALTH_PATH` | `/health` | Proxy health path for an HTTP health check. |
+| `MOSDNS_BACKEND_PORT` | `18080` | Loopback port between the proxy and MosDNS. |
+| `HAGEZI_UPSTREAM` | `rotate` | `rotate`, `random`, or a fixed `https://` endpoint. |
+| `UPSTREAM_0_IP` | `188.34.161.210` | Built-in `root.hagezi.org` dial pin. |
+| `UPSTREAM_1_IP` | `159.69.155.94` | Built-in `wurzn.hagezi.org` dial pin. |
+| `UPSTREAM_2_IP` | `95.217.163.17` | Built-in `juuri.hagezi.org` dial pin. |
+| `CACHE_SIZE` | `2048` | Maximum cache entries in RAM and warm snapshot. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
-| `CACHE_DUMP_INTERVAL` | `3300` | Snapshot interval in seconds (55 min). |
-| `MAX_QPS` | `15` | MosDNS client-side QPS ceiling. |
-| `SERVER_TIMEOUT` | `8` | MosDNS per-query server timeout, seconds. |
-| `UPSTREAM_IDLE_TIMEOUT` | `30` | Upstream connection idle timeout, seconds. |
-| `UPSTREAM_MAX_CONNS` | `2` | Max concurrent connections per upstream. |
-| `DOH_IDLE_TIMEOUT` | `120` | Local DoH listener idle timeout, seconds. |
-| `DOH_RATE_LIMIT` | `5` | Per-IP DoH request rate (req/s). |
-| `DOH_RATE_BURST` | `12` | Per-IP burst allowance. |
-| `DOH_RATE_MAX_IPS` | `512` | Max tracked client IPs for per-IP limiting. |
-| `GLOBAL_RATE_LIMIT` | `40` | Global DoH request rate (req/s). |
-| `GLOBAL_RATE_BURST` | `80` | Global burst allowance. |
-| `GLOBAL_CONN_LIMIT` | `128` | Global concurrent connection ceiling. |
-| `IP_CONN_LIMIT` | `0` | Per-IP connection limit; `0` preserves Firefox/Fennec reuse. |
-| `DOH_MAX_BODY_BYTES` | `4096` | Max DoH POST body / GET `dns` parameter size. |
-| `HEALTH_CHECK` | `true` | Enables startup probing and the runtime health supervisor. |
-| `HEALTH_TIMEOUT_MS` | `1200` | Per-probe timeout, milliseconds. |
-| `HEALTH_INTERVAL` | `300` | Runtime re-probe interval, seconds (min 30). |
-| `HEALTH_FAILS_TO_SWITCH` | `2` | Consecutive failures before the active upstream is swapped. |
+| `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
+| `SERVER_TIMEOUT` | `8` | MosDNS query timeout, seconds. |
+| `UPSTREAM_IDLE_TIMEOUT` | `30` | Upstream idle connection timeout, seconds. |
+| `UPSTREAM_MAX_CONNS` | `2` | Maximum upstream connections per endpoint. |
+| `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. |
+| `DOH_RATE_LIMIT` | `5` | Per-client request rate, requests/second. |
+| `DOH_RATE_BURST` | `12` | Per-client burst allowance. |
+| `DOH_RATE_MAX_IPS` | `512` | Maximum client buckets retained. |
+| `GLOBAL_RATE_LIMIT` | `40` | Global request rate, requests/second. |
+| `GLOBAL_RATE_BURST` | `80` | Global DoH burst allowance. |
+| `HEALTH_RATE_LIMIT` | `2` | Per-client health request rate, requests/second. |
+| `HEALTH_RATE_BURST` | `4` | Per-client health burst allowance. |
+| `GLOBAL_HEALTH_RATE_LIMIT` | `10` | Aggregate health request rate, requests/second. |
+| `GLOBAL_HEALTH_RATE_BURST` | `20` | Aggregate health burst allowance. |
+| `GLOBAL_CONN_LIMIT` | `128` | Maximum concurrent public connections. |
+| `IP_CONN_LIMIT` | `0` | Per-client concurrent connection limit; `0` disables it. |
+| `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
+| `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
+| `HEALTH_TIMEOUT_MS` | `1200` | Upstream probe timeout, milliseconds. |
+| `HEALTH_INTERVAL` | `300` | Runtime probe interval, seconds. |
+| `HEALTH_FAILS_TO_SWITCH` | `2` | Consecutive active-upstream failures before switching. |
 | `HEALTH_RESTART_COOLDOWN` | `900` | Minimum seconds between supervisor-triggered restarts. |
-| `HEALTH_EWMA_ALPHA` | `0.35` | Smoothing factor for the latency EWMA (0–1]. |
-| `HEALTH_FAILURE_PENALTY_MS` | `1500` | Score penalty added per probe failure. |
-| `HEALTH_SWITCH_MARGIN_PCT` | `0.20` | Relative score improvement required to switch without a failure. |
-| `HEALTH_SWITCH_MARGIN_MS` | `25` | Absolute score improvement required to switch without a failure. |
-| `HEALTH_STATE_FILE` | `/tmp/mosdns-upstream-state.tsv` | Where probe EWMA/failure state persists between probes. |
-| `HEALTH_BACKEND_TIMEOUT_MS` | `1000` | Timeout for the proxy's own `/health` TCP check against MosDNS, in milliseconds. |
-| `UPSTREAM_0_IP` / `_1_IP` / `_2_IP` | *(pinned HaGeZi IPs)* | `dial_addr` pins for the three built-in HaGeZi endpoints; unused for a custom `HAGEZI_UPSTREAM` endpoint. |
-| `GOMEMLIMIT` | `320MiB` | Go runtime soft memory limit. |
-| `GOMAXPROCS` | `1` | Go runtime CPU limit, matched to the 0.1 vCPU Instance. |
-
-
-## Requirements
-
-- A [Koyeb](https://www.koyeb.com/) account
-- A GitHub repository containing this project
-- A domain provided by Koyeb, or a custom domain
-- Dockerfile builder enabled for the service
+| `HEALTH_EWMA_ALPHA` | `0.35` | Probe-latency EWMA smoothing factor. |
+| `HEALTH_FAILURE_PENALTY_MS` | `1500` | Score penalty per failed probe. |
+| `HEALTH_SWITCH_MARGIN_PCT` | `0.20` | Relative score improvement needed for a healthy switch. |
+| `HEALTH_SWITCH_MARGIN_MS` | `25` | Absolute score improvement needed for a healthy switch. |
+| `HEALTH_STATE_FILE` | `/tmp/mosdns-upstream-state.tsv` | Probe state file. |
+| `HEALTH_BACKEND_TIMEOUT_MS` | `1000` | Proxy health-check TCP timeout, milliseconds. |
+| `GOMEMLIMIT` | `256MiB` | Go memory soft limit. |
+| `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
 ## Deploy to Koyeb
 
-### Using the Koyeb dashboard
+### Dashboard
 
-1. Sign in to your Koyeb account.
-2. Create a new **Web Service**.
-3. Select the GitHub repository containing this project.
-4. Choose the **Dockerfile** builder.
-5. Expose port `8080` using the HTTP protocol.
-6. Add the environment variable `DOH_PATH=/dns-query` (or your own custom path — see below).
-7. Deploy the service.
+Create a **Web Service** from the repository and use the Dockerfile builder. Expose port `8080` over HTTP.
 
-Koyeb provides the `PORT` environment variable automatically; if none is configured explicitly, Koyeb uses the lowest port exposed by the Dockerfile (`8080` here).
-
-### Using the Koyeb CLI
-
-```bash
-koyeb app init mosdns \
-  --git github.com/YOUR_USERNAME/YOUR_REPOSITORY \
-  --git-branch main \
-  --git-builder docker \
-  --ports 8080:http \
-  --routes /:8080 \
-  --env DOH_PATH=/dns-query \
-  --checks 8080:tcp
-```
-
-Replace `YOUR_USERNAME` and `YOUR_REPOSITORY` with your GitHub username and repository name. A TCP health check on `8080` is used because the DoH endpoint itself isn't a normal web page.
-
-## Configure a custom DoH path
+For readiness checking, configure an HTTP health check for:
 
 ```text
-DOH_PATH=/my-secret-dns
+port: 8080
+path: /health
 ```
 
-```bash
-koyeb app init mosdns \
-  --git github.com/YOUR_USERNAME/YOUR_REPOSITORY \
-  --git-branch main \
-  --git-builder docker \
-  --ports 8080:http \
-  --routes /:8080 \
-  --env DOH_PATH=/my-secret-dns \
-  --checks 8080:tcp
-```
-
-The endpoint is then available at `https://YOUR-KOYEB-DOMAIN/my-secret-dns`.
-
-**Keep your DoH path private.** A publicly known DoH resolver can be abused by third parties, increasing bandwidth usage and cost. For stronger access control, consider placing the service behind an authentication layer or a private network.
-
-## DoH endpoint
-
-With the default configuration:
+Koyeb supplies the `PORT` environment variable automatically. With the image defaults, the public DoH endpoint is:
 
 ```text
 https://YOUR-KOYEB-DOMAIN/dns-query
 ```
 
-Use this URL in any DNS client that supports DNS-over-HTTPS. Replace `/dns-query` with your custom path if you set one.
+### CLI
 
-## Upstream resolvers
+```bash
+koyeb app init mosdns \
+  --git github.com/YOUR_USERNAME/YOUR_REPOSITORY \
+  --git-branch main \
+  --git-builder docker \
+  --ports 8080:http \
+  --routes /:8080 \
+  --checks 8080:http:/health
+```
 
-- `https://root.hagezi.org/dns-query`
-- `https://wurzn.hagezi.org/dns-query`
-- `https://juuri.hagezi.org/dns-query`
+For a different public DoH path, set for example:
 
-All three are configured as trusted resolvers with DNS pipelining enabled and are always kept in the sequential failover chain, regardless of which one is currently first.
+```text
+DOH_PATH=/my-secret-dns
+```
 
-## 🌐 Free DNS Services
+A custom path is obscurity, not authentication. The built-in rate and connection limits remain active regardless of the path.
 
-High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+## Resource profile
 
-| Blocklist | DNS-over-HTTPS (DoH) |
-| :--- | :--- |
-| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
-| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
+The configuration is intentionally small for a low-CPU instance:
 
-## Client IP handling
+- no GeoIP/Geosite downloads;
+- no SQLite, Redis, dnsmasq, BIND, or separate cache process;
+- one MosDNS process, one small proxy process, and one health-probe helper invoked when checks run;
+- bounded RAM cache, an 8 KiB-per-entry warm snapshot, and bounded public request/connection state.
 
-The public proxy uses the last valid `X-Forwarded-For` address, matching Koyeb Edge Network's documented trust model. Client-supplied `X-Real-IP` and earlier XFF entries are not used for the anti-abuse rate/connection limits.
+For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume.
 
-## Health checks
+## Repository scope
 
-Koyeb is configured with a TCP health check on port `8080`. Koyeb documents that liveness health-check failures can trigger an Instance restart. Koyeb Free Instances can also scale to zero after roughly one hour without traffic — the next request cold-starts a new Instance.
-
-## Project scope
-
-This repository is intentionally focused on running MosDNS v4.5.3 on Koyeb's free tier. Deliberately **not** included: GeoIP/Geosite databases or downloads, a resident cache/database process, and deployment files for other PaaS providers.
+This repository is focused on this Koyeb MosDNS deployment. Unrelated application components and deployment material are intentionally not included.
 
 ## 🚀 Bandwidth Hero Server
 

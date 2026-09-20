@@ -1,5 +1,5 @@
 # MosDNS v4.5.3, tuned for a tiny Koyeb Web Service.
-# Runtime target: 512 MiB RAM / 0.1 vCPU / 2 GiB SSD.
+# Runtime target: 512 MiB RAM / 0.25 vCPU / 2 GiB SSD.
 #
 # Build stage MUST stay on Go 1.19.x: v4.5.3 transitively depends on
 # github.com/lucas-clemente/quic-go v0.30.0 (pulled in by the built-in
@@ -10,30 +10,38 @@
 # upstream constraint, not a stale pin -- do not bump past golang:1.19 here
 # without also replacing/vendoring quic-go. The runtime stage below has no
 # Go toolchain and can be kept current independently.
-FROM --platform=linux/amd64 golang:1.19-alpine3.17 AS build
+FROM --platform=linux/amd64 golang:1.19.13-alpine3.18 AS build
 
 WORKDIR /src
 ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 
-RUN apk add --no-cache ca-certificates git perl \
-    && git clone --depth 1 --branch v4.5.3 https://github.com/IrineSistiana/mosdns.git .
+RUN apk add --no-cache ca-certificates git \
+    && git clone --depth 1 --branch v4.5.3 https://github.com/IrineSistiana/mosdns.git . \
+    && test "$(git rev-parse HEAD)" = "760a660192fdf996463b024d1d0e19bd66b6ed31"
+
+# Cache dependency download separately from the custom plugin layers so source
+# edits do not force a full module re-download during image builds.
+RUN go mod download
 
 # Keep the warm-start disk cache feature without maintaining a fork.
 COPY content/warm_backend.go /src/plugin/executable/cache/warm_backend.go
-RUN perl -0pi -e 's/(WhenHit\s+string\s+`yaml:"when_hit"`)/$1\n\tDumpFile          string `yaml:"dump_file"`\n\tDumpInterval      int    `yaml:"dump_interval"`/' /src/plugin/executable/cache/cache.go \
- && perl -0pi -e 's/c = mem_cache\.NewMemCache\(args\.Size, 0\)/c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())/' /src/plugin/executable/cache/cache.go \
+RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tDumpFile          string `yaml:\"dump_file\"`"; print "\tDumpInterval      int    `yaml:\"dump_interval\"`"}' /src/plugin/executable/cache/cache.go > /src/plugin/executable/cache/cache.go.tmp \
+ && mv /src/plugin/executable/cache/cache.go.tmp /src/plugin/executable/cache/cache.go \
+ && test "$(grep -c 'DumpFile[[:space:]]*string[[:space:]]*`yaml:\"dump_file\"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && test "$(grep -c 'DumpInterval[[:space:]]*int[[:space:]]*`yaml:\"dump_interval\"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && sed -i 's|c = mem_cache.NewMemCache(args.Size, 0)|c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())|' /src/plugin/executable/cache/cache.go \
  && gofmt -w /src/plugin/executable/cache/cache.go /src/plugin/executable/cache/warm_backend.go
 
 COPY content/upstream_probe.go /src/probe/main.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
 COPY content/ip_conn_proxy.go /src/probe/ip_conn_proxy.go
 
-RUN go build -trimpath -ldflags='-s -w' -o /out/mosdns . \
- && go build -trimpath -ldflags='-s -w' -o /out/mosdns-probe ./probe/main.go \
- && go build -trimpath -ldflags='-s -w' -o /out/ip-conn-proxy ./probe/ip_conn_proxy.go \
+RUN go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
+ && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe/main.go \
+ && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./probe/ip_conn_proxy.go \
  && /out/mosdns version
 
-FROM --platform=linux/amd64 alpine:3.24
+FROM --platform=linux/amd64 alpine:3.24.2
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S mosdns \
@@ -58,6 +66,10 @@ ENV PORT=8080 \
     DOH_RATE_MAX_IPS=512 \
     GLOBAL_RATE_LIMIT=40 \
     GLOBAL_RATE_BURST=80 \
+    HEALTH_RATE_LIMIT=2 \
+    HEALTH_RATE_BURST=4 \
+    GLOBAL_HEALTH_RATE_LIMIT=10 \
+    GLOBAL_HEALTH_RATE_BURST=20 \
     GLOBAL_CONN_LIMIT=128 \
     DOH_MAX_BODY_BYTES=4096 \
     DOH_IDLE_TIMEOUT=120 \
@@ -65,7 +77,6 @@ ENV PORT=8080 \
     UPSTREAM_MAX_CONNS=2 \
     CACHE_SIZE=2048 \
     CACHE_DUMP_INTERVAL=3300 \
-    MAX_QPS=15 \
     HEALTH_TIMEOUT_MS=1200 \
     HEALTH_BACKEND_TIMEOUT_MS=1000 \
     HEALTH_CHECK=true \
@@ -77,9 +88,8 @@ ENV PORT=8080 \
     HEALTH_INTERVAL=300 \
     HEALTH_FAILS_TO_SWITCH=2 \
     HEALTH_RESTART_COOLDOWN=900 \
-    GOMEMLIMIT=320MiB \
+    GOMEMLIMIT=256MiB \
     GOMAXPROCS=1 \
-    UPSTREAM_MODE=doh-only \
     HAGEZI_UPSTREAM=rotate \
     HEALTH_PATH=/health \
     DOH_PATH=/dns-query \
