@@ -84,7 +84,7 @@ per-IP conn:      IP_CONN_LIMIT (0 = disabled)
 request size:     DOH_MAX_BODY_BYTES
 ```
 
-Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
+Each DoH request is checked against the per-client rate limit first and the global limit second, so one abusive client cannot use up the shared budget. Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
 
 The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
 
