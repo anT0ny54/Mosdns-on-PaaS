@@ -45,7 +45,7 @@ Source: [HaGeZi DNS servers](https://github.com/hagezi/dns-servers).
 
 ### Sequential failover
 
-The custom `sequential_forward` plugin tries one upstream at a time. The next upstream is contacted only when the previous `ExchangeContext` returns an error. A valid DNS response, including a DNS error response such as `NXDOMAIN` or `SERVFAIL`, is returned immediately rather than causing another upstream query.
+The custom `sequential_forward` plugin tries one upstream at a time. The next upstream is contacted only when the previous `ExchangeContext` returns an error. Each attempt gets an equal share of the time left before the `SERVER_TIMEOUT` deadline (the last upstream keeps the remainder), so a stalled upstream cannot consume the whole deadline and prevent failover. A valid DNS response, including a DNS error response such as `NXDOMAIN` or `SERVFAIL`, is returned immediately rather than causing another upstream query.
 
 This is intentionally different from MosDNS's parallel `fast_forward` behavior: normal traffic should produce one upstream request, with later endpoints reserved for transport/upstream exchange failures.
 
@@ -59,7 +59,7 @@ This is intentionally different from MosDNS's parallel `fast_forward` behavior: 
 | `random` | Probe all three built-ins and randomly rotate among near-equal healthy candidates. |
 | `https://...` | Use the custom endpoint as the first candidate and keep two built-in HaGeZi endpoints as fallbacks. |
 
-The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart.
+The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart. When a switch happens, the complete measured order from the probe (not just the new first entry) becomes the new failover order.
 
 The three built-in IP variables are validated as IPv4 addresses before configuration is rendered. A custom `HAGEZI_UPSTREAM` is not pinned by these variables and is resolved normally.
 
@@ -67,7 +67,7 @@ The three built-in IP variables are validated as IPv4 addresses before configura
 
 The normal query path uses MosDNS's memory cache. A small custom backend keeps a second, bounded copy for warm starts and writes it atomically to disk at `CACHE_DUMP_INTERVAL`. The warm copy is limited by both `CACHE_SIZE` and an 8 KiB per-entry cap, which keeps duplicate cached response data bounded on the 512 MB instance. Warm metadata keeps insertion/restore recency for snapshot eviction and restoration; ordinary hot-cache hits stay on the fast inner-cache path and do not take the warm-metadata lock. The snapshot is limited to the same warm-entry set, and expired or oversized entries are discarded before restore.
 
-Koyeb local storage is ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after an Instance replacement.
+Koyeb local storage is ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after an Instance replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting.
 
 ## DoH proxy
 
@@ -86,7 +86,7 @@ request size:     DOH_MAX_BODY_BYTES
 
 Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
 
-The proxy uses the final `X-Forwarded-For` address for client limiting and removes client-controlled forwarding headers before proxying to MosDNS.
+The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
 
 The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve platform health checks, while repeated health polling is still bounded.
 
@@ -124,7 +124,7 @@ The image has working defaults; no environment variable is required for the defa
 | `IP_CONN_LIMIT` | `0` | Per-client concurrent connection limit; `0` disables it. |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
 | `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
-| `HEALTH_TIMEOUT_MS` | `1200` | Upstream probe timeout, milliseconds. |
+| `HEALTH_TIMEOUT_MS` | `1200` | Upstream probe timeout, milliseconds (must be > 0). |
 | `HEALTH_INTERVAL` | `300` | Runtime probe interval, seconds. |
 | `HEALTH_FAILS_TO_SWITCH` | `2` | Consecutive active-upstream failures before switching. |
 | `HEALTH_RESTART_COOLDOWN` | `900` | Minimum seconds between supervisor-triggered restarts. |

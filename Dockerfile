@@ -30,15 +30,18 @@ RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tD
  && test "$(grep -c 'DumpFile[[:space:]]*string[[:space:]]*`yaml:\"dump_file\"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && test "$(grep -c 'DumpInterval[[:space:]]*int[[:space:]]*`yaml:\"dump_interval\"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && sed -i 's|c = mem_cache.NewMemCache(args.Size, 0)|c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())|' /src/plugin/executable/cache/cache.go \
+ && test "$(grep -c 'newWarmBackend(' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && gofmt -w /src/plugin/executable/cache/cache.go /src/plugin/executable/cache/warm_backend.go
 
+# The probe helper and the DoH proxy are separate `package main` programs, so
+# each gets its own directory instead of sharing /src/probe.
 COPY content/upstream_probe.go /src/probe/main.go
+COPY content/ip_conn_proxy.go /src/proxy/main.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
-COPY content/ip_conn_proxy.go /src/probe/ip_conn_proxy.go
 
 RUN go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
- && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe/main.go \
- && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./probe/ip_conn_proxy.go \
+ && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe \
+ && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./proxy \
  && /out/mosdns version
 
 FROM --platform=linux/amd64 alpine:3.24.2
