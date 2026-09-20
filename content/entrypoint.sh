@@ -318,9 +318,9 @@ render_config() {
   # scalar instead of letting YAML punctuation alter the generated config.
   sed -i "/^[[:space:]]*dial_addr:[[:space:]]*''[[:space:]]*$/d" "$candidate"
 
-  if grep -Eq '__[A-Z0-9_]+__' "$candidate"; then
+  if grep -q '__NAME__' "$candidate"; then
     echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
-    grep -nE '__[A-Z0-9_]+__' "$candidate" >&2 || true
+    grep -nF '__NAME__' "$candidate" >&2 || true
     rm -f "$candidate"
     return 1
   fi
