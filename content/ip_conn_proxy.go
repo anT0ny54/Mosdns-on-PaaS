@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -185,8 +188,10 @@ func clientIP(r *http.Request) string {
 	// the header: if the final element is malformed, an earlier element can
 	// still be attacker-controlled. In that case, fall back to RemoteAddr.
 	if x := r.Header.Get("X-Forwarded-For"); x != "" {
-		parts := strings.Split(x, ",")
-		ip := strings.TrimSpace(parts[len(parts)-1])
+		if i := strings.LastIndexByte(x, ','); i >= 0 {
+			x = x[i+1:]
+		}
+		ip := strings.TrimSpace(x)
 		if net.ParseIP(ip) != nil {
 			return ip
 		}
@@ -202,11 +207,15 @@ func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
 	max := getenvInt("IP_CONN_LIMIT", 0)
-	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 30)
-	rateBurst := getenvInt("DOH_RATE_BURST", 60)
+	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 5)
+	rateBurst := getenvInt("DOH_RATE_BURST", 12)
 	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 512)
 	globalRatePerSecond := getenvFloat("GLOBAL_RATE_LIMIT", 40)
 	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 80)
+	healthRatePerSecond := getenvFloat("HEALTH_RATE_LIMIT", 2)
+	healthRateBurst := getenvInt("HEALTH_RATE_BURST", 4)
+	globalHealthRatePerSecond := getenvFloat("GLOBAL_HEALTH_RATE_LIMIT", 10)
+	globalHealthRateBurst := getenvInt("GLOBAL_HEALTH_RATE_BURST", 20)
 	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 128)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
@@ -228,6 +237,18 @@ func main() {
 	if globalRateBurst < 0 {
 		log.Fatalf("GLOBAL_RATE_BURST must be >= 0")
 	}
+	if healthRatePerSecond < 0 {
+		log.Fatalf("HEALTH_RATE_LIMIT must be >= 0 (0 = unlimited)")
+	}
+	if healthRateBurst < 0 {
+		log.Fatalf("HEALTH_RATE_BURST must be >= 0")
+	}
+	if globalHealthRatePerSecond < 0 {
+		log.Fatalf("GLOBAL_HEALTH_RATE_LIMIT must be >= 0 (0 = unlimited)")
+	}
+	if globalHealthRateBurst < 0 {
+		log.Fatalf("GLOBAL_HEALTH_RATE_BURST must be >= 0")
+	}
 	if globalConnLimit < 0 {
 		log.Fatalf("GLOBAL_CONN_LIMIT must be >= 0 (0 = unlimited)")
 	}
@@ -242,12 +263,13 @@ func main() {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
 		Proxy:                 nil,
+		DisableCompression:    true,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          8,
 		MaxIdleConnsPerHost:   4,
 		MaxConnsPerHost:       8,
-		IdleConnTimeout:       120 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -259,6 +281,8 @@ func main() {
 	globalConnLim := newGlobalConnLimiter(globalConnLimit)
 	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
 	globalRateLim := newRateLimiter(globalRatePerSecond, globalRateBurst, 1)
+	healthRateLim := newRateLimiter(healthRatePerSecond, healthRateBurst, ratePeers)
+	globalHealthRateLim := newRateLimiter(globalHealthRatePerSecond, globalHealthRateBurst, 1)
 	dohPath := getenv("DOH_PATH", "/dns-query")
 	healthPathValue := getenv("HEALTH_PATH", "/health")
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -267,7 +291,45 @@ func main() {
 			return
 		}
 
+		ip := clientIP(r)
+
+		var connStateValue *connState
+		if max > 0 {
+			state := r.Context().Value(connStateKey{})
+			connStateValue, _ = state.(*connState)
+			if connStateValue == nil {
+				http.Error(w, "internal limiter error", http.StatusInternalServerError)
+				return
+			}
+			// Enforce the configured per-IP connection cap on every accepted
+			// request, including the public health endpoint. Otherwise a client
+			// could keep persistent health connections outside the limiter.
+			if !connLim.allow(ip, connStateValue) {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "too many connections", http.StatusTooManyRequests)
+				return
+			}
+		}
+
+		now := time.Now()
+
 		if r.URL.Path == healthPathValue {
+			// Keep platform health checks independent from the public DoH request
+			// budget. A separate per-IP plus global health budget still prevents
+			// /health from becoming an unbounded backend-connect flood.
+			if !healthRateLim.allow(ip, now) || !globalHealthRateLim.allow("health-global", now) {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "health rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+			// Health checks are infrequent and should never hold a global connection
+			// slot open just because the client uses HTTP keep-alive.
+			r.Close = true
+			w.Header().Set("Connection", "close")
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
 			w.Header().Set("Cache-Control", "no-store")
 			c, err := net.DialTimeout("tcp", backendAddr, healthTimeout)
 			if err != nil {
@@ -280,40 +342,55 @@ func main() {
 			return
 		}
 
-		state := r.Context().Value(connStateKey{})
-		connStateValue, _ := state.(*connState)
-		if connStateValue == nil {
-			http.Error(w, "internal limiter error", http.StatusInternalServerError)
+		// The global DoH budget applies only to DNS requests; health uses its own
+		// isolated limiter so platform health checks cannot be starved by clients.
+		if !globalRateLim.allow("global", now) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "service rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
-		ip := clientIP(r)
 
-		// Strip client-controlled forwarding headers before MosDNS sees the request.
+		// Only RFC 8484 GET/POST DoH requests are accepted. Apply the per-client
+		// request-rate limit before body buffering or other parsing work so rejected
+		// floods consume as little CPU and memory as possible.
+		if !rateLim.allow(ip, now) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+
+		// Strip client-controlled forwarding metadata before MosDNS sees the request.
 		// ReverseProxy will append its request RemoteAddr to X-Forwarded-For, so
-		// remove the inbound header and replace RemoteAddr with the already-validated
-		// client IP. This makes the backend receive exactly one trusted XFF value
-		// instead of "client,127.0.0.1".
-		r.Header.Del("X-Real-IP")
-		r.Header.Del("X-Forwarded-For")
+		// remove inbound forwarding headers and replace RemoteAddr with the already-
+		// validated client IP. The backend only needs the trusted XFF value.
+		for _, header := range []string{
+			"Forwarded",
+			"X-Forwarded-For",
+			"X-Forwarded-Host",
+			"X-Forwarded-Proto",
+			"X-Real-IP",
+		} {
+			r.Header.Del(header)
+		}
 		if net.ParseIP(ip) != nil {
 			r.RemoteAddr = net.JoinHostPort(ip, "0")
 		}
 
-		// Keep the connection cap disabled by default for Firefox/Fennec DoH.
-		// The abuse control is request-rate based instead of connection based.
-		if max > 0 && !connLim.allow(ip, connStateValue) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "too many connections", http.StatusTooManyRequests)
-			return
-		}
-
-		// Only RFC 8484 GET/POST DoH requests are accepted. Reject malformed
-		// or oversized requests before they reach MosDNS.
+		// Reject malformed or oversized requests before they reach MosDNS.
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if r.Method == http.MethodGet {
+			// DoH GET carries the DNS message in the query string. Reject a request
+			// body instead of letting ReverseProxy stream an unused, potentially
+			// unbounded body to MosDNS.
+			if r.ContentLength != 0 {
+				r.Close = true
+				w.Header().Set("Connection", "close")
+				http.Error(w, "GET request body not allowed", http.StatusBadRequest)
+				return
+			}
 			dnsParam := r.URL.Query().Get("dns")
 			if dnsParam == "" {
 				http.Error(w, "missing dns parameter", http.StatusBadRequest)
@@ -333,19 +410,26 @@ func main() {
 				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-		}
-
-		now := time.Now()
-		if !globalRateLim.allow("global", now) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "service rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-		if !rateLim.allow(ip, now) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "too many requests", http.StatusTooManyRequests)
-			return
+			if r.ContentLength < 0 {
+				// Chunked requests have no trusted Content-Length. Buffer at most
+				// one byte beyond the configured cap so an oversized body is
+				// rejected before ReverseProxy can stream any of it upstream.
+				body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+				if err != nil {
+					http.Error(w, "invalid request body", http.StatusBadRequest)
+					return
+				}
+				if int64(len(body)) > maxBodyBytes {
+					r.Close = true
+					w.Header().Set("Connection", "close")
+					http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				r.ContentLength = int64(len(body))
+			} else {
+				r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+			}
 		}
 
 		r.Header.Set("Accept", "application/dns-message")
@@ -356,9 +440,14 @@ func main() {
 		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       180 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if max <= 0 {
+				return ctx
+			}
 			state := connLim.registerConn(c)
 			return context.WithValue(ctx, connStateKey{}, state)
 		},
@@ -370,15 +459,17 @@ func main() {
 				}
 			case http.StateClosed:
 				globalConnLim.remove(c)
-				connLim.closeConn(c)
+				if max > 0 {
+					connLim.closeConn(c)
+				}
 			}
 		},
 	}
 
 	if max == 0 {
-		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=unlimited, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
+		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=unlimited, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
 	} else {
-		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
+		log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
 	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
@@ -404,7 +495,7 @@ func getenvInt(k string, d int) int {
 
 func getenvFloat(k string, d float64) float64 {
 	v, err := strconv.ParseFloat(getenv(k, strconv.FormatFloat(d, 'f', -1, 64)), 64)
-	if err != nil {
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 		return d
 	}
 	return v

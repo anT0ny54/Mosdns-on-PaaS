@@ -4,16 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,17 +44,69 @@ func dnsQuery(id uint16) []byte {
 	return b
 }
 
-// probeClient is shared across probes so keep-alive connections are reused
-// between the parallel per-cycle probes and across probe cycles, instead of
-// paying a fresh TCP+TLS handshake for every single probe on a 0.1 vCPU box.
-var probeClient = &http.Client{}
+type probeURLKey struct{}
+
+// The probe helper is a one-shot process. Keep the transport deliberately
+// single-use so it does not retain idle sockets between its three probes.
+var probeClient = newProbeClient()
+var probeID uint32
+
+func newProbeClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: -1}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:              nil,
+			ForceAttemptHTTP2:  true,
+			DisableCompression: true,
+			DisableKeepAlives:  true,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if network == "tcp" {
+					if _, port, err := net.SplitHostPort(addr); err == nil {
+						if rawURL, _ := ctx.Value(probeURLKey{}).(string); rawURL != "" {
+							if ip := pinnedIPForURL(rawURL); ip != "" {
+								addr = net.JoinHostPort(ip, port)
+							}
+						}
+					}
+				}
+				return dialer.DialContext(ctx, network, addr)
+			},
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			// A health probe must not redirect to another origin.
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func pinnedIPForURL(rawURL string) string {
+	// Pin only the exact built-in endpoint URLs. A custom endpoint may share a
+	// built-in hostname but use a different URL/path; runtime MosDNS resolves
+	// that custom URL normally, so the health probe must use the same behavior.
+	switch rawURL {
+	case "https://root.hagezi.org/dns-query":
+		return validPinnedIP(os.Getenv("UPSTREAM_0_IP"))
+	case "https://wurzn.hagezi.org/dns-query":
+		return validPinnedIP(os.Getenv("UPSTREAM_1_IP"))
+	case "https://juuri.hagezi.org/dns-query":
+		return validPinnedIP(os.Getenv("UPSTREAM_2_IP"))
+	default:
+		return ""
+	}
+}
+
+func validPinnedIP(value string) string {
+	ip := net.ParseIP(value)
+	if ip != nil && ip.To4() != nil {
+		return value
+	}
+	return ""
+}
 
 func probe(url string, timeout time.Duration) (int64, bool) {
-	var idBytes [2]byte
-	if _, err := rand.Read(idBytes[:]); err != nil {
-		return 0, false
-	}
-	id := binary.BigEndian.Uint16(idBytes[:])
+	id := uint16(atomic.AddUint32(&probeID, 1))
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(dnsQuery(id)))
 	if err != nil {
 		return 0, false
@@ -61,6 +116,7 @@ func probe(url string, timeout time.Duration) (int64, bool) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	ctx = context.WithValue(ctx, probeURLKey{}, url)
 	resp, err := probeClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return 0, false
@@ -69,8 +125,41 @@ func probe(url string, timeout time.Duration) (int64, bool) {
 	if resp.StatusCode != http.StatusOK {
 		return 0, false
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil || len(data) < 12 || binary.BigEndian.Uint16(data[0:2]) != id || binary.BigEndian.Uint16(data[6:8]) == 0 {
+	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType != "application/dns-message" {
+		return 0, false
+	}
+	// DNS messages are bounded by the wire-format maximum. Only the 12-byte
+	// header is needed for validation; drain the remainder without retaining
+	// the full response so health probes stay allocation-light and memory-bounded.
+	const maxDNSMessageBytes = 65535
+	if resp.ContentLength > maxDNSMessageBytes {
+		return 0, false
+	}
+	var header [12]byte
+	if _, err := io.ReadFull(resp.Body, header[:]); err != nil {
+		return 0, false
+	}
+	remaining := int64(maxDNSMessageBytes - len(header))
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, remaining+1))
+	if err != nil || n > remaining {
+		return 0, false
+	}
+	flags := binary.BigEndian.Uint16(header[2:4])
+	if binary.BigEndian.Uint16(header[0:2]) != id || flags&0x8000 == 0 {
+		return 0, false
+	}
+	// The probe sends one standard recursive DNS question. Require the normal
+	// query opcode and an echoed question count so a generic HTTP/DNS-shaped
+	// response cannot be mistaken for a healthy resolver.
+	if flags&0x7800 != 0 || flags&0x0200 != 0 || binary.BigEndian.Uint16(header[4:6]) != 1 {
+		return 0, false
+	}
+	// Treat only NOERROR and NXDOMAIN as healthy probe outcomes. Unknown or
+	// reserved RCODEs must not be accepted as evidence that the resolver is
+	// servicing DNS normally.
+	rcode := flags & 0x000f
+	if rcode != 0 && rcode != 3 {
 		return 0, false
 	}
 	ms := time.Since(start).Milliseconds()
@@ -98,6 +187,15 @@ func envInt64(name string, def int64) int64 {
 	return def
 }
 
+func envIntOrDefault(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
 func loadState(path string) map[string]state {
 	m := make(map[string]state)
 	f, err := os.Open(path)
@@ -113,26 +211,73 @@ func loadState(path string) map[string]state {
 		}
 		e, err1 := strconv.ParseFloat(p[1], 64)
 		fails, err2 := strconv.Atoi(p[2])
-		if err1 == nil && err2 == nil && e > 0 && fails >= 0 {
+		if err1 == nil && err2 == nil && e > 0 && !math.IsNaN(e) && !math.IsInf(e, 0) && fails >= 0 {
 			m[p[0]] = state{ewma: e, failures: fails}
 		}
+	}
+	if err := s.Err(); err != nil {
+		return make(map[string]state)
 	}
 	return m
 }
 
 func saveState(path string, m map[string]state) {
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return
+		}
+	}
+
+	keys := make([]string, 0, len(m))
+	for url := range m {
+		keys = append(keys, url)
+	}
+	sort.Strings(keys)
+
 	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return
 	}
-	w := bufio.NewWriter(f)
-	for url, st := range m {
-		fmt.Fprintf(w, "%s\t%.3f\t%d\n", url, st.ewma, st.failures)
+	w := bufio.NewWriterSize(f, 4<<10)
+	writeOK := true
+	for _, url := range keys {
+		st := m[url]
+		if _, err := fmt.Fprintf(w, "%s\t%.3f\t%d\n", url, st.ewma, st.failures); err != nil {
+			writeOK = false
+			break
+		}
 	}
-	_ = w.Flush()
-	_ = f.Close()
-	_ = os.Rename(tmp, path)
+	flushErr := w.Flush()
+	closeErr := f.Close()
+	if writeOK && flushErr == nil && closeErr == nil {
+		if err := os.Rename(tmp, path); err == nil {
+			return
+		}
+	}
+	_ = os.Remove(tmp)
+}
+
+func scoreState(s state, failurePenalty int64) int64 {
+	var score int64
+	switch {
+	case math.IsNaN(s.ewma) || s.ewma <= 0:
+		score = 0
+	case s.ewma >= 10000:
+		score = 10000
+	default:
+		score = int64(s.ewma)
+	}
+
+	if score < 10000 && s.failures > 0 && failurePenalty > 0 {
+		room := 10000 - score
+		penalty := int64(s.failures)
+		if penalty > room/failurePenalty {
+			return 10000
+		}
+		score += penalty * failurePenalty
+	}
+	return score
 }
 
 func main() {
@@ -189,17 +334,15 @@ func main() {
 			}
 			s.failures++
 		}
-		score := int64(s.ewma) + int64(s.failures)*failurePenalty
-		if !r.ok || s.failures > 0 {
-			score += failurePenalty
-		}
-		if score > 10000 {
-			score = 10000
-		}
+		score := scoreState(s, failurePenalty)
 		r.ewma, r.failures, r.score = s.ewma, s.failures, score
 		st[r.url] = s
 	}
-	saveState(statePath, st)
+	currentState := make(map[string]state, len(urls))
+	for _, u := range urls {
+		currentState[u] = st[u]
+	}
+	saveState(statePath, currentState)
 
 	// Stable health order: healthy first, then lowest smoothed score.
 	sort.SliceStable(out, func(i, j int) bool {
@@ -226,17 +369,30 @@ func main() {
 				bestPos = i
 			}
 		}
-		if activePos >= 0 && bestPos >= 0 && out[activePos].ok && bestPos != activePos {
+		if activePos >= 0 && bestPos >= 0 && bestPos != activePos {
 			best := out[bestPos]
 			cur := out[activePos]
-			improvement := float64(cur.score-best.score) / float64(max64(cur.score, 1))
-			absolute := cur.score - best.score
-			if improvement < switchPct || absolute < switchMs {
-				// Keep active first; retain the health ordering for the remainder.
-				keptActive = true
-				keep := out[activePos]
-				copy(out[1:activePos+1], out[0:activePos])
-				out[0] = keep
+			if !cur.ok {
+				// A transient failure must not be enough to replace the active
+				// upstream. Preserve it until the configured consecutive-failure
+				// threshold is reached; this also prevents random mode from
+				// bypassing the same hysteresis rule below.
+				if cur.failures < envIntOrDefault("HEALTH_FAILS_TO_SWITCH", 2) {
+					keptActive = true
+					keep := out[activePos]
+					copy(out[1:activePos+1], out[0:activePos])
+					out[0] = keep
+				}
+			} else {
+				improvement := float64(cur.score-best.score) / float64(max64(cur.score, 1))
+				absolute := cur.score - best.score
+				if improvement < switchPct || absolute < switchMs {
+					// Keep active first; retain the health ordering for the remainder.
+					keptActive = true
+					keep := out[activePos]
+					copy(out[1:activePos+1], out[0:activePos])
+					out[0] = keep
+				}
 			}
 		}
 	}
@@ -249,10 +405,36 @@ func main() {
 		if cutoff < best+10 {
 			cutoff = best + 10
 		}
+		activeScore, activeHealthy := int64(0), false
+		if active != "" {
+			for i := range out {
+				if out[i].url == active {
+					activeScore, activeHealthy = out[i].score, out[i].ok
+					break
+				}
+			}
+		}
+		if activeHealthy && activeScore != best {
+			// When active is not the best candidate, every randomized candidate
+			// must still beat it by both configured switch margins. If active is
+			// already best, use the normal near-best cutoff so random mode can
+			// actually rotate among otherwise equivalent healthy endpoints.
+			marginCutoff := activeScore - switchMs
+			pctCutoff := int64(float64(activeScore) * (1 - switchPct))
+			if pctCutoff < marginCutoff {
+				cutoff = pctCutoff
+			} else {
+				cutoff = marginCutoff
+			}
+		}
 		candidates := 0
 		for i := range out {
 			if out[i].ok && out[i].score <= cutoff {
 				candidates++
+				continue
+			}
+			if out[i].ok {
+				break
 			}
 		}
 		if candidates > 1 {

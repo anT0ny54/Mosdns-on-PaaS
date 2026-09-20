@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
@@ -9,6 +10,10 @@ set -eu
 : "${DOH_RATE_MAX_IPS:=512}"
 : "${GLOBAL_RATE_LIMIT:=40}"
 : "${GLOBAL_RATE_BURST:=80}"
+: "${HEALTH_RATE_LIMIT:=2}"
+: "${HEALTH_RATE_BURST:=4}"
+: "${GLOBAL_HEALTH_RATE_LIMIT:=10}"
+: "${GLOBAL_HEALTH_RATE_BURST:=20}"
 : "${GLOBAL_CONN_LIMIT:=128}"
 : "${DOH_MAX_BODY_BYTES:=4096}"
 : "${HEALTH_PATH:=/health}"
@@ -16,12 +21,10 @@ set -eu
 : "${CACHE_SIZE:=2048}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
 : "${CACHE_DUMP_INTERVAL:=3300}"
-: "${MAX_QPS:=15}"
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${UPSTREAM_IDLE_TIMEOUT:=30}"
 : "${UPSTREAM_MAX_CONNS:=2}"
 : "${SERVER_TIMEOUT:=8}"
-: "${UPSTREAM_MODE:=doh-only}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_BACKEND_TIMEOUT_MS:=1000}"
 : "${HEALTH_CHECK:=true}"
@@ -33,7 +36,7 @@ set -eu
 : "${HEALTH_INTERVAL:=300}"
 : "${HEALTH_FAILS_TO_SWITCH:=2}"
 : "${HEALTH_RESTART_COOLDOWN:=900}"
-: "${GOMEMLIMIT:=320MiB}"
+: "${GOMEMLIMIT:=256MiB}"
 : "${GOMAXPROCS:=1}"
 : "${DOH_IDLE_TIMEOUT:=120}"
 : "${UPSTREAM_0_IP:=188.34.161.210}"
@@ -44,6 +47,11 @@ validate_uint() {
   case "$2" in
     ''|*[!0-9]*) echo "Invalid $1: $2" >&2; exit 1 ;;
   esac
+}
+
+validate_uint_max() {
+  validate_uint "$1" "$2"
+  [ "$2" -le "$3" ] || { echo "Invalid $1: $2 (must be <= $3)" >&2; exit 1; }
 }
 
 validate_port() {
@@ -58,8 +66,23 @@ validate_printable_ascii() {
   esac
 }
 
+validate_ipv4() {
+  awk -v ip="$2" 'BEGIN {
+    if (split(ip, octet, ".") != 4) exit 1
+    for (i = 1; i <= 4; i++) {
+      if (octet[i] !~ /^[0-9]+$/ || octet[i] < 0 || octet[i] > 255) exit 1
+    }
+  }' 2>/dev/null || {
+    echo "Invalid $1: $2 (must be an IPv4 address)" >&2
+    exit 1
+  }
+}
+
 validate_float01() {
-  awk -v v="$2" 'BEGIN { exit !(v > 0 && v <= 1) }' 2>/dev/null || {
+  awk -v v="$2" 'BEGIN {
+    if (v !~ /^[+]?(0|[0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
+    exit !(v > 0 && v <= 1)
+  }' 2>/dev/null || {
     echo "Invalid $1: $2 (must be >0 and <=1)" >&2
     exit 1
   }
@@ -79,46 +102,50 @@ validate_nonnegative_float() {
 
 validate_port PORT "$PORT"
 validate_port MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
+[ "$PORT" -ge 1024 ] || { echo "Invalid PORT: $PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
+[ "$MOSDNS_BACKEND_PORT" -ge 1024 ] || { echo "Invalid MOSDNS_BACKEND_PORT: $MOSDNS_BACKEND_PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
 validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
 validate_uint DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS"
 validate_uint GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST"
 validate_uint GLOBAL_CONN_LIMIT "$GLOBAL_CONN_LIMIT"
-validate_uint DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES"
+validate_uint_max DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES" 65535
 validate_uint CACHE_SIZE "$CACHE_SIZE"
-validate_uint CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL"
-validate_uint MAX_QPS "$MAX_QPS"
-validate_uint UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT"
-validate_uint UPSTREAM_MAX_CONNS "$UPSTREAM_MAX_CONNS"
-validate_uint SERVER_TIMEOUT "$SERVER_TIMEOUT"
-validate_uint HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS"
-validate_uint HEALTH_BACKEND_TIMEOUT_MS "$HEALTH_BACKEND_TIMEOUT_MS"
-validate_uint DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT"
-validate_uint HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS"
-validate_uint HEALTH_SWITCH_MARGIN_MS "$HEALTH_SWITCH_MARGIN_MS"
-validate_uint HEALTH_INTERVAL "$HEALTH_INTERVAL"
-validate_uint HEALTH_FAILS_TO_SWITCH "$HEALTH_FAILS_TO_SWITCH"
-validate_uint HEALTH_RESTART_COOLDOWN "$HEALTH_RESTART_COOLDOWN"
+validate_uint_max CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL" 604800
+validate_uint_max UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT" 3600
+validate_uint_max UPSTREAM_MAX_CONNS "$UPSTREAM_MAX_CONNS" 64
+validate_uint_max SERVER_TIMEOUT "$SERVER_TIMEOUT" 300
+validate_uint_max HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS" 600000
+validate_uint_max HEALTH_BACKEND_TIMEOUT_MS "$HEALTH_BACKEND_TIMEOUT_MS" 600000
+validate_uint_max DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT" 3600
+validate_uint_max HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS" 3600000
+validate_uint_max HEALTH_SWITCH_MARGIN_MS "$HEALTH_SWITCH_MARGIN_MS" 3600000
+validate_uint_max HEALTH_INTERVAL "$HEALTH_INTERVAL" 604800
+validate_uint_max HEALTH_FAILS_TO_SWITCH "$HEALTH_FAILS_TO_SWITCH" 1000
+validate_uint_max HEALTH_RESTART_COOLDOWN "$HEALTH_RESTART_COOLDOWN" 604800
 validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
 validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
 validate_printable_ascii DOH_PATH "$DOH_PATH"
 validate_printable_ascii HEALTH_PATH "$HEALTH_PATH"
 validate_printable_ascii CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
 validate_printable_ascii HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
+validate_ipv4 UPSTREAM_0_IP "$UPSTREAM_0_IP"
+validate_ipv4 UPSTREAM_1_IP "$UPSTREAM_1_IP"
+validate_ipv4 UPSTREAM_2_IP "$UPSTREAM_2_IP"
 
 validate_nonnegative_float DOH_RATE_LIMIT "$DOH_RATE_LIMIT"
 validate_nonnegative_float GLOBAL_RATE_LIMIT "$GLOBAL_RATE_LIMIT"
+validate_nonnegative_float HEALTH_RATE_LIMIT "$HEALTH_RATE_LIMIT"
+validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 
-[ "$PORT" -gt 0 ] || { echo "PORT must be > 0" >&2; exit 1; }
-[ "$MOSDNS_BACKEND_PORT" -gt 0 ] || { echo "MOSDNS_BACKEND_PORT must be > 0" >&2; exit 1; }
-[ "$IP_CONN_LIMIT" -ge 0 ] || { echo "IP_CONN_LIMIT must be >= 0" >&2; exit 1; }
 [ "$DOH_RATE_BURST" -gt 0 ] || { echo "DOH_RATE_BURST must be > 0" >&2; exit 1; }
 [ "$DOH_RATE_MAX_IPS" -gt 0 ] || { echo "DOH_RATE_MAX_IPS must be > 0" >&2; exit 1; }
 [ "$GLOBAL_RATE_BURST" -gt 0 ] || { echo "GLOBAL_RATE_BURST must be > 0" >&2; exit 1; }
+[ "$HEALTH_RATE_BURST" -gt 0 ] || { echo "HEALTH_RATE_BURST must be > 0" >&2; exit 1; }
+[ "$GLOBAL_HEALTH_RATE_BURST" -gt 0 ] || { echo "GLOBAL_HEALTH_RATE_BURST must be > 0" >&2; exit 1; }
 [ "$GLOBAL_CONN_LIMIT" -gt 0 ] || { echo "GLOBAL_CONN_LIMIT must be > 0" >&2; exit 1; }
 [ "$DOH_MAX_BODY_BYTES" -ge 512 ] || { echo "DOH_MAX_BODY_BYTES must be >= 512" >&2; exit 1; }
-[ "$CACHE_SIZE" -gt 0 ] || { echo "CACHE_SIZE must be > 0" >&2; exit 1; }
-[ "$MAX_QPS" -gt 0 ] || { echo "MAX_QPS must be > 0" >&2; exit 1; }
+[ "$CACHE_SIZE" -ge 1024 ] || { echo "CACHE_SIZE must be >= 1024" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
 [ "$HEALTH_BACKEND_TIMEOUT_MS" -gt 0 ] || { echo "HEALTH_BACKEND_TIMEOUT_MS must be > 0" >&2; exit 1; }
 [ "$PORT" -ne "$MOSDNS_BACKEND_PORT" ] || { echo "PORT and MOSDNS_BACKEND_PORT must differ" >&2; exit 1; }
@@ -133,8 +160,11 @@ case "$HEALTH_PATH" in /*) ;; *) echo "HEALTH_PATH must start with /" >&2; exit 
 case "$DOH_PATH" in *'?'*|*'#'*|*' '*) echo "DOH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in *'?'*|*'#'*|*' '*) echo "HEALTH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HAGEZI_UPSTREAM" in rotate|random|https://*) ;; *) echo "HAGEZI_UPSTREAM must be 'rotate', 'random', or an https:// endpoint" >&2; exit 1 ;; esac
-case "$UPSTREAM_MODE" in doh-only) ;; *) echo "UPSTREAM_MODE must be doh-only" >&2; exit 1 ;; esac
 case "$HEALTH_CHECK" in true|false) ;; *) echo "HEALTH_CHECK must be true or false" >&2; exit 1 ;; esac
+if [ "$HEALTH_CHECK" = "true" ] && ! command -v mosdns-probe >/dev/null 2>&1; then
+  echo "ERROR: mosdns-probe binary not found while HEALTH_CHECK=true" >&2
+  exit 1
+fi
 
 UPSTREAM_0="https://root.hagezi.org/dns-query"
 UPSTREAM_1="https://wurzn.hagezi.org/dns-query"
@@ -145,18 +175,10 @@ case "$UPSTREAM_0 $UPSTREAM_1 $UPSTREAM_2" in
   *http://*|*udp://*|*tcp://*) echo "ERROR: plain-DNS upstream blocked (HTTPS DoH only)" >&2; exit 1 ;;
 esac
 
-PROBE_WARNED=0
 probe_upstreams() {
   [ "$HEALTH_CHECK" = "true" ] || return 1
-  if ! command -v mosdns-probe >/dev/null 2>&1; then
-    if [ "$PROBE_WARNED" -eq 0 ]; then
-      echo "WARNING: mosdns-probe binary not found; upstream health checks disabled" >&2
-      PROBE_WARNED=1
-    fi
-    return 1
-  fi
-  export HEALTH_TIMEOUT_MS HEALTH_EWMA_ALPHA HEALTH_FAILURE_PENALTY_MS HEALTH_SWITCH_MARGIN_PCT HEALTH_SWITCH_MARGIN_MS HEALTH_STATE_FILE HAGEZI_UPSTREAM
-  mosdns-probe "$@" 2>/dev/null
+  export HEALTH_TIMEOUT_MS HEALTH_EWMA_ALPHA HEALTH_FAILURE_PENALTY_MS HEALTH_SWITCH_MARGIN_PCT HEALTH_SWITCH_MARGIN_MS HEALTH_FAILS_TO_SWITCH HEALTH_STATE_FILE HEALTH_ACTIVE_UPSTREAM HAGEZI_UPSTREAM UPSTREAM_0_IP UPSTREAM_1_IP UPSTREAM_2_IP
+  GOMEMLIMIT=32MiB GOMAXPROCS=1 mosdns-probe "$@" 2>/dev/null
 }
 
 probe_candidate_set() {
@@ -238,7 +260,6 @@ yaml_single_quote() { escaped=$(printf '%s' "$1" | sed "s/'/''/g"); printf "'%s'
 CACHE_SIZE_ESCAPED=$(sed_escape_replacement "$CACHE_SIZE")
 CACHE_DUMP_FILE_ESCAPED=$(yaml_single_quote "$CACHE_DUMP_FILE" | sed 's/[\\&|]/\\&/g')
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
-MAX_QPS_ESCAPED=$(sed_escape_replacement "$MAX_QPS")
 MOSDNS_BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$MOSDNS_BACKEND_PORT")
 UPSTREAM_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_IDLE_TIMEOUT")
 UPSTREAM_MAX_CONNS_ESCAPED=$(sed_escape_replacement "$UPSTREAM_MAX_CONNS")
@@ -267,9 +288,9 @@ render_config() {
   U0_ESCAPED=$(yaml_single_quote "$ORDER_0" | sed 's/[\\&|]/\\&/g')
   U1_ESCAPED=$(yaml_single_quote "$ORDER_1" | sed 's/[\\&|]/\\&/g')
   U2_ESCAPED=$(yaml_single_quote "$ORDER_2" | sed 's/[\\&|]/\\&/g')
-  U0_IP_ESCAPED=$(sed_escape_replacement "$ORDER_0_IP")
-  U1_IP_ESCAPED=$(sed_escape_replacement "$ORDER_1_IP")
-  U2_IP_ESCAPED=$(sed_escape_replacement "$ORDER_2_IP")
+  U0_IP_ESCAPED=$(yaml_single_quote "$ORDER_0_IP" | sed 's/[\\&|]/\\&/g')
+  U1_IP_ESCAPED=$(yaml_single_quote "$ORDER_1_IP" | sed 's/[\\&|]/\\&/g')
+  U2_IP_ESCAPED=$(yaml_single_quote "$ORDER_2_IP" | sed 's/[\\&|]/\\&/g')
 
   candidate="${RUNTIME_CONFIG}.new"
   sed \
@@ -279,7 +300,6 @@ render_config() {
     -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
-    -e "s|__MAX_QPS__|${MAX_QPS_ESCAPED}|g" \
     -e "s|__UPSTREAM_IDLE_TIMEOUT__|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
     -e "s|__UPSTREAM_MAX_CONNS__|${UPSTREAM_MAX_CONNS_ESCAPED}|g" \
     -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
@@ -292,7 +312,10 @@ render_config() {
     "$TEMPLATE" > "$candidate"
 
   # Custom HAGEZI_UPSTREAM endpoints do not have a pinned IP in this image.
-  sed -i '/^[[:space:]]*dial_addr:[[:space:]]*$/d' "$candidate"
+  # Remove empty quoted dial_addr values for custom endpoints that have no
+  # pinned IP. Quoting the value keeps environment overrides inside the YAML
+  # scalar instead of letting YAML punctuation alter the generated config.
+  sed -i "/^[[:space:]]*dial_addr:[[:space:]]*''[[:space:]]*$/d" "$candidate"
 
   if grep -Eq '(__[A-Z0-9_]+__)|BACKEND_[0-9]+|PORT_PLACEHOLDER|BACKEND_PORT_PLACEHOLDER|PATH_PLACEHOLDER' "$candidate"; then
     echo "ERROR: unresolved placeholder in generated MosDNS config:" >&2
@@ -332,7 +355,7 @@ trap cleanup TERM INT EXIT
 printf '%s\n' '=== MosDNS runtime ==='
 mosdns version
 printf '%s\n' '======================'
-echo "Build: Koyeb tiny-instance profile; MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
+echo "Build: Koyeb tiny-instance profile (512 MiB / 0.25 vCPU); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Plain DNS listener: disabled"
@@ -372,7 +395,8 @@ DOH_MAX_BODY_BYTES="${DOH_MAX_BODY_BYTES}" \
 HEALTH_PATH="${HEALTH_PATH}" \
 HEALTH_BACKEND_TIMEOUT_MS="${HEALTH_BACKEND_TIMEOUT_MS}" \
 DOH_PATH="${DOH_PATH}" \
-GOMAXPROCS="${GOMAXPROCS}" \
+GOMEMLIMIT=64MiB \
+GOMAXPROCS=1 \
 ip-conn-proxy &
 PROXY_PID=$!
 
@@ -429,8 +453,6 @@ health_check_once() {
   [ "$HEALTH_CHECK" = "true" ] || return 0
 
   now=$(date +%s)
-  [ $((now - last_restart)) -ge "$HEALTH_RESTART_COOLDOWN" ] || return 0
-
   current="${ORDER_0:-$UPSTREAM_0}"
   raw=$(HEALTH_ACTIVE_UPSTREAM="$current" probe_candidate_set || true)
   [ -n "$raw" ] || return 0
@@ -457,6 +479,12 @@ health_check_once() {
   fi
 
   if [ "$switch" -ne 1 ]; then
+    return 0
+  fi
+
+  # Restart cooldown protects against healthy-performance churn, but it must
+  # never prevent evacuation from an actively failed upstream.
+  if [ "$current_ok" -eq 1 ] && [ $((now - last_restart)) -lt "$HEALTH_RESTART_COOLDOWN" ]; then
     return 0
   fi
 

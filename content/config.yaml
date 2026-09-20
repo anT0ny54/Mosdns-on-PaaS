@@ -3,13 +3,6 @@ log:
 
 # Public DoH only. No UDP/TCP DNS listener is exposed.
 plugins:
-  - tag: client_limit
-    type: client_limiter
-    args:
-      max_qps: __MAX_QPS__
-      v4_mask: 32
-      v6_mask: 48
-
   # Small hot cache plus bounded disk-backed warm-start copy.
   - tag: mem_cache
     type: cache
@@ -32,30 +25,23 @@ plugins:
       upstream:
         - addr: __UPSTREAM_0__
           dial_addr: __UPSTREAM_0_IP__
-          trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: true
           max_conns: __UPSTREAM_MAX_CONNS__
 
         - addr: __UPSTREAM_1__
           dial_addr: __UPSTREAM_1_IP__
-          trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: true
           max_conns: __UPSTREAM_MAX_CONNS__
 
         - addr: __UPSTREAM_2__
           dial_addr: __UPSTREAM_2_IP__
-          trusted: true
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
-          enable_pipeline: true
           max_conns: __UPSTREAM_MAX_CONNS__
 
   - tag: forward
     type: sequence
     args:
       exec:
-        - client_limit
         - _misc_optm
         - mem_cache
         - sequential_failover

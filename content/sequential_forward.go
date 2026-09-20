@@ -107,7 +107,9 @@ func (f *sequentialForward) Exec(ctx context.Context, qCtx *query_context.Contex
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		r, err := u.ExchangeContext(ctx, q.Copy())
+		// ExchangeContext must not retain or modify q, so reuse the same query
+		// object across fallback attempts and avoid an allocation/copy per hop.
+		r, err := u.ExchangeContext(ctx, q)
 		if err == nil {
 			if r == nil {
 				lastErr = errors.New("upstream returned nil response")
