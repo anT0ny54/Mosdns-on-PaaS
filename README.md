@@ -57,9 +57,9 @@ This is intentionally different from MosDNS's parallel `fast_forward` behavior: 
 | --- | --- |
 | `rotate` | Probe all three built-ins and place the healthiest result first. |
 | `random` | Probe all three built-ins and randomly rotate among near-equal healthy candidates. |
-| `https://...` | Use the custom endpoint as the first candidate and keep two built-in HaGeZi endpoints as fallbacks. |
+| `https://...` | Prefer this endpoint (a custom one takes the first built-in slot; a built-in URL is simply moved first) and keep the other two as fallbacks. It stays first while it passes its health probe; the probe only reorders the fallbacks. |
 
-The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart. When a switch happens, the complete measured order from the probe (not just the new first entry) becomes the new failover order.
+The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart. When a switch happens, the complete measured order from the probe (not just the new first entry) becomes the new failover order. With a fixed `https://...` endpoint, latency never demotes it: it is moved down only after it has failed `HEALTH_FAILS_TO_SWITCH` probes in a row, and the supervisor moves it back to first (subject to `HEALTH_RESTART_COOLDOWN`) once it probes healthy again.
 
 The three built-in IP variables are validated as IPv4 addresses before configuration is rendered. A custom `HAGEZI_UPSTREAM` is not pinned by these variables and is resolved normally.
 
@@ -107,7 +107,7 @@ The image has working defaults; no environment variable is required for the defa
 | `CACHE_SIZE` | `2048` | Maximum cache entries in RAM and warm snapshot. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
 | `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
-| `SERVER_TIMEOUT` | `8` | MosDNS query timeout, seconds. |
+| `SERVER_TIMEOUT` | `8` | MosDNS query timeout, seconds. The proxy stops waiting for MosDNS after 12 s, so values above 12 only produce a startup warning. |
 | `UPSTREAM_IDLE_TIMEOUT` | `30` | Upstream idle connection timeout, seconds. |
 | `UPSTREAM_MAX_CONNS` | `2` | Maximum upstream connections per endpoint. |
 | `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. |
@@ -136,6 +136,8 @@ The image has working defaults; no environment variable is required for the defa
 | `HEALTH_BACKEND_TIMEOUT_MS` | `1000` | Proxy health-check TCP timeout, milliseconds. |
 | `GOMEMLIMIT` | `256MiB` | Go memory soft limit. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
+
+Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst, connection, and timeout values must be greater than 0 (`IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable).
 
 ## Deploy to Koyeb
 
