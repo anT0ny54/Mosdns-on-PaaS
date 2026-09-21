@@ -1,5 +1,57 @@
 # Changelog
 
+## 8.2.14
+
+Audit of the runtime path (Koyeb edge -> `ip-conn-proxy` -> MosDNS `forward`
+sequence -> `mem_cache` -> `sequential_failover`) and its configuration.
+
+### Fixed
+- `entrypoint.sh`: `render_config` runs inside `if ! render_config`, where
+  `set -e` is disabled. A failed or partial `sed` render (for example a full
+  `/tmp`) could therefore still be checked for placeholders and installed as
+  the runtime config. The render and the `dial_addr` cleanup are now checked
+  explicitly and the candidate file is discarded on failure.
+- `ip_conn_proxy.go`: the proxy kept idle backend connections for a fixed 90 s
+  while the MosDNS listener idle timeout is configurable (`DOH_IDLE_TIMEOUT`).
+  With a value below 90 s MosDNS could close a pooled connection first, and a
+  reused connection then failed non-replayable DoH POST requests with 502.
+  The proxy now receives `DOH_IDLE_TIMEOUT` and keeps idle backend connections
+  between 1 s and 90 s, always 5 s shorter than the MosDNS timeout.
+
+### Changed
+- `entrypoint.sh`: the startup upstream selection now logs a warning when the
+  health probe produced no usable result and the default order is used, instead
+  of falling back silently.
+- `entrypoint.sh`: the supervisor loop ticks every 5 s instead of 2 s. This
+  removes about 60% of the idle `sleep`/`kill -0`/`date` process spawns on the
+  0.25 vCPU instance; crash detection is still bounded by a few seconds and
+  `SIGTERM` handling stays immediate because the wait is interruptible.
+- `README.md`: documented the `DOH_IDLE_TIMEOUT` / proxy relationship and
+  corrected the validation summary (idle timeouts and rate limits may be 0).
+
+### Removed
+- `ip_conn_proxy.go`: three dead `r.Close = true` assignments. `net/http`
+  ignores `Request.Close` on the server side; the `Connection: close` response
+  header that sits next to each one is what actually closes the connection.
+
+### Reviewed, no change needed
+- `sequential_forward.go`, `warm_backend.go`, `upstream_probe.go`,
+  `config.yaml`, `Dockerfile`: no functional defects found. Dockerfile `ENV`
+  defaults match the `entrypoint.sh` defaults and the README table.
+
+### Notes / follow-ups (not changed)
+- `sequentialForward.closers` duplicates `upstreams`; it can be merged once the
+  `upstream.Upstream` interface in the pinned MosDNS v4.5.3 is confirmed to
+  include `io.Closer`.
+- Failover order is fixed per process. A dead first upstream costs one
+  per-attempt timeout on every uncached query until the supervisor reorders
+  (about `HEALTH_FAILS_TO_SWITCH` x `HEALTH_INTERVAL`). Passive failure
+  memory in `sequential_forward` would remove that delay.
+- README still contains unrelated sections (free DNS list, Bandwidth Hero,
+  donation address) that contradict "Repository scope".
+- Go changes were not compiled in this review environment (no Go toolchain);
+  build with `docker build` before deploying.
+
 ## 8.2.13
 
 Full review of every file in the archive (Dockerfile, config.yaml, entrypoint.sh,

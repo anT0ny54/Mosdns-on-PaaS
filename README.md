@@ -110,7 +110,7 @@ The image has working defaults; no environment variable is required for the defa
 | `SERVER_TIMEOUT` | `8` | MosDNS query timeout, seconds. The proxy stops waiting for MosDNS after 12 s, so values above 12 only produce a startup warning. |
 | `UPSTREAM_IDLE_TIMEOUT` | `30` | Upstream idle connection timeout, seconds. |
 | `UPSTREAM_MAX_CONNS` | `2` | Maximum upstream connections per endpoint. |
-| `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. |
+| `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. `0` uses MosDNS v4.5.3's 10 s default. Valid explicit values are 6-3600 s. The proxy keeps pooled backend connections at least 5 s shorter, capped at 90 s. |
 | `DOH_RATE_LIMIT` | `5` | Per-client request rate, requests/second. |
 | `DOH_RATE_BURST` | `12` | Per-client burst allowance. |
 | `DOH_RATE_MAX_IPS` | `512` | Maximum client buckets retained. |
@@ -137,7 +137,7 @@ The image has working defaults; no environment variable is required for the defa
 | `GOMEMLIMIT` | `256MiB` | Go memory soft limit. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
-Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst, connection, and timeout values must be greater than 0 (`IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable).
+Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter.
 
 ## Deploy to Koyeb
 
@@ -191,7 +191,7 @@ For a small instance, `CACHE_SIZE` and the rate limits should be changed only af
 
 ## Repository scope
 
-This repository is focused on this Koyeb MosDNS deployment. Unrelated application components and deployment material are intentionally not included.
+This repository is focused on this Koyeb MosDNS deployment. Unrelated application components and deployment material are not included.
 
 ## 🌐 Free DNS Services
 

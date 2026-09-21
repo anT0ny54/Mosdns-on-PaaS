@@ -38,9 +38,11 @@ RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tD
 # each gets its own directory instead of sharing /src/probe.
 COPY content/upstream_probe.go /src/probe/main.go
 COPY content/ip_conn_proxy.go /src/proxy/main.go
+COPY content/ip_conn_proxy_test.go /src/proxy/main_test.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
 
-RUN go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
+RUN go test ./proxy \
+ && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./proxy \
  && /out/mosdns version
@@ -57,6 +59,7 @@ COPY --from=build /out/mosdns-probe /usr/local/bin/mosdns-probe
 COPY --from=build /out/ip-conn-proxy /usr/local/bin/ip-conn-proxy
 COPY content/config.yaml ./config.yaml
 COPY content/entrypoint.sh ./entrypoint.sh
+COPY VERSION ./VERSION
 
 RUN chmod 0755 ./entrypoint.sh \
     && mkdir -p /var/cache/mosdns \
