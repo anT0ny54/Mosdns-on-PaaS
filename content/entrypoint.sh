@@ -163,6 +163,9 @@ case "$HEALTH_PATH" in /*) ;; *) echo "HEALTH_PATH must start with /" >&2; exit 
 case "$DOH_PATH" in *'?'*|*'#'*|*' '*) echo "DOH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in *'?'*|*'#'*|*' '*) echo "HEALTH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HAGEZI_UPSTREAM" in rotate|random|https://*) ;; *) echo "HAGEZI_UPSTREAM must be 'rotate', 'random', or an https:// endpoint" >&2; exit 1 ;; esac
+if [ "$SERVER_TIMEOUT" -gt 12 ]; then
+  echo "WARNING: SERVER_TIMEOUT=${SERVER_TIMEOUT}s is above the DoH proxy's 12s backend response limit; slower queries are answered with 502 by the proxy" >&2
+fi
 case "$HEALTH_CHECK" in true|false) ;; *) echo "HEALTH_CHECK must be true or false" >&2; exit 1 ;; esac
 if [ "$HEALTH_CHECK" = "true" ] && ! command -v mosdns-probe >/dev/null 2>&1; then
   echo "ERROR: mosdns-probe binary not found while HEALTH_CHECK=true" >&2
@@ -225,9 +228,53 @@ set_default_order() {
   ORDER_2="$CAND_2"
 }
 
+# A fixed HAGEZI_UPSTREAM (an https:// endpoint) names a preferred first upstream.
+# rotate/random are the only modes where the probe alone decides the first slot.
+is_fixed_mode() {
+  case "$HAGEZI_UPSTREAM" in
+    rotate|random) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# $1 = probe rows (tab-separated, as printed by mosdns-probe), $2 = upstream URL.
+# Succeeds only when that upstream's row reports ok=true.
+probe_row_ok() {
+  printf '%s\n' "$1" | awk -F '\t' -v u="$2" '$2 == u && $4 == "true" { found = 1 } END { exit !found }'
+}
+
+# stdin = probe rows, $1 = preferred URL. Prints the URLs with the preferred one
+# first and the others in their measured order.
+preferred_first_urls() {
+  awk -F '\t' -v p="$1" '$2 == p { print $2 } $2 != p { rest[++n] = $2 } END { for (i = 1; i <= n; i++) print rest[i] }'
+}
+
+# $1 = preferred URL, $2 = probe rows. Sets ORDER_0..2 to preferred-first order.
+apply_preferred_first() {
+  ordered=$(printf '%s\n' "$2" | preferred_first_urls "$1")
+  o_0=$(printf '%s\n' "$ordered" | sed -n '1p')
+  o_1=$(printf '%s\n' "$ordered" | sed -n '2p')
+  o_2=$(printf '%s\n' "$ordered" | sed -n '3p')
+  [ -n "$o_0" ] && [ -n "$o_1" ] && [ -n "$o_2" ] || return 0
+  ORDER_0="$o_0"; ORDER_1="$o_1"; ORDER_2="$o_2"
+}
+
 select_order() {
   if ! probe_and_score; then
     set_default_order
+    return 0
+  fi
+  # With a fixed endpoint the probe may only reorder the fallbacks; the preferred
+  # endpoint is demoted at startup only if it actually failed its probe. (A
+  # custom endpoint has no pinned IP, so a plain latency sort would almost always
+  # push it behind the pinned built-ins.)
+  if is_fixed_mode; then
+    set_candidate_order
+    if probe_row_ok "$probe_output" "$CAND_0"; then
+      apply_preferred_first "$CAND_0" "$probe_output"
+    else
+      echo "Preferred upstream ${CAND_0} failed its startup probe; using measured order" >&2
+    fi
   fi
 }
 
@@ -430,6 +477,19 @@ health_check_once() {
   best=$(printf '%s\n' "$best_line" | cut -f2)
   best_ok=$(printf '%s\n' "$best_line" | awk -F '\t' '{print ($4=="true") ? 1 : 0}')
 
+  # Fixed mode: the preferred endpoint is "best" whenever it is healthy, so a
+  # supervisor restart can never demote it for latency, and a fallback that took
+  # over during an outage hands back to it once it recovers.
+  pref_first=""
+  if is_fixed_mode; then
+    set_candidate_order
+    if probe_row_ok "$raw" "$CAND_0"; then
+      pref_first="$CAND_0"
+      best="$CAND_0"
+      best_ok=1
+    fi
+  fi
+
   # Switch only to a healthy best candidate, and only when the active upstream
   # is healthy-but-beaten (upstream_probe.go already applied the margins) or has
   # failed HEALTH_FAILS_TO_SWITCH times in a row.
@@ -451,9 +511,14 @@ health_check_once() {
 
   # Adopt the probe's complete measured order (exactly like startup) so the
   # fallback positions are health-aware too, not a fixed static permutation.
-  new_0=$(printf '%s\n' "$raw" | sed -n '1p' | cut -f2)
-  new_1=$(printf '%s\n' "$raw" | sed -n '2p' | cut -f2)
-  new_2=$(printf '%s\n' "$raw" | sed -n '3p' | cut -f2)
+  if [ -n "$pref_first" ]; then
+    ordered=$(printf '%s\n' "$raw" | preferred_first_urls "$pref_first")
+  else
+    ordered=$(printf '%s\n' "$raw" | cut -f2)
+  fi
+  new_0=$(printf '%s\n' "$ordered" | sed -n '1p')
+  new_1=$(printf '%s\n' "$ordered" | sed -n '2p')
+  new_2=$(printf '%s\n' "$ordered" | sed -n '3p')
   [ -n "$new_0" ] && [ -n "$new_1" ] && [ -n "$new_2" ] || return 0
 
   echo "Health supervisor: switching active upstream ${current} -> ${best}" >&2
@@ -502,10 +567,12 @@ while :; do
     exit 1
   fi
 
-  now=$(date +%s)
-  if [ "$HEALTH_CHECK" = "true" ] && [ $((now - last_health_check)) -ge "$HEALTH_INTERVAL" ]; then
-    last_health_check="$now"
-    health_check_once
+  if [ "$HEALTH_CHECK" = "true" ]; then
+    now=$(date +%s)
+    if [ $((now - last_health_check)) -ge "$HEALTH_INTERVAL" ]; then
+      last_health_check="$now"
+      health_check_once
+    fi
   fi
   # Interruptible sleep: `wait` returns as soon as a trapped signal arrives.
   sleep 2 &
