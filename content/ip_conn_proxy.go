@@ -222,6 +222,7 @@ func main() {
 	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 128)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
+	dohIdleTimeoutSeconds := getenvInt("DOH_IDLE_TIMEOUT", 120)
 	if max < 0 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 0 (0 = unlimited)")
 	}
@@ -258,6 +259,9 @@ func main() {
 	if maxBodyBytes < 1 {
 		log.Fatalf("DOH_MAX_BODY_BYTES must be >= 1")
 	}
+	if dohIdleTimeoutSeconds < 0 || dohIdleTimeoutSeconds > 3600 || (dohIdleTimeoutSeconds > 0 && dohIdleTimeoutSeconds < 6) {
+		log.Fatalf("DOH_IDLE_TIMEOUT must be 0 or 6-3600 seconds (0 uses MosDNS v4.5.3's 10s default)")
+	}
 
 	target, err := url.Parse("http://" + backendAddr)
 	if err != nil {
@@ -265,14 +269,17 @@ func main() {
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
-		Proxy:                 nil,
-		DisableCompression:    true,
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          8,
-		MaxIdleConnsPerHost:   4,
-		MaxConnsPerHost:       8,
-		IdleConnTimeout:       90 * time.Second,
+		Proxy:               nil,
+		DisableCompression:  true,
+		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
+		ForceAttemptHTTP2:   false,
+		MaxIdleConns:        8,
+		MaxIdleConnsPerHost: 4,
+		MaxConnsPerHost:     8,
+		// Must expire before MosDNS closes its own idle listener connections,
+		// otherwise a reused connection can be reset mid-request and non-replayable
+		// POSTs are answered with 502.
+		IdleConnTimeout:       backendIdleTimeout(dohIdleTimeoutSeconds),
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		// Without this a hung MosDNS pins all MaxConnsPerHost slots until each
@@ -330,8 +337,9 @@ func main() {
 				return
 			}
 			// Health checks are infrequent and should never hold a global connection
-			// slot open just because the client uses HTTP keep-alive.
-			r.Close = true
+			// slot open just because the client uses HTTP keep-alive. (The response
+			// header is what closes a server-side connection; Request.Close is
+			// ignored by net/http servers.)
 			w.Header().Set("Connection", "close")
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -393,7 +401,6 @@ func main() {
 			// body instead of letting ReverseProxy stream an unused, potentially
 			// unbounded body to MosDNS.
 			if r.ContentLength != 0 {
-				r.Close = true
 				w.Header().Set("Connection", "close")
 				http.Error(w, "GET request body not allowed", http.StatusBadRequest)
 				return
@@ -427,7 +434,6 @@ func main() {
 					return
 				}
 				if int64(len(body)) > maxBodyBytes {
-					r.Close = true
 					w.Header().Set("Connection", "close")
 					http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 					return
@@ -484,6 +490,31 @@ func main() {
 }
 
 type connStateKey struct{}
+
+// backendIdleTimeout returns how long the proxy may keep an idle connection to
+// MosDNS. MosDNS v4.5.3 normalizes listener idle_timeout <= 0 to its 10s default,
+// so zero is treated as 10s here. The proxy then expires pooled connections at
+// least 5s earlier, with a 90s upper bound. Explicit 1-5s values are rejected
+// during proxy startup because they cannot provide the required margin.
+func backendIdleTimeout(mosdnsIdleSeconds int) time.Duration {
+	const (
+		mosdnsDefaultIdle = 10 * time.Second
+		margin            = 5 * time.Second
+		maxIdle           = 90 * time.Second
+		minIdle           = time.Second
+	)
+	if mosdnsIdleSeconds <= 0 {
+		return mosdnsDefaultIdle - margin
+	}
+	idle := time.Duration(mosdnsIdleSeconds)*time.Second - margin
+	if idle < minIdle {
+		idle = minIdle
+	}
+	if idle > maxIdle {
+		idle = maxIdle
+	}
+	return idle
+}
 
 func getenv(k, d string) string {
 	if v := os.Getenv(k); v != "" {

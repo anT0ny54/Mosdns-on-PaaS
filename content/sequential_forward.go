@@ -28,7 +28,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v4/pkg/upstream"
-	"io"
 	"time"
 )
 
@@ -43,7 +42,6 @@ var _ coremain.ExecutablePlugin = (*sequentialForward)(nil)
 type sequentialForward struct {
 	*coremain.BP
 	upstreams []upstream.Upstream
-	closers   []io.Closer
 }
 
 func initSequentialForward(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -81,13 +79,12 @@ func newSequentialForward(bp *coremain.BP, args *Args) (*sequentialForward, erro
 
 		u, err := upstream.NewUpstream(c.Addr, opt)
 		if err != nil {
-			for _, closer := range f.closers {
-				_ = closer.Close()
+			for _, u := range f.upstreams {
+				_ = u.Close()
 			}
 			return nil, fmt.Errorf("failed to init upstream #%d: %w", i, err)
 		}
 		f.upstreams = append(f.upstreams, u)
-		f.closers = append(f.closers, u)
 	}
 	return f, nil
 }
@@ -147,8 +144,8 @@ func (f *sequentialForward) Exec(ctx context.Context, qCtx *query_context.Contex
 
 func (f *sequentialForward) Shutdown() error {
 	var firstErr error
-	for _, closer := range f.closers {
-		if err := closer.Close(); err != nil && firstErr == nil {
+	for _, u := range f.upstreams {
+		if err := u.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

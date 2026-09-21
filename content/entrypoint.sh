@@ -120,6 +120,14 @@ validate_uint_max SERVER_TIMEOUT "$SERVER_TIMEOUT" 300
 validate_uint_max HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS" 600000
 validate_uint_max HEALTH_BACKEND_TIMEOUT_MS "$HEALTH_BACKEND_TIMEOUT_MS" 600000
 validate_uint_max DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT" 3600
+# MosDNS v4.5.3 treats idle_timeout <= 0 as its 10s default. The proxy keeps
+# its pooled backend connection at least 5s shorter, so explicit values 1-5s
+# cannot satisfy the required safety margin and are rejected. Zero is allowed
+# as the MosDNS-default sentinel.
+case "$DOH_IDLE_TIMEOUT" in
+  0) ;;
+  1|2|3|4|5) echo "Invalid DOH_IDLE_TIMEOUT: $DOH_IDLE_TIMEOUT (must be 0 or >= 6; 0 uses MosDNS's 10s default)" >&2; exit 1 ;;
+esac
 validate_uint_max HEALTH_FAILURE_PENALTY_MS "$HEALTH_FAILURE_PENALTY_MS" 3600000
 validate_uint_max HEALTH_SWITCH_MARGIN_MS "$HEALTH_SWITCH_MARGIN_MS" 3600000
 validate_uint_max HEALTH_INTERVAL "$HEALTH_INTERVAL" 604800
@@ -261,6 +269,9 @@ apply_preferred_first() {
 
 select_order() {
   if ! probe_and_score; then
+    if [ "$HEALTH_CHECK" = "true" ]; then
+      echo "Startup probe returned no usable result; using the default upstream order" >&2
+    fi
     set_default_order
     return 0
   fi
@@ -342,13 +353,23 @@ render_config() {
     -e "s|__UPSTREAM_1_IP__|${U1_IP_ESCAPED}|g" \
     -e "s|__UPSTREAM_2_IP__|${U2_IP_ESCAPED}|g" \
     -e "s|__DOH_IDLE_TIMEOUT__|${DOH_IDLE_TIMEOUT_ESCAPED}|g" \
-    "$TEMPLATE" > "$candidate"
+    "$TEMPLATE" > "$candidate" || {
+      # `set -e` is ignored while render_config runs inside `if !`, so a failed
+      # or partial render must be rejected explicitly instead of being installed.
+      echo "ERROR: failed to render MosDNS config from ${TEMPLATE}" >&2
+      rm -f "$candidate"
+      return 1
+    }
 
   # Custom HAGEZI_UPSTREAM endpoints do not have a pinned IP in this image.
   # Remove empty quoted dial_addr values for custom endpoints that have no
   # pinned IP. Quoting the value keeps environment overrides inside the YAML
   # scalar instead of letting YAML punctuation alter the generated config.
-  sed -i "/^[[:space:]]*dial_addr:[[:space:]]*''[[:space:]]*$/d" "$candidate"
+  sed -i "/^[[:space:]]*dial_addr:[[:space:]]*''[[:space:]]*$/d" "$candidate" || {
+    echo "ERROR: failed to post-process generated MosDNS config" >&2
+    rm -f "$candidate"
+    return 1
+  }
 
   # Every __PLACEHOLDER__ that exists in the template must have been consumed.
   # (Checking the template's own names avoids false hits on user-supplied values.)
@@ -398,6 +419,8 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 
 printf '%s\n' '=== MosDNS runtime ==='
+RELEASE_VERSION=$(cat /etc/mosdns/VERSION)
+echo "Release: ${RELEASE_VERSION}"
 mosdns version
 printf '%s\n' '======================'
 echo "Build: Koyeb tiny-instance profile (512 MiB / 0.25 vCPU); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
@@ -406,6 +429,13 @@ echo "Sequential failover: enabled"
 echo "Plain DNS listener: disabled"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"
 echo "Upstream idle timeout: ${UPSTREAM_IDLE_TIMEOUT}s, max conns: ${UPSTREAM_MAX_CONNS}"
+if [ "$DOH_IDLE_TIMEOUT" -eq 0 ]; then
+  echo "DoH listener idle timeout: MosDNS default (10s); proxy backend pool timeout: 5s"
+elif [ "$DOH_IDLE_TIMEOUT" -le 95 ]; then
+  echo "DoH listener idle timeout: ${DOH_IDLE_TIMEOUT}s; proxy backend pool timeout: $((DOH_IDLE_TIMEOUT - 5))s"
+else
+  echo "DoH listener idle timeout: ${DOH_IDLE_TIMEOUT}s; proxy backend pool timeout: 90s (capped)"
+fi
 echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Runtime limits: GOMAXPROCS=${GOMAXPROCS}, GOMEMLIMIT=${GOMEMLIMIT}"
@@ -444,6 +474,7 @@ GLOBAL_HEALTH_RATE_LIMIT="${GLOBAL_HEALTH_RATE_LIMIT}" \
 GLOBAL_HEALTH_RATE_BURST="${GLOBAL_HEALTH_RATE_BURST}" \
 HEALTH_BACKEND_TIMEOUT_MS="${HEALTH_BACKEND_TIMEOUT_MS}" \
 DOH_PATH="${DOH_PATH}" \
+DOH_IDLE_TIMEOUT="${DOH_IDLE_TIMEOUT}" \
 GOMEMLIMIT=64MiB \
 GOMAXPROCS=1 \
 ip-conn-proxy &
@@ -575,6 +606,6 @@ while :; do
     fi
   fi
   # Interruptible sleep: `wait` returns as soon as a trapped signal arrives.
-  sleep 2 &
+  sleep 5 &
   wait $! || true
 done
