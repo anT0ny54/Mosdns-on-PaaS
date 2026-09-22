@@ -9,207 +9,40 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-type connState struct {
-	mu      sync.Mutex
-	ip      string
-	counted bool
-}
-
-type limiter struct {
-	mu      sync.Mutex
-	max     int
-	active  map[string]int
-	connMap sync.Map // net.Conn -> *connState
-}
-
-func newLimiter(max int) *limiter {
-	return &limiter{max: max, active: make(map[string]int)}
-}
-
-func (l *limiter) registerConn(c net.Conn) *connState {
-	s := &connState{}
-	l.connMap.Store(c, s)
-	return s
-}
-
-func (l *limiter) closeConn(c net.Conn) {
-	v, ok := l.connMap.LoadAndDelete(c)
-	if !ok {
-		return
-	}
-	s := v.(*connState)
-	s.mu.Lock()
-	ip, counted := s.ip, s.counted
-	s.counted = false
-	s.mu.Unlock()
-	if counted && ip != "" {
-		l.mu.Lock()
-		if l.active[ip] > 1 {
-			l.active[ip]--
-		} else {
-			delete(l.active, ip)
-		}
-		l.mu.Unlock()
-	}
-}
-
-func (l *limiter) allow(ip string, s *connState) bool {
-	if ip == "" {
-		ip = "unknown"
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.counted {
-		return s.ip == ip
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.max > 0 && l.active[ip] >= l.max {
-		return false
-	}
-	l.active[ip]++
-	s.ip = ip
-	s.counted = true
-	return true
-}
-
-type globalConnLimiter struct {
-	mu     sync.Mutex
-	max    int
-	active map[net.Conn]struct{}
-}
-
-func newGlobalConnLimiter(max int) *globalConnLimiter {
-	return &globalConnLimiter{max: max, active: make(map[net.Conn]struct{})}
-}
-
-func (g *globalConnLimiter) add(c net.Conn) bool {
-	if g.max <= 0 {
-		return true
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if len(g.active) >= g.max {
-		return false
-	}
-	g.active[c] = struct{}{}
-	return true
-}
-
-func (g *globalConnLimiter) remove(c net.Conn) {
-	if g.max <= 0 {
-		return
-	}
-	g.mu.Lock()
-	delete(g.active, c)
-	g.mu.Unlock()
-}
-
-// rateBucket is a small standard-library-only token bucket. It deliberately
-// avoids an external dependency so the tiny Koyeb image remains simple.
-type rateBucket struct {
-	tokens float64
-	last   time.Time
-}
-
-type rateLimiter struct {
-	mu       sync.Mutex
-	rate     float64
-	burst    float64
-	buckets  map[string]*rateBucket
-	maxPeers int
-}
-
-func newRateLimiter(ratePerSecond float64, burst, maxPeers int) *rateLimiter {
-	return &rateLimiter{
-		rate:     ratePerSecond,
-		burst:    float64(burst),
-		buckets:  make(map[string]*rateBucket),
-		maxPeers: maxPeers,
-	}
-}
-
-func (r *rateLimiter) allow(ip string, now time.Time) bool {
-	if r.rate <= 0 || r.burst <= 0 {
-		return true
-	}
-	if ip == "" {
-		ip = "unknown"
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	b := r.buckets[ip]
-	if b == nil {
-		if len(r.buckets) >= r.maxPeers {
-			// The map is only a bounded anti-abuse cache. If it fills, evict one
-			// old bucket; active clients immediately get a fresh burst allowance.
-			var oldestIP string
-			var oldest time.Time
-			for k, v := range r.buckets {
-				if oldestIP == "" || v.last.Before(oldest) {
-					oldestIP, oldest = k, v.last
-				}
-			}
-			if oldestIP != "" {
-				delete(r.buckets, oldestIP)
-			}
-		}
-		b = &rateBucket{tokens: r.burst, last: now}
-		r.buckets[ip] = b
-	}
-
-	elapsed := now.Sub(b.last).Seconds()
-	if elapsed > 0 {
-		b.tokens += elapsed * r.rate
-		if b.tokens > r.burst {
-			b.tokens = r.burst
-		}
-		b.last = now
-	}
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
-}
-
-func clientIP(r *http.Request) string {
-	// Koyeb appends the IP used to connect to the edge to X-Forwarded-For.
-	// Only the final XFF element is certifiable. Never walk backwards through
-	// the header: if the final element is malformed, an earlier element can
-	// still be attacker-controlled. In that case, fall back to RemoteAddr.
-	// A client may send several X-Forwarded-For header lines, and Header.Get
-	// returns the first (attacker-controlled) one, so take the last line.
+func clientIPAddr(r *http.Request) netip.Addr {
+	// Koyeb/proxy infrastructure appends the client address to XFF. Trust only
+	// the final element of the final header line; if that value is malformed,
+	// fall back to the actual peer rather than accepting an attacker-controlled
+	// earlier XFF element.
 	if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
 		x := vals[len(vals)-1]
 		if i := strings.LastIndexByte(x, ','); i >= 0 {
 			x = x[i+1:]
 		}
-		ip := strings.TrimSpace(x)
-		if net.ParseIP(ip) != nil {
+		if ip, err := netip.ParseAddr(strings.TrimSpace(x)); err == nil {
 			return ip
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && net.ParseIP(host) != nil {
-		return host
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		if ip, err := netip.ParseAddr(host); err == nil {
+			return ip
+		}
 	}
-	return "unknown"
+	return netip.Addr{}
 }
 
 func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
-	max := getenvInt("IP_CONN_LIMIT", 0)
+	max := getenvInt("IP_CONN_LIMIT", 8)
 	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 5)
 	rateBurst := getenvInt("DOH_RATE_BURST", 12)
 	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 512)
@@ -219,7 +52,7 @@ func main() {
 	healthRateBurst := getenvInt("HEALTH_RATE_BURST", 4)
 	globalHealthRatePerSecond := getenvFloat("GLOBAL_HEALTH_RATE_LIMIT", 10)
 	globalHealthRateBurst := getenvInt("GLOBAL_HEALTH_RATE_BURST", 20)
-	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 128)
+	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 64)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	dohIdleTimeoutSeconds := getenvInt("DOH_IDLE_TIMEOUT", 120)
@@ -232,8 +65,8 @@ func main() {
 	if rateBurst < 0 {
 		log.Fatalf("DOH_RATE_BURST must be >= 0")
 	}
-	if ratePeers < 1 {
-		log.Fatalf("DOH_RATE_MAX_IPS must be >= 1")
+	if ratePeers < 1 || ratePeers > maxSourceStateHardCap {
+		log.Fatalf("DOH_RATE_MAX_IPS must be 1-%d", maxSourceStateHardCap)
 	}
 	if globalRatePerSecond < 0 {
 		log.Fatalf("GLOBAL_RATE_LIMIT must be >= 0 (0 = unlimited)")
@@ -291,12 +124,19 @@ func main() {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
 
-	connLim := newLimiter(max)
-	globalConnLim := newGlobalConnLimiter(globalConnLimit)
-	rateLim := newRateLimiter(ratePerSecond, rateBurst, ratePeers)
-	globalRateLim := newRateLimiter(globalRatePerSecond, globalRateBurst, 1)
-	healthRateLim := newRateLimiter(healthRatePerSecond, healthRateBurst, ratePeers)
-	globalHealthRateLim := newRateLimiter(globalHealthRatePerSecond, globalHealthRateBurst, 1)
+	guard := newPublicGuard(
+		globalConnLimit,
+		ratePeers,
+		max,
+		ratePerSecond,
+		float64(rateBurst),
+		globalRatePerSecond,
+		float64(globalRateBurst),
+		healthRatePerSecond,
+		float64(healthRateBurst),
+		globalHealthRatePerSecond,
+		float64(globalHealthRateBurst),
+	)
 	dohPath := getenv("DOH_PATH", "/dns-query")
 	healthPathValue := getenv("HEALTH_PATH", "/health")
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -305,24 +145,13 @@ func main() {
 			return
 		}
 
-		ip := clientIP(r)
+		ipAddr := clientIPAddr(r)
 
-		var connStateValue *connState
-		if max > 0 {
-			state := r.Context().Value(connStateKey{})
-			connStateValue, _ = state.(*connState)
-			if connStateValue == nil {
-				http.Error(w, "internal limiter error", http.StatusInternalServerError)
-				return
-			}
-			// Enforce the configured per-IP connection cap on every accepted
-			// request, including the public health endpoint. Otherwise a client
-			// could keep persistent health connections outside the limiter.
-			if !connLim.allow(ip, connStateValue) {
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, "too many connections", http.StatusTooManyRequests)
-				return
-			}
+		if state, ok := r.Context().Value(connGuardKey{}).(*guardedConn); ok && !state.bindSource(ipAddr) {
+			w.Header().Set("Connection", "close")
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
 		}
 
 		now := time.Now()
@@ -331,7 +160,7 @@ func main() {
 			// Keep platform health checks independent from the public DoH request
 			// budget. A separate per-IP plus global health budget still prevents
 			// /health from becoming an unbounded backend-connect flood.
-			if !healthRateLim.allow(ip, now) || !globalHealthRateLim.allow("health-global", now) {
+			if !guard.allowHealth(ipAddr, now) {
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, "health rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -363,14 +192,9 @@ func main() {
 		// requests; health uses its own isolated limiters. Both run before body
 		// buffering or other parsing so rejected floods cost as little CPU and
 		// memory as possible.
-		if !rateLim.allow(ip, now) {
+		if !guard.allowDoH(ipAddr, now) {
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "too many requests", http.StatusTooManyRequests)
-			return
-		}
-		if !globalRateLim.allow("global", now) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "service rate limit exceeded", http.StatusTooManyRequests)
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
@@ -387,8 +211,8 @@ func main() {
 		} {
 			r.Header.Del(header)
 		}
-		if net.ParseIP(ip) != nil {
-			r.RemoteAddr = net.JoinHostPort(ip, "0")
+		if ipAddr.IsValid() {
+			r.RemoteAddr = net.JoinHostPort(ipAddr.String(), "0")
 		}
 
 		// Reject malformed or oversized requests before they reach MosDNS.
@@ -449,8 +273,13 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 
+	rawListener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	listener := &guardedListener{Listener: rawListener, guard: guard}
+
 	srv := &http.Server{
-		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -458,38 +287,24 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if max <= 0 {
-				return ctx
+			if gc, ok := c.(*guardedConn); ok {
+				return context.WithValue(ctx, connGuardKey{}, gc)
 			}
-			state := connLim.registerConn(c)
-			return context.WithValue(ctx, connStateKey{}, state)
-		},
-		ConnState: func(c net.Conn, state http.ConnState) {
-			switch state {
-			case http.StateNew:
-				if !globalConnLim.add(c) {
-					_ = c.Close()
-				}
-			case http.StateClosed:
-				globalConnLim.remove(c)
-				if max > 0 {
-					connLim.closeConn(c)
-				}
-			}
+			return ctx
 		},
 	}
 
 	connLimitDesc := "unlimited"
-	if max > 0 {
-		connLimitDesc = strconv.Itoa(max)
+	if globalConnLimit > 0 {
+		connLimitDesc = strconv.Itoa(globalConnLimit)
 	}
-	log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%s, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%d, body<=%dB, health=%s)", listenAddr, backendAddr, connLimitDesc, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, globalConnLimit, maxBodyBytes, healthPathValue)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%s, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, connLimitDesc, maxBodyBytes, healthPathValue)
+	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }
 
-type connStateKey struct{}
+type connGuardKey struct{}
 
 // backendIdleTimeout returns how long the proxy may keep an idle connection to
 // MosDNS. MosDNS v4.5.3 normalizes listener idle_timeout <= 0 to its 10s default,

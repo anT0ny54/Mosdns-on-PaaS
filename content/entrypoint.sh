@@ -4,7 +4,7 @@ umask 077
 
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
-: "${IP_CONN_LIMIT:=0}"
+: "${IP_CONN_LIMIT:=8}"
 : "${DOH_RATE_LIMIT:=5}"
 : "${DOH_RATE_BURST:=12}"
 : "${DOH_RATE_MAX_IPS:=512}"
@@ -14,7 +14,7 @@ umask 077
 : "${HEALTH_RATE_BURST:=4}"
 : "${GLOBAL_HEALTH_RATE_LIMIT:=10}"
 : "${GLOBAL_HEALTH_RATE_BURST:=20}"
-: "${GLOBAL_CONN_LIMIT:=128}"
+: "${GLOBAL_CONN_LIMIT:=64}"
 : "${DOH_MAX_BODY_BYTES:=4096}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
@@ -106,7 +106,7 @@ validate_port MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 [ "$MOSDNS_BACKEND_PORT" -ge 1024 ] || { echo "Invalid MOSDNS_BACKEND_PORT: $MOSDNS_BACKEND_PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
 validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
-validate_uint DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS"
+validate_uint_max DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS" 512
 validate_uint GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST"
 validate_uint HEALTH_RATE_BURST "$HEALTH_RATE_BURST"
 validate_uint GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST"
@@ -440,7 +440,7 @@ echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Runtime limits: GOMAXPROCS=${GOMAXPROCS}, GOMEMLIMIT=${GOMEMLIMIT}"
 echo "DoH endpoint: ${DOH_PATH}"
-echo "Anti-abuse: per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
+echo "Anti-abuse: per-IP conn ${IP_CONN_LIMIT}, per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, fixed source state <= ${DOH_RATE_MAX_IPS}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
 
 echo "Selecting upstream order..."
 unset HEALTH_ACTIVE_UPSTREAM 2>/dev/null || true
