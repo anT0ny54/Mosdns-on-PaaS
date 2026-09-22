@@ -207,6 +207,7 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
 | Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not use in 15 minute) |
 
 ---
 
