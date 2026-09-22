@@ -358,9 +358,6 @@ func UDPDropOversized(packet []byte, maxBytes int) bool {
 	return len(packet) > maxBytes || len(packet) < 12
 }
 
-// ReadTCPDNSFrame validates the two-byte DNS-over-TCP length prefix before any
-// frame allocation or DNS parsing. Callers should close the TCP connection when
-// an error is returned.
 // ReadTCPDNSQuery enforces both the per-connection query budget and the DNS
 // length prefix. Any abuse error closes the TCP connection immediately.
 func ReadTCPDNSQuery(c net.Conn, maxBytes int, budget *TCPDNSQueryBudget) ([]byte, error) {
@@ -376,6 +373,11 @@ func ReadTCPDNSQuery(c net.Conn, maxBytes int, budget *TCPDNSQueryBudget) ([]byt
 	return frame, nil
 }
 
+// ReadTCPDNSFrame validates the two-byte DNS-over-TCP length prefix before any
+// frame allocation or DNS parsing. Callers should close the TCP connection when
+// an error is returned. (ReadTCPDNSQuery above is the abuse-aware wrapper most
+// callers on a real TCP connection want; this lower-level function is exported
+// separately so it stays directly unit-testable against a plain io.Reader.)
 func ReadTCPDNSFrame(r io.Reader, maxBytes int) ([]byte, error) {
 	if maxBytes <= 0 || maxBytes > 65535 {
 		maxBytes = defaultMaxTCPDNSFrame
