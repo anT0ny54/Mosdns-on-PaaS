@@ -8,7 +8,7 @@ The container keeps the public surface deliberately narrow:
 - three HaGeZi DoH endpoints are used in strict sequential order;
 - the upstream health probe uses the same pinned IPv4 addresses as the MosDNS `dial_addr` configuration for the built-in endpoints;
 - the DNS cache is bounded in memory and has a bounded warm-start snapshot;
-- a small Go proxy applies request-rate, connection, and request-size limits before MosDNS;
+- a small Go proxy applies accept-time and source-aware request-rate, connection, and request-size limits before MosDNS;
 - MosDNS and the proxy are supervised so a failed process causes the container to exit and lets Koyeb restart the Instance.
 
 ## Request path
@@ -79,16 +79,20 @@ tracked peers:    DOH_RATE_MAX_IPS
 service rate:     GLOBAL_RATE_LIMIT / second, burst GLOBAL_RATE_BURST
 health rate:      HEALTH_RATE_LIMIT / second, burst HEALTH_RATE_BURST
 health aggregate: GLOBAL_HEALTH_RATE_LIMIT / second, burst GLOBAL_HEALTH_RATE_BURST
-connections:      GLOBAL_CONN_LIMIT
-per-IP conn:      IP_CONN_LIMIT (0 = disabled)
+connections:      GLOBAL_CONN_LIMIT (accept-time atomic cap)
+per-IP conn:      IP_CONN_LIMIT (bound to the client IP on the first DoH/health request)
+source state:     DOH_RATE_MAX_IPS (fixed-size sharded table, hard cap 512)
 request size:     DOH_MAX_BODY_BYTES
 ```
 
 Each DoH request is checked against the per-client rate limit first and the global limit second, so one abusive client cannot use up the shared budget. Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
 
-The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
+The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. The global TCP connection cap is enforced by an atomic accept-and-close listener, while the per-source-IP cap is bound to the first relevant request on the connection so a shared Koyeb edge IP is not treated as every client. Source-IP rate/connection state is held in a fixed sharded table rather than an attacker-growable map. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
 
 The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve platform health checks, while repeated health polling is still bounded.
+
+The repository is intentionally DoH-only, so it does not expose a raw DNS UDP/TCP listener. `content/doh_guard.go` nevertheless includes reusable raw-DNS framing guards for deployments that have a separate raw DNS listener: oversized UDP packets are intended to be silently dropped, the 2-byte TCP DNS length is checked before frame allocation/parsing, and a TCP connection can be closed after a bounded query count. The defaults are 1232-byte UDP packets, 4096-byte TCP DNS frames, and 16 queries per TCP connection. Koyeb's current public Web Service exposure supports HTTP/HTTP2, while public TCP is provided separately through TCP Proxy; public UDP is not a Web Service protocol.
+
 
 ## Environment variables
 
@@ -120,8 +124,8 @@ The image has working defaults; no environment variable is required for the defa
 | `HEALTH_RATE_BURST` | `4` | Per-client health burst allowance. |
 | `GLOBAL_HEALTH_RATE_LIMIT` | `10` | Aggregate health request rate, requests/second. |
 | `GLOBAL_HEALTH_RATE_BURST` | `20` | Aggregate health burst allowance. |
-| `GLOBAL_CONN_LIMIT` | `128` | Maximum concurrent public connections. |
-| `IP_CONN_LIMIT` | `0` | Per-client concurrent connection limit; `0` disables it. |
+| `GLOBAL_CONN_LIMIT` | `64` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
+| `IP_CONN_LIMIT` | `8` | Per-client concurrent connection limit; `0` disables it. The first relevant request binds the connection to its client IP. |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
 | `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
 | `HEALTH_TIMEOUT_MS` | `1200` | Upstream probe timeout, milliseconds (must be > 0). |
@@ -137,7 +141,7 @@ The image has working defaults; no environment variable is required for the defa
 | `GOMEMLIMIT` | `256MiB` | Go memory soft limit. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
-Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter.
+Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-512, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter.
 
 ## Deploy to Koyeb
 

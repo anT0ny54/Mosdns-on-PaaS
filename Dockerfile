@@ -38,7 +38,9 @@ RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tD
 # each gets its own directory instead of sharing /src/probe.
 COPY content/upstream_probe.go /src/probe/main.go
 COPY content/ip_conn_proxy.go /src/proxy/main.go
+COPY content/doh_guard.go /src/proxy/guard.go
 COPY content/ip_conn_proxy_test.go /src/proxy/main_test.go
+COPY content/doh_guard_test.go /src/proxy/guard_test.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
 
 RUN go test ./proxy \
@@ -67,7 +69,7 @@ RUN chmod 0755 ./entrypoint.sh \
 
 ENV PORT=8080 \
     MOSDNS_BACKEND_PORT=18080 \
-    IP_CONN_LIMIT=0 \
+    IP_CONN_LIMIT=8 \
     DOH_RATE_LIMIT=5 \
     DOH_RATE_BURST=12 \
     DOH_RATE_MAX_IPS=512 \
@@ -77,7 +79,7 @@ ENV PORT=8080 \
     HEALTH_RATE_BURST=4 \
     GLOBAL_HEALTH_RATE_LIMIT=10 \
     GLOBAL_HEALTH_RATE_BURST=20 \
-    GLOBAL_CONN_LIMIT=128 \
+    GLOBAL_CONN_LIMIT=64 \
     DOH_MAX_BODY_BYTES=4096 \
     DOH_IDLE_TIMEOUT=120 \
     UPSTREAM_IDLE_TIMEOUT=30 \
