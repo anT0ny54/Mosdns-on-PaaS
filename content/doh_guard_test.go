@@ -64,6 +64,11 @@ func TestSourceStateHardCap(t *testing.T) {
 	}
 }
 
+// allowIP exercises the production key path (rateKey + allowRateKey).
+func allowIP(tbl *sourceTable, ip netip.Addr, now time.Time, rate, burst float64) bool {
+	return tbl.allowRateKey(rateKey(ip, "test.example"), now, rate, burst, false)
+}
+
 func sourceSlotCount(tbl *sourceTable) int {
 	total := 0
 	for i := range tbl.shards {
@@ -77,7 +82,7 @@ func TestBoundedSourceState(t *testing.T) {
 	now := time.Unix(0, 1)
 	for i := 1; i <= 200; i++ {
 		ip := mustAddr(t, "192.0.2."+itoa(i%250+1))
-		_ = tbl.allowRate(ip, now.Add(time.Duration(i)*time.Millisecond), 100, 100, false)
+		_ = allowIP(tbl, ip, now.Add(time.Duration(i)*time.Millisecond), 100, 100)
 	}
 	for i := range tbl.shards {
 		sh := &tbl.shards[i]
@@ -92,21 +97,21 @@ func TestSourceTokenBucket(t *testing.T) {
 	ip := mustAddr(t, "203.0.113.7")
 	base := time.Unix(100, 0)
 	for i := 0; i < 3; i++ {
-		if !tbl.allowRate(ip, base, 2, 3, false) {
+		if !allowIP(tbl, ip, base, 2, 3) {
 			t.Fatalf("initial burst request %d denied", i+1)
 		}
 	}
-	if tbl.allowRate(ip, base, 2, 3, false) {
+	if allowIP(tbl, ip, base, 2, 3) {
 		t.Fatal("request beyond burst unexpectedly allowed")
 	}
-	if !tbl.allowRate(ip, base.Add(500*time.Millisecond), 2, 3, false) {
+	if !allowIP(tbl, ip, base.Add(500*time.Millisecond), 2, 3) {
 		t.Fatal("one token should have refilled after 500ms")
 	}
 }
 
 func TestInvalidSourceFailsClosedWhenRateLimited(t *testing.T) {
 	tbl := newSourceTable(8)
-	if tbl.allowRate(netip.Addr{}, time.Unix(100, 0), 5, 12, false) {
+	if allowIP(tbl, netip.Addr{}, time.Unix(100, 0), 5, 12) {
 		t.Fatal("invalid source must not bypass a configured per-source rate limit")
 	}
 }
@@ -252,7 +257,17 @@ func TestSourceRateBucketsArePerIPAndHost(t *testing.T) {
 	}
 }
 
-func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
+func connCount(g *publicGuard, ip netip.Addr) int {
+	sh := g.connections.shardFor(ip)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := findConnLocked(sh, ipKey(ip)); e != nil {
+		return e.connections
+	}
+	return 0
+}
+
+func TestGuardedConnRebindsSharedEdgeConnection(t *testing.T) {
 	g := newPublicGuard(8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 	server, client := net.Pipe()
 	defer client.Close()
@@ -262,42 +277,58 @@ func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
 	if !c.bindSource(a) {
 		t.Fatal("initial source binding failed")
 	}
-	if c.bindSource(b) {
-		t.Fatal("already-bound connection changed source identity")
+	if !c.bindSource(a) {
+		t.Fatal("re-binding the same source must be a no-op")
 	}
-	shA := g.connections.shardFor(a)
-	shA.mu.Lock()
-	eA := findConnLocked(shA, ipKey(a))
-	countA := 0
-	if eA != nil {
-		countA = eA.connections
+	if got := connCount(g, a); got != 1 {
+		t.Fatalf("source A connection count = %d, want 1", got)
 	}
-	shA.mu.Unlock()
-	if countA != 1 {
-		t.Fatalf("source A connection count = %d, want 1", countA)
+	// A pooled edge connection may carry another client next: the slot moves.
+	if !c.bindSource(b) {
+		t.Fatal("shared connection was rejected when its client changed")
 	}
-	shB := g.connections.shardFor(b)
-	shB.mu.Lock()
-	eB := findConnLocked(shB, ipKey(b))
-	countB := 0
-	if eB != nil {
-		countB = eB.connections
+	if got := connCount(g, a); got != 0 {
+		t.Fatalf("source A connection count after rebind = %d, want 0", got)
 	}
-	shB.mu.Unlock()
-	if countB != 0 {
-		t.Fatalf("source B connection count = %d, want 0", countB)
+	if got := connCount(g, b); got != 1 {
+		t.Fatalf("source B connection count after rebind = %d, want 1", got)
 	}
 	_ = c.Close()
-	shA.mu.Lock()
-	eA = findConnLocked(shA, ipKey(a))
-	countA = 0
-	if eA != nil {
-		countA = eA.connections
+	if got := connCount(g, b); got != 0 {
+		t.Fatalf("source B connection count after close = %d, want 0", got)
 	}
-	shA.mu.Unlock()
-	if countA != 0 {
-		t.Fatalf("source A connection count after close = %d, want 0", countA)
+	if c.bindSource(a) {
+		t.Fatal("a closed connection must not take a new slot")
 	}
+	if got := connCount(g, a); got != 0 {
+		t.Fatalf("source A connection count after post-close bind = %d, want 0", got)
+	}
+}
+
+func TestGuardedConnRebindRespectsPerSourceLimit(t *testing.T) {
+	g := newPublicGuard(8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+	s1, c1 := net.Pipe()
+	s2, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	conn1 := &guardedConn{Conn: s1, guard: g}
+	conn2 := &guardedConn{Conn: s2, guard: g}
+	a := mustAddr(t, "192.0.2.1")
+	b := mustAddr(t, "192.0.2.2")
+	if !conn1.bindSource(a) || !conn2.bindSource(b) {
+		t.Fatal("initial bindings failed")
+	}
+	if conn2.bindSource(a) {
+		t.Fatal("rebinding onto a source already at its connection limit must fail")
+	}
+	if got := connCount(g, a); got != 1 {
+		t.Fatalf("source A connection count = %d, want 1", got)
+	}
+	if got := connCount(g, b); got != 0 {
+		t.Fatalf("source B slot must have been released by the failed move, got %d", got)
+	}
+	_ = conn1.Close()
+	_ = conn2.Close()
 }
 
 func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {

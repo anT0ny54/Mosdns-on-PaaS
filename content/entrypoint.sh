@@ -5,27 +5,27 @@ umask 077
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
 : "${IP_CONN_LIMIT:=16}"
-: "${DOH_RATE_LIMIT:=1.6666667}"
-: "${DOH_RATE_BURST:=80}"
+: "${DOH_RATE_LIMIT:=5}"
+: "${DOH_RATE_BURST:=100}"
 : "${DOH_RATE_MAX_IPS:=4096}"
-: "${GLOBAL_RATE_LIMIT:=10}"
-: "${GLOBAL_RATE_BURST:=80}"
+: "${GLOBAL_RATE_LIMIT:=80}"
+: "${GLOBAL_RATE_BURST:=160}"
 : "${HEALTH_RATE_LIMIT:=2}"
 : "${HEALTH_RATE_BURST:=4}"
 : "${GLOBAL_HEALTH_RATE_LIMIT:=10}"
 : "${GLOBAL_HEALTH_RATE_BURST:=20}"
-: "${GLOBAL_CONN_LIMIT:=64}"
+: "${GLOBAL_CONN_LIMIT:=256}"
 : "${DOH_MAX_BODY_BYTES:=4096}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
-: "${CACHE_SIZE:=8192}"
+: "${CACHE_SIZE:=32768}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
 : "${CACHE_DUMP_INTERVAL:=3300}"
 : "${HAGEZI_UPSTREAM:=rotate}"
-: "${UPSTREAM_IDLE_TIMEOUT:=30}"
+: "${UPSTREAM_IDLE_TIMEOUT:=60}"
 : "${UPSTREAM_MAX_CONNS:=4}"
 : "${SERVER_TIMEOUT:=8}"
-: "${HEALTH_TIMEOUT_MS:=1200}"
+: "${HEALTH_TIMEOUT_MS:=2000}"
 : "${HEALTH_BACKEND_TIMEOUT_MS:=1000}"
 : "${HEALTH_CHECK:=true}"
 : "${HEALTH_EWMA_ALPHA:=0.35}"
@@ -91,9 +91,9 @@ validate_float01() {
 validate_nonnegative_float() {
   awk -v v="$2" 'BEGIN {
     if (v !~ /^[+-]?(0|[0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
-    exit !(v >= 0)
+    exit !(v >= 0 && v <= 1000000000)
   }' 2>/dev/null || {
-    echo "Invalid $1: $2 (must be a non-negative number)" >&2
+    echo "Invalid $1: $2 (must be a number from 0 to 1000000000)" >&2
     exit 1
   }
 }
@@ -102,15 +102,15 @@ validate_port PORT "$PORT"
 validate_port MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 [ "$PORT" -ge 1024 ] || { echo "Invalid PORT: $PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
 [ "$MOSDNS_BACKEND_PORT" -ge 1024 ] || { echo "Invalid MOSDNS_BACKEND_PORT: $MOSDNS_BACKEND_PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
-validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
-validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
+validate_uint_max IP_CONN_LIMIT "$IP_CONN_LIMIT" 65535
+validate_uint_max DOH_RATE_BURST "$DOH_RATE_BURST" 1000000
 validate_uint_max DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS" 4096
-validate_uint GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST"
-validate_uint HEALTH_RATE_BURST "$HEALTH_RATE_BURST"
-validate_uint GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST"
-validate_uint GLOBAL_CONN_LIMIT "$GLOBAL_CONN_LIMIT"
+validate_uint_max GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST" 1000000
+validate_uint_max HEALTH_RATE_BURST "$HEALTH_RATE_BURST" 1000000
+validate_uint_max GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST" 1000000
+validate_uint_max GLOBAL_CONN_LIMIT "$GLOBAL_CONN_LIMIT" 65535
 validate_uint_max DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES" 65535
-validate_uint CACHE_SIZE "$CACHE_SIZE"
+validate_uint_max CACHE_SIZE "$CACHE_SIZE" 1048576
 validate_uint_max CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL" 604800
 validate_uint_max UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT" 3600
 validate_uint_max UPSTREAM_MAX_CONNS "$UPSTREAM_MAX_CONNS" 64
@@ -133,10 +133,23 @@ validate_uint_max HEALTH_FAILS_TO_SWITCH "$HEALTH_FAILS_TO_SWITCH" 1000
 validate_uint_max HEALTH_RESTART_COOLDOWN "$HEALTH_RESTART_COOLDOWN" 604800
 validate_float01 HEALTH_EWMA_ALPHA "$HEALTH_EWMA_ALPHA"
 validate_float01 HEALTH_SWITCH_MARGIN_PCT "$HEALTH_SWITCH_MARGIN_PCT"
+# User-supplied text is substituted into the template one sed expression at a
+# time, so a value that itself looks like a __PLACEHOLDER__ could be rewritten
+# by a later expression. Reject that shape outright.
+validate_no_placeholder() {
+  if printf '%s' "$2" | grep -Eq '__[A-Z0-9_]+__'; then
+    echo "Invalid $1: must not contain __UPPERCASE__ placeholder-like text" >&2
+    exit 1
+  fi
+}
+
 validate_printable_ascii DOH_PATH "$DOH_PATH"
 validate_printable_ascii HEALTH_PATH "$HEALTH_PATH"
 validate_printable_ascii CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
 validate_printable_ascii HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
+validate_no_placeholder DOH_PATH "$DOH_PATH"
+validate_no_placeholder CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
+validate_no_placeholder HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
 validate_ipv4 UPSTREAM_0_IP "$UPSTREAM_0_IP"
 validate_ipv4 UPSTREAM_1_IP "$UPSTREAM_1_IP"
 validate_ipv4 UPSTREAM_2_IP "$UPSTREAM_2_IP"

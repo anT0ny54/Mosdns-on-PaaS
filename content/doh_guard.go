@@ -122,16 +122,17 @@ func canonicalHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 }
 
+// rateKey returns "" for an invalid source so allowRateKey fails closed instead
+// of letting every unidentifiable client share one "invalid IP" bucket.
 func rateKey(ip netip.Addr, host string) string {
+	if !ip.IsValid() {
+		return ""
+	}
 	return ipKey(ip) + "\x00" + canonicalHost(host)
 }
 
 func (t *sourceTable) shardForKey(key string) *sourceShard {
 	return &t.shards[hashKey(key)%uint64(t.activeShards)]
-}
-
-func (t *sourceTable) shardFor(ip netip.Addr) *sourceShard {
-	return t.shardForKey(ipKey(ip))
 }
 
 func findSourceLocked(sh *sourceShard, key string) *sourceEntry {
@@ -214,13 +215,6 @@ func (t *sourceTable) allowRateKey(key string, now time.Time, rate, burst float6
 		return refill(&e.healthTokens, &e.healthLastNS, rate, burst, nowNS)
 	}
 	return refill(&e.dohTokens, &e.dohLastNS, rate, burst, nowNS)
-}
-
-func (t *sourceTable) allowRate(ip netip.Addr, now time.Time, rate, burst float64, health bool) bool {
-	if !ip.IsValid() {
-		return false
-	}
-	return t.allowRateKey(ipKey(ip), now, rate, burst, health)
 }
 
 func findConnLocked(sh *connShard, key string) *connEntry {
@@ -374,13 +368,19 @@ func (g *publicGuard) allowHealth(ip netip.Addr, host string, now time.Time) boo
 
 type guardedConn struct {
 	net.Conn
-	guard    *publicGuard
-	mu       sync.Mutex
-	source   netip.Addr
-	hasSlot  bool
-	closeOne sync.Once
+	guard   *publicGuard
+	mu      sync.Mutex
+	source  netip.Addr
+	hasSlot bool
+	closed  bool
+	once    sync.Once
 }
 
+// bindSource charges this connection's per-IP slot to ip. A PaaS edge may reuse
+// one keep-alive connection for requests from different clients, so a changed
+// identity moves the slot to the new client instead of rejecting the request.
+// The old slot is released before the new one is acquired, and the two shard
+// locks are never held together, so the move cannot deadlock or double-count.
 func (c *guardedConn) bindSource(ip netip.Addr) bool {
 	if c.guard.connections.perConn <= 0 {
 		return true
@@ -390,12 +390,18 @@ func (c *guardedConn) bindSource(ip netip.Addr) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		// Never take a slot on a connection whose Close has already run; it
+		// would never be released.
+		return false
+	}
 	if c.hasSlot {
-		// The source identity is fixed on the first relevant request. A later
-		// change would make connection accounting migrate between buckets and
-		// could race with bounded-table eviction. Treat it as an abuse/malformed
-		// forwarding condition instead of moving a live slot.
-		return c.source == ip
+		if c.source == ip {
+			return true
+		}
+		c.guard.connections.releaseConn(c.source)
+		c.hasSlot = false
+		c.source = netip.Addr{}
 	}
 	if !c.guard.connections.acquireConn(ip) {
 		return false
@@ -406,8 +412,9 @@ func (c *guardedConn) bindSource(ip netip.Addr) bool {
 }
 
 func (c *guardedConn) Close() error {
-	c.closeOne.Do(func() {
+	c.once.Do(func() {
 		c.mu.Lock()
+		c.closed = true
 		if c.hasSlot {
 			c.guard.connections.releaseConn(c.source)
 			c.hasSlot = false

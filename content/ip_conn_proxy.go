@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"math"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,21 +44,21 @@ func clientIPAddr(r *http.Request) netip.Addr {
 func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
-	max := getenvInt("IP_CONN_LIMIT", 16)
-	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 1.6666667)
-	rateBurst := getenvInt("DOH_RATE_BURST", 16)
+	perIPConnLimit := getenvInt("IP_CONN_LIMIT", 16)
+	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 5)
+	rateBurst := getenvInt("DOH_RATE_BURST", 100)
 	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 4096)
-	globalRatePerSecond := getenvFloat("GLOBAL_RATE_LIMIT", 10)
-	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 32)
+	globalRatePerSecond := getenvFloat("GLOBAL_RATE_LIMIT", 80)
+	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 160)
 	healthRatePerSecond := getenvFloat("HEALTH_RATE_LIMIT", 2)
 	healthRateBurst := getenvInt("HEALTH_RATE_BURST", 4)
 	globalHealthRatePerSecond := getenvFloat("GLOBAL_HEALTH_RATE_LIMIT", 10)
 	globalHealthRateBurst := getenvInt("GLOBAL_HEALTH_RATE_BURST", 20)
-	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 64)
+	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 256)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	dohIdleTimeoutSeconds := getenvInt("DOH_IDLE_TIMEOUT", 120)
-	if max < 0 {
+	if perIPConnLimit < 0 {
 		log.Fatalf("IP_CONN_LIMIT must be >= 0 (0 = unlimited)")
 	}
 	if ratePerSecond < 0 {
@@ -110,9 +112,12 @@ func main() {
 		DisableCompression:  true,
 		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:   false,
-		MaxIdleConns:        16,
-		MaxIdleConnsPerHost: 8,
-		MaxConnsPerHost:     16,
+		// One loopback backend: allow enough concurrent cache-miss queries to
+		// overlap upstream latency, but keep a hard ceiling so a stalled
+		// backend cannot pile up unbounded goroutines on 0.25 vCPU.
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 32,
+		MaxConnsPerHost:     32,
 		// Must expire before MosDNS closes its own idle listener connections,
 		// otherwise a reused connection can be reset mid-request and non-replayable
 		// POSTs are answered with 502.
@@ -124,14 +129,24 @@ func main() {
 		// ErrorHandler can still be written.
 		ResponseHeaderTimeout: 12 * time.Second,
 	}
+	var lastProxyErrLogNS int64
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		// Surface backend failures in the logs, at most once per 10s so a hung
+		// backend cannot turn every rejected request into a log line.
+		// A client that simply went away is not a backend fault.
+		now := time.Now().UnixNano()
+		if last := atomic.LoadInt64(&lastProxyErrLogNS); !errors.Is(err, context.Canceled) &&
+			now-last >= int64(10*time.Second) &&
+			atomic.CompareAndSwapInt64(&lastProxyErrLogNS, last, now) {
+			log.Printf("backend request failed (further errors suppressed for 10s): %v", err)
+		}
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
 
 	guard := newPublicGuard(
 		globalConnLimit,
 		ratePeers,
-		max,
+		perIPConnLimit,
 		ratePerSecond,
 		float64(rateBurst),
 		globalRatePerSecond,
@@ -143,7 +158,7 @@ func main() {
 	)
 	dohPath := getenv("DOH_PATH", "/dns-query")
 	healthPathValue := getenv("HEALTH_PATH", "/health")
-	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != healthPathValue && r.URL.Path != dohPath {
 			http.NotFound(w, r)
 			return
@@ -284,7 +299,7 @@ func main() {
 	listener := &guardedListener{Listener: rawListener, guard: guard}
 
 	srv := &http.Server{
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -302,7 +317,7 @@ func main() {
 	if globalConnLimit > 0 {
 		connLimitDesc = strconv.Itoa(globalConnLimit)
 	}
-	log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%s, body<=%dB, health=%s)", listenAddr, backendAddr, max, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, connLimitDesc, maxBodyBytes, healthPathValue)
+	log.Printf("DoH proxy listening on %s -> %s (per-IP conn=%d, per-IP rate=%g/s burst=%d max-IPs=%d, global rate=%g/s burst=%d, health rate=%g/s burst=%d, global health rate=%g/s burst=%d, global conn=%s, body<=%dB, health=%s)", listenAddr, backendAddr, perIPConnLimit, ratePerSecond, rateBurst, ratePeers, globalRatePerSecond, globalRateBurst, healthRatePerSecond, healthRateBurst, globalHealthRatePerSecond, globalHealthRateBurst, connLimitDesc, maxBodyBytes, healthPathValue)
 	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
