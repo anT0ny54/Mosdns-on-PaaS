@@ -4,26 +4,26 @@ umask 077
 
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
-: "${IP_CONN_LIMIT:=12}"
-: "${DOH_RATE_LIMIT:=10}"
-: "${DOH_RATE_BURST:=24}"
-: "${DOH_RATE_MAX_IPS:=512}"
-: "${GLOBAL_RATE_LIMIT:=80}"
-: "${GLOBAL_RATE_BURST:=160}"
+: "${IP_CONN_LIMIT:=16}"
+: "${DOH_RATE_LIMIT:=1.6666667}"
+: "${DOH_RATE_BURST:=80}"
+: "${DOH_RATE_MAX_IPS:=4096}"
+: "${GLOBAL_RATE_LIMIT:=10}"
+: "${GLOBAL_RATE_BURST:=80}"
 : "${HEALTH_RATE_LIMIT:=2}"
 : "${HEALTH_RATE_BURST:=4}"
 : "${GLOBAL_HEALTH_RATE_LIMIT:=10}"
 : "${GLOBAL_HEALTH_RATE_BURST:=20}"
-: "${GLOBAL_CONN_LIMIT:=96}"
+: "${GLOBAL_CONN_LIMIT:=64}"
 : "${DOH_MAX_BODY_BYTES:=4096}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
-: "${CACHE_SIZE:=4096}"
+: "${CACHE_SIZE:=8192}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
 : "${CACHE_DUMP_INTERVAL:=3300}"
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${UPSTREAM_IDLE_TIMEOUT:=30}"
-: "${UPSTREAM_MAX_CONNS:=2}"
+: "${UPSTREAM_MAX_CONNS:=4}"
 : "${SERVER_TIMEOUT:=8}"
 : "${HEALTH_TIMEOUT_MS:=1200}"
 : "${HEALTH_BACKEND_TIMEOUT_MS:=1000}"
@@ -36,7 +36,7 @@ umask 077
 : "${HEALTH_INTERVAL:=300}"
 : "${HEALTH_FAILS_TO_SWITCH:=2}"
 : "${HEALTH_RESTART_COOLDOWN:=900}"
-: "${GOMEMLIMIT:=256MiB}"
+: "${GOMEMLIMIT:=288MiB}"
 : "${GOMAXPROCS:=1}"
 : "${DOH_IDLE_TIMEOUT:=120}"
 : "${UPSTREAM_0_IP:=188.34.161.210}"
@@ -106,7 +106,7 @@ validate_port MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 [ "$MOSDNS_BACKEND_PORT" -ge 1024 ] || { echo "Invalid MOSDNS_BACKEND_PORT: $MOSDNS_BACKEND_PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
 validate_uint IP_CONN_LIMIT "$IP_CONN_LIMIT"
 validate_uint DOH_RATE_BURST "$DOH_RATE_BURST"
-validate_uint_max DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS" 512
+validate_uint_max DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS" 4096
 validate_uint GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST"
 validate_uint HEALTH_RATE_BURST "$HEALTH_RATE_BURST"
 validate_uint GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST"
@@ -461,7 +461,7 @@ echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
 echo "Runtime limits: GOMAXPROCS=${GOMAXPROCS}, GOMEMLIMIT=${GOMEMLIMIT}"
 echo "DoH endpoint: ${DOH_PATH}"
-echo "Anti-abuse: per-IP conn ${IP_CONN_LIMIT}, per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, fixed source state <= ${DOH_RATE_MAX_IPS}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
+echo "Anti-abuse: per-IP conn ${IP_CONN_LIMIT}, per-IP+Host ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, fixed source state <= ${DOH_RATE_MAX_IPS}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
 
 echo "Selecting upstream order..."
 unset HEALTH_ACTIVE_UPSTREAM 2>/dev/null || true
@@ -496,7 +496,7 @@ GLOBAL_HEALTH_RATE_BURST="${GLOBAL_HEALTH_RATE_BURST}" \
 HEALTH_BACKEND_TIMEOUT_MS="${HEALTH_BACKEND_TIMEOUT_MS}" \
 DOH_PATH="${DOH_PATH}" \
 DOH_IDLE_TIMEOUT="${DOH_IDLE_TIMEOUT}" \
-GOMEMLIMIT=64MiB \
+GOMEMLIMIT=80MiB \
 GOMAXPROCS=1 \
 ip-conn-proxy &
 PROXY_PID=$!

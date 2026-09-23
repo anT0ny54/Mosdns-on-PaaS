@@ -3,7 +3,7 @@ log:
 
 # Public DoH only. No UDP/TCP DNS listener is exposed.
 plugins:
-  # Small hot cache plus bounded disk-backed warm-start copy.
+  # Larger bounded hot cache plus bounded disk-backed warm-start copy.
   - tag: mem_cache
     type: cache
     args:

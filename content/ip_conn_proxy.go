@@ -42,17 +42,17 @@ func clientIPAddr(r *http.Request) netip.Addr {
 func main() {
 	listenAddr := getenv("LISTEN_ADDR", ":8080")
 	backendAddr := getenv("BACKEND_ADDR", "127.0.0.1:18080")
-	max := getenvInt("IP_CONN_LIMIT", 12)
-	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 10)
-	rateBurst := getenvInt("DOH_RATE_BURST", 24)
-	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 512)
-	globalRatePerSecond := getenvFloat("GLOBAL_RATE_LIMIT", 80)
-	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 160)
+	max := getenvInt("IP_CONN_LIMIT", 16)
+	ratePerSecond := getenvFloat("DOH_RATE_LIMIT", 1.6666667)
+	rateBurst := getenvInt("DOH_RATE_BURST", 16)
+	ratePeers := getenvInt("DOH_RATE_MAX_IPS", 4096)
+	globalRatePerSecond := getenvFloat("GLOBAL_RATE_LIMIT", 10)
+	globalRateBurst := getenvInt("GLOBAL_RATE_BURST", 32)
 	healthRatePerSecond := getenvFloat("HEALTH_RATE_LIMIT", 2)
 	healthRateBurst := getenvInt("HEALTH_RATE_BURST", 4)
 	globalHealthRatePerSecond := getenvFloat("GLOBAL_HEALTH_RATE_LIMIT", 10)
 	globalHealthRateBurst := getenvInt("GLOBAL_HEALTH_RATE_BURST", 20)
-	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 96)
+	globalConnLimit := getenvInt("GLOBAL_CONN_LIMIT", 64)
 	maxBodyBytes := int64(getenvInt("DOH_MAX_BODY_BYTES", 4096))
 	healthTimeout := time.Duration(getenvInt("HEALTH_BACKEND_TIMEOUT_MS", 1000)) * time.Millisecond
 	dohIdleTimeoutSeconds := getenvInt("DOH_IDLE_TIMEOUT", 120)
@@ -110,9 +110,9 @@ func main() {
 		DisableCompression:  true,
 		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
 		ForceAttemptHTTP2:   false,
-		MaxIdleConns:        8,
-		MaxIdleConnsPerHost: 4,
-		MaxConnsPerHost:     8,
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 8,
+		MaxConnsPerHost:     16,
 		// Must expire before MosDNS closes its own idle listener connections,
 		// otherwise a reused connection can be reset mid-request and non-replayable
 		// POSTs are answered with 502.
@@ -164,7 +164,7 @@ func main() {
 			// Keep platform health checks independent from the public DoH request
 			// budget. A separate per-IP plus global health budget still prevents
 			// /health from becoming an unbounded backend-connect flood.
-			if !guard.allowHealth(ipAddr, now) {
+			if !guard.allowHealth(ipAddr, r.Host, now) {
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, "health rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -196,7 +196,7 @@ func main() {
 		// requests; health uses its own isolated limiters. Both run before body
 		// buffering or other parsing so rejected floods cost as little CPU and
 		// memory as possible.
-		if !guard.allowDoH(ipAddr, now) {
+		if !guard.allowDoH(ipAddr, r.Host, now) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return

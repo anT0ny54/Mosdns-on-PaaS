@@ -58,7 +58,7 @@ func mustAddr(t *testing.T, s string) netip.Addr {
 }
 
 func TestSourceStateHardCap(t *testing.T) {
-	tbl := newSourceTable(maxSourceStateHardCap+128, 0)
+	tbl := newSourceTable(maxSourceStateHardCap + 128)
 	if got := sourceSlotCount(tbl); got != maxSourceStateHardCap {
 		t.Fatalf("source table allocated %d slots, want hard cap %d", got, maxSourceStateHardCap)
 	}
@@ -73,7 +73,7 @@ func sourceSlotCount(tbl *sourceTable) int {
 }
 
 func TestBoundedSourceState(t *testing.T) {
-	tbl := newSourceTable(16, 2)
+	tbl := newSourceTable(16)
 	now := time.Unix(0, 1)
 	for i := 1; i <= 200; i++ {
 		ip := mustAddr(t, "192.0.2."+itoa(i%250+1))
@@ -88,7 +88,7 @@ func TestBoundedSourceState(t *testing.T) {
 }
 
 func TestSourceTokenBucket(t *testing.T) {
-	tbl := newSourceTable(8, 0)
+	tbl := newSourceTable(8)
 	ip := mustAddr(t, "203.0.113.7")
 	base := time.Unix(100, 0)
 	for i := 0; i < 3; i++ {
@@ -105,7 +105,7 @@ func TestSourceTokenBucket(t *testing.T) {
 }
 
 func TestInvalidSourceFailsClosedWhenRateLimited(t *testing.T) {
-	tbl := newSourceTable(8, 0)
+	tbl := newSourceTable(8)
 	if tbl.allowRate(netip.Addr{}, time.Unix(100, 0), 5, 12, false) {
 		t.Fatal("invalid source must not bypass a configured per-source rate limit")
 	}
@@ -116,13 +116,13 @@ func TestPerSourceRejectDoesNotConsumeGlobalRate(t *testing.T) {
 	base := time.Unix(200, 0)
 	a := mustAddr(t, "203.0.113.10")
 	b := mustAddr(t, "203.0.113.11")
-	if !g.allowDoH(a, base) {
+	if !g.allowDoH(a, "dns.example", base) {
 		t.Fatal("first source request should be allowed")
 	}
-	if g.allowDoH(a, base) {
+	if g.allowDoH(a, "dns.example", base) {
 		t.Fatal("second request from source A should be rejected by its own bucket")
 	}
-	if !g.allowDoH(b, base) {
+	if !g.allowDoH(b, "dns.example", base) {
 		t.Fatal("source B should still consume the second global token")
 	}
 }
@@ -144,14 +144,14 @@ func TestGlobalConnectionLimitIsAtomic(t *testing.T) {
 func TestPerSourceConnectionLimit(t *testing.T) {
 	g := newPublicGuard(8, 8, 2, 5, 12, 40, 80, 2, 4, 10, 20)
 	ip := mustAddr(t, "198.51.100.9")
-	if !g.sources.acquireConn(ip) || !g.sources.acquireConn(ip) {
+	if !g.connections.acquireConn(ip) || !g.connections.acquireConn(ip) {
 		t.Fatal("first two per-source connections must be accepted")
 	}
-	if g.sources.acquireConn(ip) {
+	if g.connections.acquireConn(ip) {
 		t.Fatal("third per-source connection must be rejected")
 	}
-	g.sources.releaseConn(ip)
-	if !g.sources.acquireConn(ip) {
+	g.connections.releaseConn(ip)
+	if !g.connections.acquireConn(ip) {
 		t.Fatal("released per-source connection must be reusable")
 	}
 }
@@ -236,6 +236,22 @@ func (g *publicGuard) globalCount() int64 {
 	return atomic.LoadInt64(&g.globalConn)
 }
 
+func TestSourceRateBucketsArePerIPAndHost(t *testing.T) {
+	g := newPublicGuard(8, 32, 0, 1, 1, 100, 100, 1, 1, 10, 10)
+	now := time.Unix(300, 0)
+	ip := mustAddr(t, "192.0.2.44")
+
+	if !g.allowDoH(ip, "Example.Test.:443", now) {
+		t.Fatal("first request should be admitted")
+	}
+	if g.allowDoH(ip, "example.test", now) {
+		t.Fatal("same IP+canonical host should be rate limited")
+	}
+	if !g.allowDoH(ip, "other.example.test", now) {
+		t.Fatal("same IP with a different host should have an independent bucket")
+	}
+}
+
 func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
 	g := newPublicGuard(8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 	server, client := net.Pipe()
@@ -249,9 +265,9 @@ func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
 	if c.bindSource(b) {
 		t.Fatal("already-bound connection changed source identity")
 	}
-	shA := g.sources.shardFor(a)
+	shA := g.connections.shardFor(a)
 	shA.mu.Lock()
-	eA := findSourceLocked(shA, a)
+	eA := findConnLocked(shA, ipKey(a))
 	countA := 0
 	if eA != nil {
 		countA = eA.connections
@@ -260,9 +276,9 @@ func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
 	if countA != 1 {
 		t.Fatalf("source A connection count = %d, want 1", countA)
 	}
-	shB := g.sources.shardFor(b)
+	shB := g.connections.shardFor(b)
 	shB.mu.Lock()
-	eB := findSourceLocked(shB, b)
+	eB := findConnLocked(shB, ipKey(b))
 	countB := 0
 	if eB != nil {
 		countB = eB.connections
@@ -273,7 +289,7 @@ func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
 	}
 	_ = c.Close()
 	shA.mu.Lock()
-	eA = findSourceLocked(shA, a)
+	eA = findConnLocked(shA, ipKey(a))
 	countA = 0
 	if eA != nil {
 		countA = eA.connections
@@ -281,5 +297,50 @@ func TestGuardedConnBindsSourceOnlyOnce(t *testing.T) {
 	shA.mu.Unlock()
 	if countA != 0 {
 		t.Fatalf("source A connection count after close = %d, want 0", countA)
+	}
+}
+
+func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {
+	g := newPublicGuard(8, maxSourceStateHardCap, 16, 1000, 1000, 1000, 1000, 1, 1, 10, 10)
+	ip := mustAddr(t, "192.0.2.1")
+	if !g.connections.acquireConn(ip) {
+		t.Fatal("failed to allocate active per-IP connection state")
+	}
+
+	// The source-rate table is independently preallocated to the hard cap. The
+	// connection table may also hold the active client, but it must not consume
+	// any of the rate-state slots.
+	if got := sourceSlotCount(g.sources); got != maxSourceStateHardCap {
+		t.Fatalf("rate table slots = %d, want %d", got, maxSourceStateHardCap)
+	}
+	connSlots := 0
+	for i := range g.connections.shards {
+		connSlots += len(g.connections.shards[i].entries)
+	}
+	if connSlots != maxSourceStateHardCap {
+		t.Fatalf("connection table slots = %d, want %d", connSlots, maxSourceStateHardCap)
+	}
+
+	now := time.Unix(400, 0)
+	for i := 0; i < maxSourceStateHardCap; i++ {
+		key := "198.51.100.1\x00host-" + itoa(i) + ".example"
+		if !g.sources.allowRateKey(key, now, 1000, 1000, false) {
+			t.Fatalf("rate bucket %d was rejected", i)
+		}
+	}
+
+	rateBuckets := 0
+	for i := range g.sources.shards {
+		sh := &g.sources.shards[i]
+		sh.mu.Lock()
+		for _, e := range sh.entries {
+			if e.key != "" {
+				rateBuckets++
+			}
+		}
+		sh.mu.Unlock()
+	}
+	if rateBuckets < maxSourceStateHardCap-16 {
+		t.Fatalf("rate buckets retained = %d, unexpectedly low for a full 4096-slot rate table", rateBuckets)
 	}
 }

@@ -3,26 +3,26 @@ package main
 import (
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	maxSourceStateHardCap = 512
+	maxSourceStateHardCap = 4096
 	guardShardCount       = 8
 )
 
 // sourceEntry is fixed-size state. A hostile rotation of source IPs cannot grow
 // a Go map; the table is allocated once and capped at maxSourceStateHardCap.
 type sourceEntry struct {
-	ip           netip.Addr
+	key          string
 	lastSeenNS   int64
 	dohTokens    float64
 	dohLastNS    int64
 	healthTokens float64
 	healthLastNS int64
-	connections  int
 }
 
 type sourceShard struct {
@@ -33,10 +33,9 @@ type sourceShard struct {
 type sourceTable struct {
 	shards       [guardShardCount]sourceShard
 	activeShards int
-	perConn      int
 }
 
-func newSourceTable(maxPeers, perConn int) *sourceTable {
+func newSourceTable(maxPeers int) *sourceTable {
 	if maxPeers < 1 {
 		maxPeers = 1
 	}
@@ -47,7 +46,7 @@ func newSourceTable(maxPeers, perConn int) *sourceTable {
 	if maxPeers < activeShards {
 		activeShards = maxPeers
 	}
-	t := &sourceTable{activeShards: activeShards, perConn: perConn}
+	t := &sourceTable{activeShards: activeShards}
 	for i := 0; i < maxPeers; i++ {
 		s := i % activeShards
 		t.shards[s].entries = append(t.shards[s].entries, sourceEntry{})
@@ -55,23 +54,89 @@ func newSourceTable(maxPeers, perConn int) *sourceTable {
 	return t
 }
 
-func hashIP(ip netip.Addr) uint64 {
-	b := ip.As16()
+type connEntry struct {
+	key         string
+	lastSeenNS  int64
+	connections int
+}
+
+type connShard struct {
+	mu      sync.Mutex
+	entries []connEntry
+}
+
+// connTable keeps per-IP connection accounting physically separate from the
+// IP+Host rate-state table. This prevents active connection entries from
+// consuming rate-bucket capacity and preserves the full configured rate-state
+// bound even when source IPs have live connections.
+type connTable struct {
+	shards       [guardShardCount]connShard
+	activeShards int
+	perConn      int
+}
+
+func newConnTable(maxPeers, perConn int) *connTable {
+	if maxPeers < 1 {
+		maxPeers = 1
+	}
+	if maxPeers > maxSourceStateHardCap {
+		maxPeers = maxSourceStateHardCap
+	}
+	activeShards := guardShardCount
+	if maxPeers < activeShards {
+		activeShards = maxPeers
+	}
+	t := &connTable{activeShards: activeShards, perConn: perConn}
+	for i := 0; i < maxPeers; i++ {
+		s := i % activeShards
+		t.shards[s].entries = append(t.shards[s].entries, connEntry{})
+	}
+	return t
+}
+
+func (t *connTable) shardFor(ip netip.Addr) *connShard {
+	return &t.shards[hashKey(ipKey(ip))%uint64(t.activeShards)]
+}
+
+func hashKey(key string) uint64 {
 	var h uint64 = 1469598103934665603
-	for _, v := range b {
-		h ^= uint64(v)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
 		h *= 1099511628211
 	}
 	return h
 }
 
-func (t *sourceTable) shardFor(ip netip.Addr) *sourceShard {
-	return &t.shards[hashIP(ip)%uint64(t.activeShards)]
+func ipKey(ip netip.Addr) string {
+	return ip.String()
 }
 
-func findSourceLocked(sh *sourceShard, ip netip.Addr) *sourceEntry {
+func canonicalHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+}
+
+func rateKey(ip netip.Addr, host string) string {
+	return ipKey(ip) + "\x00" + canonicalHost(host)
+}
+
+func (t *sourceTable) shardForKey(key string) *sourceShard {
+	return &t.shards[hashKey(key)%uint64(t.activeShards)]
+}
+
+func (t *sourceTable) shardFor(ip netip.Addr) *sourceShard {
+	return t.shardForKey(ipKey(ip))
+}
+
+func findSourceLocked(sh *sourceShard, key string) *sourceEntry {
 	for i := range sh.entries {
-		if sh.entries[i].ip == ip {
+		if sh.entries[i].key == key {
 			return &sh.entries[i]
 		}
 	}
@@ -82,28 +147,28 @@ func findFreeSourceLocked(sh *sourceShard) *sourceEntry {
 	var oldest *sourceEntry
 	for i := range sh.entries {
 		e := &sh.entries[i]
-		if !e.ip.IsValid() {
+		if e.key == "" {
 			return e
 		}
-		if e.connections == 0 && (oldest == nil || e.lastSeenNS < oldest.lastSeenNS) {
+		if oldest == nil || e.lastSeenNS < oldest.lastSeenNS {
 			oldest = e
 		}
 	}
 	return oldest
 }
 
-func (t *sourceTable) findOrCreateLocked(sh *sourceShard, ip netip.Addr, nowNS int64) *sourceEntry {
-	if e := findSourceLocked(sh, ip); e != nil {
+func (t *sourceTable) findOrCreateLocked(sh *sourceShard, key string, nowNS int64) *sourceEntry {
+	if e := findSourceLocked(sh, key); e != nil {
 		e.lastSeenNS = nowNS
 		return e
 	}
 	e := findFreeSourceLocked(sh)
 	if e == nil {
-		// This source shard is full of active connections. Fail closed rather than
-		// allocating attacker-controlled state or evicting live accounting.
+		// This source shard is exhausted. Fail closed rather than allocating
+		// attacker-controlled state beyond the fixed bound.
 		return nil
 	}
-	*e = sourceEntry{ip: ip, lastSeenNS: nowNS}
+	*e = sourceEntry{key: key, lastSeenNS: nowNS}
 	return e
 }
 
@@ -130,17 +195,17 @@ func refill(tokens *float64, lastNS *int64, rate, burst float64, nowNS int64) bo
 	return true
 }
 
-func (t *sourceTable) allowRate(ip netip.Addr, now time.Time, rate, burst float64, health bool) bool {
+func (t *sourceTable) allowRateKey(key string, now time.Time, rate, burst float64, health bool) bool {
 	if rate <= 0 || burst <= 0 {
 		return true
 	}
-	if !ip.IsValid() {
+	if key == "" {
 		return false
 	}
-	sh := t.shardFor(ip)
+	sh := t.shardForKey(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e := t.findOrCreateLocked(sh, ip, now.UnixNano())
+	e := t.findOrCreateLocked(sh, key, now.UnixNano())
 	if e == nil {
 		return false
 	}
@@ -151,14 +216,55 @@ func (t *sourceTable) allowRate(ip netip.Addr, now time.Time, rate, burst float6
 	return refill(&e.dohTokens, &e.dohLastNS, rate, burst, nowNS)
 }
 
-func (t *sourceTable) acquireConn(ip netip.Addr) bool {
+func (t *sourceTable) allowRate(ip netip.Addr, now time.Time, rate, burst float64, health bool) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	return t.allowRateKey(ipKey(ip), now, rate, burst, health)
+}
+
+func findConnLocked(sh *connShard, key string) *connEntry {
+	for i := range sh.entries {
+		if sh.entries[i].key == key {
+			return &sh.entries[i]
+		}
+	}
+	return nil
+}
+
+func findFreeConnLocked(sh *connShard) *connEntry {
+	var oldest *connEntry
+	for i := range sh.entries {
+		e := &sh.entries[i]
+		if e.key == "" {
+			return e
+		}
+		if e.connections == 0 && (oldest == nil || e.lastSeenNS < oldest.lastSeenNS) {
+			oldest = e
+		}
+	}
+	return oldest
+}
+
+func (t *connTable) acquireConn(ip netip.Addr) bool {
 	if t.perConn <= 0 || !ip.IsValid() {
 		return true
 	}
 	sh := t.shardFor(ip)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e := t.findOrCreateLocked(sh, ip, time.Now().UnixNano())
+	key := ipKey(ip)
+	e := findConnLocked(sh, key)
+	if e == nil {
+		e = findFreeConnLocked(sh)
+		if e == nil {
+			// This source shard is full of active connections. Fail closed rather
+			// than allocating attacker-controlled state or evicting live accounting.
+			return false
+		}
+		*e = connEntry{key: key}
+	}
+	e.lastSeenNS = time.Now().UnixNano()
 	if e == nil || e.connections >= t.perConn {
 		return false
 	}
@@ -166,14 +272,14 @@ func (t *sourceTable) acquireConn(ip netip.Addr) bool {
 	return true
 }
 
-func (t *sourceTable) releaseConn(ip netip.Addr) {
+func (t *connTable) releaseConn(ip netip.Addr) {
 	if t.perConn <= 0 || !ip.IsValid() {
 		return
 	}
 	sh := t.shardFor(ip)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if e := findSourceLocked(sh, ip); e != nil {
+	if e := findConnLocked(sh, ipKey(ip)); e != nil {
 		if e.connections > 0 {
 			e.connections--
 		}
@@ -187,6 +293,7 @@ type publicGuard struct {
 	globalConnLimit int64
 	globalConn      int64
 	sources         *sourceTable
+	connections     *connTable
 	globalDoH       tokenBucket
 	globalHealth    tokenBucket
 	dohRate         float64
@@ -198,7 +305,8 @@ type publicGuard struct {
 func newPublicGuard(globalConnLimit, sourceStateLimit, perSourceConn int, dohRate, dohBurst, globalRate, globalBurst, healthRate, healthBurst, globalHealthRate, globalHealthBurst float64) *publicGuard {
 	return &publicGuard{
 		globalConnLimit: int64(globalConnLimit),
-		sources:         newSourceTable(sourceStateLimit, perSourceConn),
+		sources:         newSourceTable(sourceStateLimit),
+		connections:     newConnTable(sourceStateLimit, perSourceConn),
 		globalDoH:       newTokenBucket(globalRate, globalBurst),
 		globalHealth:    newTokenBucket(globalHealthRate, globalHealthBurst),
 		dohRate:         dohRate,
@@ -250,15 +358,15 @@ func (b *tokenBucket) allow(now time.Time) bool {
 	return refill(&b.tokens, &b.lastNS, b.rate, b.burst, now.UnixNano())
 }
 
-func (g *publicGuard) allowDoH(ip netip.Addr, now time.Time) bool {
-	if !g.sources.allowRate(ip, now, g.dohRate, g.dohBurst, false) {
+func (g *publicGuard) allowDoH(ip netip.Addr, host string, now time.Time) bool {
+	if !g.sources.allowRateKey(rateKey(ip, host), now, g.dohRate, g.dohBurst, false) {
 		return false
 	}
 	return g.globalDoH.allow(now)
 }
 
-func (g *publicGuard) allowHealth(ip netip.Addr, now time.Time) bool {
-	if !g.sources.allowRate(ip, now, g.healthRate, g.healthBurst, true) {
+func (g *publicGuard) allowHealth(ip netip.Addr, host string, now time.Time) bool {
+	if !g.sources.allowRateKey(rateKey(ip, host), now, g.healthRate, g.healthBurst, true) {
 		return false
 	}
 	return g.globalHealth.allow(now)
@@ -274,7 +382,7 @@ type guardedConn struct {
 }
 
 func (c *guardedConn) bindSource(ip netip.Addr) bool {
-	if c.guard.sources.perConn <= 0 {
+	if c.guard.connections.perConn <= 0 {
 		return true
 	}
 	if !ip.IsValid() {
@@ -289,7 +397,7 @@ func (c *guardedConn) bindSource(ip netip.Addr) bool {
 		// forwarding condition instead of moving a live slot.
 		return c.source == ip
 	}
-	if !c.guard.sources.acquireConn(ip) {
+	if !c.guard.connections.acquireConn(ip) {
 		return false
 	}
 	c.source = ip
@@ -301,7 +409,7 @@ func (c *guardedConn) Close() error {
 	c.closeOne.Do(func() {
 		c.mu.Lock()
 		if c.hasSlot {
-			c.guard.sources.releaseConn(c.source)
+			c.guard.connections.releaseConn(c.source)
 			c.hasSlot = false
 			c.source = netip.Addr{}
 		}
