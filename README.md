@@ -108,7 +108,7 @@ The image has working defaults; no environment variable is required for the defa
 | `UPSTREAM_0_IP` | `188.34.161.210` | Built-in `root.hagezi.org` dial pin. |
 | `UPSTREAM_1_IP` | `159.69.155.94` | Built-in `wurzn.hagezi.org` dial pin. |
 | `UPSTREAM_2_IP` | `95.217.163.17` | Built-in `juuri.hagezi.org` dial pin. |
-| `CACHE_SIZE` | `2048` | Maximum cache entries in RAM and warm snapshot. |
+| `CACHE_SIZE` | `4096` | Maximum cache entries in RAM and warm snapshot. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
 | `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
 | `SERVER_TIMEOUT` | `8` | MosDNS query timeout, seconds. The proxy stops waiting for MosDNS after 12 s, so values above 12 only produce a startup warning. |
@@ -138,7 +138,7 @@ The image has working defaults; no environment variable is required for the defa
 | `HEALTH_SWITCH_MARGIN_MS` | `25` | Absolute score improvement needed for a healthy switch. |
 | `HEALTH_STATE_FILE` | `/tmp/mosdns-upstream-state.tsv` | Probe state file. |
 | `HEALTH_BACKEND_TIMEOUT_MS` | `1000` | Proxy health-check TCP timeout, milliseconds. |
-| `GOMEMLIMIT` | `256MiB` | Go memory soft limit. |
+| `GOMEMLIMIT` | `256MiB` | Go memory soft limit for the main MosDNS process. The DoH proxy is launched with `64MiB`, and the health-probe helper uses `32MiB`. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
 Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-512, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter.
