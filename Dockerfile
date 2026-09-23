@@ -1,4 +1,4 @@
-# MosDNS v4.5.3, tuned for a tiny Koyeb Web Service.
+# MosDNS v4.5.3, tuned for a tiny PaaS Web Service.
 # Runtime target: 512 MiB RAM / 0.25 vCPU / 2 GiB SSD.
 #
 # Build stage MUST stay on Go 1.19.x: v4.5.3 transitively depends on
@@ -41,9 +41,10 @@ COPY content/ip_conn_proxy.go /src/proxy/main.go
 COPY content/doh_guard.go /src/proxy/guard.go
 COPY content/ip_conn_proxy_test.go /src/proxy/main_test.go
 COPY content/doh_guard_test.go /src/proxy/guard_test.go
+COPY content/upstream_probe_test.go /src/probe/main_test.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
 
-RUN go test ./proxy \
+RUN go test ./probe ./proxy \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./proxy \

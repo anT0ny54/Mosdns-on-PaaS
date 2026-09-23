@@ -1,15 +1,15 @@
-# MosDNS on Koyeb
+# MosDNS on PaaS
 
-A small, DoH-only [MosDNS v4.5.3](https://github.com/IrineSistiana/mosdns/tree/v4.5.3) service for a Koyeb Web Service. The image is tuned for a deployment budget of **512 MB RAM, 0.25 vCPU, and 2 GB SSD**.
+A small, DoH-only [MosDNS v4.5.3](https://github.com/IrineSistiana/mosdns/tree/v4.5.3) service for an HTTP Web Service. The image is tuned for a deployment budget of **512 MB RAM, 0.25 vCPU, and 2 GB SSD**.
 
 The container keeps the public surface deliberately narrow:
 
 - only HTTP DoH and the minimal health endpoint are exposed publicly;
 - three HaGeZi DoH endpoints are used in strict sequential order;
 - the upstream health probe uses the same pinned IPv4 addresses as the MosDNS `dial_addr` configuration for the built-in endpoints;
-- the DNS cache is bounded in memory and has a larger bounded warm-start snapshot;
+- the DNS cache is bounded in memory and has a separate bounded warm-start snapshot;
 - a small Go proxy applies accept-time and source-aware request-rate, connection, and request-size limits before MosDNS;
-- MosDNS and the proxy are supervised so a failed process causes the container to exit and lets Koyeb restart the Instance.
+- MosDNS and the proxy are supervised so a failed process causes the container to exit and lets the hosting platform restart the service.
 
 ## Request path
 
@@ -63,11 +63,13 @@ The probe helper maintains an EWMA latency score and consecutive-failure count i
 
 The three built-in IP variables are validated as IPv4 addresses before configuration is rendered. A custom `HAGEZI_UPSTREAM` is not pinned by these variables and is resolved normally.
 
+The persisted probe state is intentionally bounded. Oversized or malformed state files are ignored, and only a small number of valid entries are loaded, so a damaged state file cannot consume unbounded startup memory.
+
 ## Warm cache
 
 The normal query path uses MosDNS's memory cache. A small custom backend keeps a second, bounded copy for warm starts and writes it atomically to disk at `CACHE_DUMP_INTERVAL`. The warm copy is limited by both `CACHE_SIZE` and an 8 KiB per-entry cap, which keeps duplicate cached response data bounded on the 512 MB instance. Warm metadata keeps insertion/restore recency for snapshot eviction and restoration; ordinary hot-cache hits stay on the fast inner-cache path and do not take the warm-metadata lock. The snapshot is limited to the same warm-entry set, and expired or oversized entries are discarded before restore.
 
-Koyeb local storage is ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after an Instance replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting.
+Local service storage may be ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after a service replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting.
 
 With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=8192`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=64`, `IP_CONN_LIMIT=16`, `UPSTREAM_MAX_CONNS=4`, and the public DoH limiter at 100 requests/60s sustained per client IP + host with an 80-request burst (up to 80 DNS lookups in a short burst). The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Multiple devices behind one public IP share the same host bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
 
@@ -89,12 +91,11 @@ request size:     DOH_MAX_BODY_BYTES
 
 Each DoH request is checked against the per-client rate limit first and the global limit second, so one abusive client cannot use up the shared budget. Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
 
-The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. The global TCP connection cap is enforced by an atomic accept-and-close listener, while the per-source-IP cap is bound to the first relevant request on the connection so a shared Koyeb edge IP is not treated as every client. Source-IP rate/connection state is held in a fixed sharded table rather than an attacker-growable map. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
+The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. This identity model requires a trusted reverse proxy or edge in front of the service that appends the real client address to `X-Forwarded-For` and prevents direct untrusted access to the proxy. Do not expose the proxy directly and then rely on a client-supplied `X-Forwarded-For` value for identity. The global TCP connection cap is enforced by an atomic accept-and-close listener, while the per-source-IP cap is bound to the first relevant request on the connection so multiple clients sharing one public edge address are not treated as the same client. Source-IP rate/connection state is held in a fixed sharded table rather than an attacker-growable map. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
 
-The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve platform health checks, while repeated health polling is still bounded.
+The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve service health checks, while repeated health polling is still bounded.
 
-The repository is intentionally DoH-only and does not expose a raw DNS UDP/TCP listener. The public proxy accepts only the DoH HTTP surface and keeps MosDNS on loopback; raw DNS framing helpers are not carried in the runtime build because they are unused by this deployment. Koyeb's current public Web Service exposure supports HTTP/HTTP2, while public TCP is provided separately through TCP Proxy; public UDP is not a Web Service protocol.
-
+The repository is intentionally DoH-only and does not expose a raw DNS UDP/TCP listener. The public proxy accepts only the DoH HTTP surface and keeps MosDNS on loopback; raw DNS framing helpers are not carried in the runtime build because they are unused by this deployment.
 
 ## Environment variables
 
@@ -102,7 +103,7 @@ The image has working defaults; no environment variable is required for the defa
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PORT` | `8080` | Public Koyeb service port. |
+| `PORT` | `8080` | Public service port. |
 | `DOH_PATH` | `/dns-query` | Public DoH path. |
 | `HEALTH_PATH` | `/health` | Proxy health path for an HTTP health check. |
 | `MOSDNS_BACKEND_PORT` | `18080` | Loopback port between the proxy and MosDNS. |
@@ -143,38 +144,21 @@ The image has working defaults; no environment variable is required for the defa
 | `GOMEMLIMIT` | `288MiB` | Go memory soft limit for the main MosDNS process. The DoH proxy is launched with `80MiB`, and the health-probe helper uses `32MiB`. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
-Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-4096, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter.
+Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-4096, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter. Numeric environment values accept ordinary decimal and exponent notation consistently with the Go helpers.
 
-## Deploy to Koyeb
+## Deploy as an HTTP service
 
-### Dashboard
+Build the repository with the included Dockerfile and deploy the resulting image as an HTTP-capable container service. The exact service type, health-check UI, and port configuration names vary by hosting provider; use the equivalent settings for your platform.
 
-Create a **Web Service** from the repository and use the Dockerfile builder. Expose port `8080` over HTTP.
-
-For readiness checking, configure an HTTP health check for:
+Configure the service to:
 
 ```text
-port: 8080
-path: /health
+public port: 8080 (or set PORT)
+health path: /health (or set HEALTH_PATH)
+DoH path:    /dns-query (or set DOH_PATH)
 ```
 
-Koyeb supplies the `PORT` environment variable automatically. With the image defaults, the public DoH endpoint is:
-
-```text
-https://YOUR-KOYEB-DOMAIN/dns-query
-```
-
-### CLI
-
-```bash
-koyeb app init mosdns \
-  --git github.com/YOUR_USERNAME/YOUR_REPOSITORY \
-  --git-branch main \
-  --git-builder docker \
-  --ports 8080:http \
-  --routes /:8080 \
-  --checks 8080:http:/health
-```
+The application listens on the value of `PORT`. The MosDNS backend remains bound to loopback and must not be exposed directly.
 
 For a different public DoH path, set for example:
 
@@ -183,6 +167,10 @@ DOH_PATH=/my-secret-dns
 ```
 
 A custom path is obscurity, not authentication. The built-in rate and connection limits remain active regardless of the path.
+
+## Build compatibility
+
+The project intentionally pins the MosDNS v4.5.3 build to Go 1.19.x because that MosDNS release pulls `quic-go` v0.30.0, whose build guard rejects newer Go toolchains. The runtime image is separate and contains no Go toolchain. Upgrading MosDNS or the build toolchain should be treated as a compatibility change, not a routine version bump.
 
 ## Resource profile
 
@@ -197,7 +185,7 @@ For a small instance, `CACHE_SIZE` and the rate limits should be changed only af
 
 ## Repository scope
 
-This repository is focused on this Koyeb MosDNS deployment. Unrelated application components and deployment material are not included.
+This repository is focused on a small containerized MosDNS deployment. Provider-specific deployment configuration is intentionally not included so the image can be used with different HTTP container platforms.
 
 ## 🌐 Free DNS Services
 
