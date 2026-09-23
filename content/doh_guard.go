@@ -203,13 +203,13 @@ func (t *sourceTable) allowRateKey(key string, now time.Time, rate, burst float6
 		return false
 	}
 	sh := t.shardForKey(key)
+	nowNS := now.UnixNano()
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e := t.findOrCreateLocked(sh, key, now.UnixNano())
+	e := t.findOrCreateLocked(sh, key, nowNS)
 	if e == nil {
 		return false
 	}
-	nowNS := now.UnixNano()
 	if health {
 		return refill(&e.healthTokens, &e.healthLastNS, rate, burst, nowNS)
 	}
@@ -265,7 +265,7 @@ func (t *connTable) acquireConn(ip netip.Addr) bool {
 		*e = connEntry{key: key}
 	}
 	e.lastSeenNS = time.Now().UnixNano()
-	if e == nil || e.connections >= t.perConn {
+	if e.connections >= t.perConn {
 		return false
 	}
 	e.connections++
@@ -436,7 +436,7 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 			_ = c.Close()
 			continue
 		}
-		// The real client IP for a public Koyeb HTTP service is available only in
+		// The real client IP for a public PaaS HTTP service is available only in
 		// the trusted X-Forwarded-For header, which HTTP parsing exposes later.
 		// Keep the global cap at accept-time and bind the per-source slot on the
 		// first relevant request in the handler. This avoids counting a shared

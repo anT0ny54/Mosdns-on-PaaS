@@ -89,13 +89,11 @@ validate_float01() {
 }
 
 validate_nonnegative_float() {
-  case "$2" in
-    ''|*[!0-9.]*) echo "Invalid $1: $2 (must be a non-negative decimal)" >&2; exit 1 ;;
-  esac
   awk -v v="$2" 'BEGIN {
-    if (v !~ /^[0-9]+([.][0-9]*)?$/ && v !~ /^[.][0-9]+$/) exit 1
+    if (v !~ /^[+-]?(0|[0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
+    exit !(v >= 0)
   }' 2>/dev/null || {
-    echo "Invalid $1: $2 (must be a non-negative decimal)" >&2
+    echo "Invalid $1: $2 (must be a non-negative number)" >&2
     exit 1
   }
 }
@@ -444,7 +442,7 @@ RELEASE_VERSION=$(cat /etc/mosdns/VERSION)
 echo "Release: ${RELEASE_VERSION}"
 mosdns version
 printf '%s\n' '======================'
-echo "Build: Koyeb tiny-instance profile (512 MiB / 0.25 vCPU); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
+echo "Build: PaaS tiny-instance profile (512 MiB / 0.25 vCPU); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Plain DNS listener: disabled"
@@ -603,12 +601,12 @@ last_restart=0
 while :; do
   if ! child_running "$MOSDNS_PID"; then
     wait "$MOSDNS_PID" 2>/dev/null || true
-    echo "MosDNS exited; restarting instance via Koyeb" >&2
+    echo "MosDNS exited; restarting instance via platform" >&2
     exit 1
   fi
   if ! child_running "$PROXY_PID"; then
     wait "$PROXY_PID" 2>/dev/null || true
-    echo "DoH proxy exited; restarting instance via Koyeb" >&2
+    echo "DoH proxy exited; restarting instance via platform" >&2
     exit 1
   fi
 

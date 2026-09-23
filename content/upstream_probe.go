@@ -46,6 +46,12 @@ func dnsQuery(id uint16) []byte {
 
 type probeURLKey struct{}
 
+const (
+	maxHealthStateFileBytes = 64 << 10
+	maxHealthStateLineBytes = 8 << 10
+	maxHealthStateEntries   = 16
+)
+
 // The probe helper is a one-shot process. Keep the transport deliberately
 // single-use so it does not retain idle sockets between its three probes.
 var probeClient = newProbeClient()
@@ -203,10 +209,19 @@ func loadState(path string) map[string]state {
 		return m
 	}
 	defer f.Close()
-	s := bufio.NewScanner(f)
+
+	if info, err := f.Stat(); err != nil || info.Size() > maxHealthStateFileBytes {
+		return make(map[string]state)
+	}
+
+	s := bufio.NewScanner(io.LimitReader(f, maxHealthStateFileBytes+1))
+	s.Buffer(make([]byte, 1024), maxHealthStateLineBytes)
 	for s.Scan() {
+		if len(m) >= maxHealthStateEntries {
+			break
+		}
 		p := strings.Split(s.Text(), "\t")
-		if len(p) != 3 {
+		if len(p) != 3 || p[0] == "" {
 			continue
 		}
 		e, err1 := strconv.ParseFloat(p[1], 64)

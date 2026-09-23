@@ -18,7 +18,7 @@ import (
 )
 
 func clientIPAddr(r *http.Request) netip.Addr {
-	// Koyeb/proxy infrastructure appends the client address to XFF. Trust only
+	// PaaS edge/proxy infrastructure appends the client address to XFF. Trust only
 	// the final element of the final header line; if that value is malformed,
 	// fall back to the actual peer rather than accepting an attacker-controlled
 	// earlier XFF element.

@@ -170,7 +170,7 @@ func itoa(v int) string {
 	return string(out[i:])
 }
 
-func TestClientIPAddrUsesKoyebFinalXFFValue(t *testing.T) {
+func TestClientIPAddrUsesTrustedFinalXFFValue(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://example.test/health", nil)
 	r.RemoteAddr = "127.0.0.1:1234"
 	r.Header.Add("X-Forwarded-For", "10.0.0.1, 203.0.113.10")
