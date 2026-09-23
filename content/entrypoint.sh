@@ -153,7 +153,9 @@ validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 [ "$GLOBAL_RATE_BURST" -gt 0 ] || { echo "GLOBAL_RATE_BURST must be > 0" >&2; exit 1; }
 [ "$HEALTH_RATE_BURST" -gt 0 ] || { echo "HEALTH_RATE_BURST must be > 0" >&2; exit 1; }
 [ "$GLOBAL_HEALTH_RATE_BURST" -gt 0 ] || { echo "GLOBAL_HEALTH_RATE_BURST must be > 0" >&2; exit 1; }
-[ "$GLOBAL_CONN_LIMIT" -gt 0 ] || { echo "GLOBAL_CONN_LIMIT must be > 0" >&2; exit 1; }
+# GLOBAL_CONN_LIMIT=0 is a supported "unlimited" sentinel in ip-conn-proxy
+# (see ip_conn_proxy.go), the same convention used by the rate-limit env vars
+# below. Only reject a negative value here; validate_uint already did that.
 [ "$DOH_MAX_BODY_BYTES" -ge 512 ] || { echo "DOH_MAX_BODY_BYTES must be >= 512" >&2; exit 1; }
 [ "$CACHE_SIZE" -ge 1024 ] || { echo "CACHE_SIZE must be >= 1024" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
@@ -388,28 +390,47 @@ render_config() {
   mv "$candidate" "$RUNTIME_CONFIG"
 }
 
+child_running() {
+  pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # BusyBox ps (used by the Alpine runtime image) does not support
+  # `ps -o stat= -p PID`. Read the kernel-maintained process state instead.
+  if grep -q '^State:[[:space:]]*Z' "/proc/$pid/status" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+stop_child() {
+  pid="$1"
+  label="$2"
+  [ -n "$pid" ] || return 0
+  if ! child_running "$pid"; then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "Stopping ${label}..."
+  kill -TERM "$pid" 2>/dev/null || true
+
+  # Do not use kill -0 as the completion test: an exited child remains a zombie
+  # until the parent calls wait, so kill -0 can report it as alive for the entire
+  # grace period. A watchdog preserves the hard stop without adding that delay.
+  (
+    sleep 10
+    kill -KILL "$pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+  wait "$pid" 2>/dev/null || true
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+}
+
 cleanup() {
   trap - TERM INT EXIT
-  if [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    kill -TERM "$PROXY_PID" 2>/dev/null || true
-  fi
-  if [ -n "${MOSDNS_PID:-}" ] && kill -0 "$MOSDNS_PID" 2>/dev/null; then
-    echo "Stopping MosDNS..."
-    kill -TERM "$MOSDNS_PID" 2>/dev/null || true
-  fi
-  [ -n "${PROXY_PID:-}" ] && wait "$PROXY_PID" 2>/dev/null || true
-
-  i=0
-  if [ -n "${MOSDNS_PID:-}" ]; then
-    while kill -0 "$MOSDNS_PID" 2>/dev/null && [ "$i" -lt 10 ]; do
-      sleep 1
-      i=$((i + 1))
-    done
-    if kill -0 "$MOSDNS_PID" 2>/dev/null; then
-      kill -KILL "$MOSDNS_PID" 2>/dev/null || true
-    fi
-    wait "$MOSDNS_PID" 2>/dev/null || true
-  fi
+  stop_child "${PROXY_PID:-}" "DoH proxy"
+  stop_child "${MOSDNS_PID:-}" "MosDNS"
 }
 # TERM/INT must end the script. A handler that merely returns would resume the
 # supervisor loop, which then reports the just-stopped MosDNS as a crash and
@@ -563,22 +584,13 @@ health_check_once() {
   fi
 
   oldpid="$MOSDNS_PID"
-  kill -TERM "$oldpid" 2>/dev/null || true
-  i=0
-  while kill -0 "$oldpid" 2>/dev/null && [ "$i" -lt 10 ]; do
-    sleep 1
-    i=$((i + 1))
-  done
-  if kill -0 "$oldpid" 2>/dev/null; then
-    kill -KILL "$oldpid" 2>/dev/null || true
-  fi
-  wait "$oldpid" 2>/dev/null || true
+  stop_child "$oldpid" "MosDNS"
   MOSDNS_PID=""
 
   mosdns start -c "$RUNTIME_CONFIG" &
   MOSDNS_PID=$!
   sleep 1
-  if kill -0 "$MOSDNS_PID" 2>/dev/null; then
+  if child_running "$MOSDNS_PID"; then
     last_restart=$(date +%s)
   else
     echo "Health supervisor: replacement MosDNS failed to start; exiting for instance restart" >&2
@@ -589,11 +601,13 @@ health_check_once() {
 last_health_check=$(date +%s)
 last_restart=0
 while :; do
-  if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
+  if ! child_running "$MOSDNS_PID"; then
+    wait "$MOSDNS_PID" 2>/dev/null || true
     echo "MosDNS exited; restarting instance via Koyeb" >&2
     exit 1
   fi
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  if ! child_running "$PROXY_PID"; then
+    wait "$PROXY_PID" 2>/dev/null || true
     echo "DoH proxy exited; restarting instance via Koyeb" >&2
     exit 1
   fi

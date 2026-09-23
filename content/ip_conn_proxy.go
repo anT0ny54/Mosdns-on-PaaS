@@ -62,8 +62,8 @@ func main() {
 	if ratePerSecond < 0 {
 		log.Fatalf("DOH_RATE_LIMIT must be >= 0 (0 = unlimited)")
 	}
-	if rateBurst < 0 {
-		log.Fatalf("DOH_RATE_BURST must be >= 0")
+	if rateBurst <= 0 {
+		log.Fatalf("DOH_RATE_BURST must be > 0")
 	}
 	if ratePeers < 1 || ratePeers > maxSourceStateHardCap {
 		log.Fatalf("DOH_RATE_MAX_IPS must be 1-%d", maxSourceStateHardCap)
@@ -71,26 +71,30 @@ func main() {
 	if globalRatePerSecond < 0 {
 		log.Fatalf("GLOBAL_RATE_LIMIT must be >= 0 (0 = unlimited)")
 	}
-	if globalRateBurst < 0 {
-		log.Fatalf("GLOBAL_RATE_BURST must be >= 0")
+	if globalRateBurst <= 0 {
+		log.Fatalf("GLOBAL_RATE_BURST must be > 0")
 	}
 	if healthRatePerSecond < 0 {
 		log.Fatalf("HEALTH_RATE_LIMIT must be >= 0 (0 = unlimited)")
 	}
-	if healthRateBurst < 0 {
-		log.Fatalf("HEALTH_RATE_BURST must be >= 0")
+	if healthRateBurst <= 0 {
+		log.Fatalf("HEALTH_RATE_BURST must be > 0")
 	}
 	if globalHealthRatePerSecond < 0 {
 		log.Fatalf("GLOBAL_HEALTH_RATE_LIMIT must be >= 0 (0 = unlimited)")
 	}
-	if globalHealthRateBurst < 0 {
-		log.Fatalf("GLOBAL_HEALTH_RATE_BURST must be >= 0")
+	if globalHealthRateBurst <= 0 {
+		log.Fatalf("GLOBAL_HEALTH_RATE_BURST must be > 0")
 	}
 	if globalConnLimit < 0 {
 		log.Fatalf("GLOBAL_CONN_LIMIT must be >= 0 (0 = unlimited)")
 	}
-	if maxBodyBytes < 1 {
-		log.Fatalf("DOH_MAX_BODY_BYTES must be >= 1")
+	// Upper-bounded to the DNS wire-format maximum message size (also enforced
+	// by entrypoint.sh's validate_uint_max). Enforcing it here too means the
+	// binary is safe even if it is ever launched without that shell wrapper.
+	const maxDNSMessageBytes = 65535
+	if maxBodyBytes < 1 || maxBodyBytes > maxDNSMessageBytes {
+		log.Fatalf("DOH_MAX_BODY_BYTES must be 1-%d", maxDNSMessageBytes)
 	}
 	if dohIdleTimeoutSeconds < 0 || dohIdleTimeoutSeconds > 3600 || (dohIdleTimeoutSeconds > 0 && dohIdleTimeoutSeconds < 6) {
 		log.Fatalf("DOH_IDLE_TIMEOUT must be 0 or 6-3600 seconds (0 uses MosDNS v4.5.3's 10s default)")

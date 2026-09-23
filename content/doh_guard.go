@@ -1,9 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
-	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -12,17 +9,8 @@ import (
 )
 
 const (
-	defaultMaxUDPPacketBytes = 1232
-	defaultMaxTCPDNSFrame    = 4096
-	defaultMaxTCPDNSQueries  = 16
-	maxSourceStateHardCap    = 512
-	guardShardCount          = 8
-)
-
-var (
-	errDNSFrameTooLarge = errors.New("dns tcp frame too large")
-	errDNSFrameInvalid  = errors.New("invalid dns tcp frame length")
-	errDNSQueryLimit    = errors.New("dns tcp query limit exceeded")
+	maxSourceStateHardCap = 512
+	guardShardCount       = 8
 )
 
 // sourceEntry is fixed-size state. A hostile rotation of source IPs cannot grow
@@ -346,83 +334,5 @@ func (l *guardedListener) Accept() (net.Conn, error) {
 		// first relevant request in the handler. This avoids counting a shared
 		// edge/proxy IP as every client.
 		return &guardedConn{Conn: c, guard: l.guard}, nil
-	}
-}
-
-// UDPDropOversized performs the size gate for a raw DNS UDP packet. Callers
-// should silently discard packets when it returns true.
-func UDPDropOversized(packet []byte, maxBytes int) bool {
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxUDPPacketBytes
-	}
-	return len(packet) > maxBytes || len(packet) < 12
-}
-
-// ReadTCPDNSQuery enforces both the per-connection query budget and the DNS
-// length prefix. Any abuse error closes the TCP connection immediately.
-func ReadTCPDNSQuery(c net.Conn, maxBytes int, budget *TCPDNSQueryBudget) ([]byte, error) {
-	if budget != nil && !budget.Allow() {
-		_ = c.Close()
-		return nil, errDNSQueryLimit
-	}
-	frame, err := ReadTCPDNSFrame(c, maxBytes)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	return frame, nil
-}
-
-// ReadTCPDNSFrame validates the two-byte DNS-over-TCP length prefix before any
-// frame allocation or DNS parsing. Callers should close the TCP connection when
-// an error is returned. (ReadTCPDNSQuery above is the abuse-aware wrapper most
-// callers on a real TCP connection want; this lower-level function is exported
-// separately so it stays directly unit-testable against a plain io.Reader.)
-func ReadTCPDNSFrame(r io.Reader, maxBytes int) ([]byte, error) {
-	if maxBytes <= 0 || maxBytes > 65535 {
-		maxBytes = defaultMaxTCPDNSFrame
-	}
-	var prefix [2]byte
-	if _, err := io.ReadFull(r, prefix[:]); err != nil {
-		return nil, err
-	}
-	frameLen := int(binary.BigEndian.Uint16(prefix[:]))
-	if frameLen < 12 {
-		return nil, errDNSFrameInvalid
-	}
-	if frameLen > maxBytes {
-		return nil, errDNSFrameTooLarge
-	}
-	frame := make([]byte, frameLen)
-	if _, err := io.ReadFull(r, frame); err != nil {
-		return nil, err
-	}
-	return frame, nil
-}
-
-type TCPDNSQueryBudget struct {
-	max   int64
-	count int64
-}
-
-func NewTCPDNSQueryBudget(maxQueries int) *TCPDNSQueryBudget {
-	if maxQueries <= 0 {
-		maxQueries = defaultMaxTCPDNSQueries
-	}
-	return &TCPDNSQueryBudget{max: int64(maxQueries)}
-}
-
-func (b *TCPDNSQueryBudget) Allow() bool {
-	if b == nil || b.max <= 0 {
-		return true
-	}
-	for {
-		count := atomic.LoadInt64(&b.count)
-		if count >= b.max {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&b.count, count, count+1) {
-			return true
-		}
 	}
 }
