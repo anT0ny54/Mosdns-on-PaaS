@@ -91,7 +91,7 @@ The proxy uses the final element of the last `X-Forwarded-For` header line for c
 
 The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve platform health checks, while repeated health polling is still bounded.
 
-The repository is intentionally DoH-only, so it does not expose a raw DNS UDP/TCP listener. `content/doh_guard.go` nevertheless includes reusable raw-DNS framing guards for deployments that have a separate raw DNS listener: oversized UDP packets are intended to be silently dropped, the 2-byte TCP DNS length is checked before frame allocation/parsing, and a TCP connection can be closed after a bounded query count. The defaults are 1232-byte UDP packets, 4096-byte TCP DNS frames, and 16 queries per TCP connection. Koyeb's current public Web Service exposure supports HTTP/HTTP2, while public TCP is provided separately through TCP Proxy; public UDP is not a Web Service protocol.
+The repository is intentionally DoH-only and does not expose a raw DNS UDP/TCP listener. The public proxy accepts only the DoH HTTP surface and keeps MosDNS on loopback; raw DNS framing helpers are not carried in the runtime build because they are unused by this deployment. Koyeb's current public Web Service exposure supports HTTP/HTTP2, while public TCP is provided separately through TCP Proxy; public UDP is not a Web Service protocol.
 
 
 ## Environment variables
