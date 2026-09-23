@@ -115,17 +115,17 @@ The image has working defaults; no environment variable is required for the defa
 | `UPSTREAM_IDLE_TIMEOUT` | `30` | Upstream idle connection timeout, seconds. |
 | `UPSTREAM_MAX_CONNS` | `2` | Maximum upstream connections per endpoint. |
 | `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. `0` uses MosDNS v4.5.3's 10 s default. Valid explicit values are 6-3600 s. The proxy keeps pooled backend connections at least 5 s shorter, capped at 90 s. |
-| `DOH_RATE_LIMIT` | `5` | Per-client request rate, requests/second. |
-| `DOH_RATE_BURST` | `12` | Per-client burst allowance. |
+| `DOH_RATE_LIMIT` | `10` | Per-client request rate, requests/second. Sized to tolerate normal browser bursts while retaining abuse protection. |
+| `DOH_RATE_BURST` | `24` | Per-client burst allowance. |
 | `DOH_RATE_MAX_IPS` | `512` | Maximum client buckets retained. |
-| `GLOBAL_RATE_LIMIT` | `40` | Global request rate, requests/second. |
-| `GLOBAL_RATE_BURST` | `80` | Global DoH burst allowance. |
+| `GLOBAL_RATE_LIMIT` | `80` | Global request rate, requests/second. |
+| `GLOBAL_RATE_BURST` | `160` | Global DoH burst allowance. |
 | `HEALTH_RATE_LIMIT` | `2` | Per-client health request rate, requests/second. |
 | `HEALTH_RATE_BURST` | `4` | Per-client health burst allowance. |
 | `GLOBAL_HEALTH_RATE_LIMIT` | `10` | Aggregate health request rate, requests/second. |
 | `GLOBAL_HEALTH_RATE_BURST` | `20` | Aggregate health burst allowance. |
-| `GLOBAL_CONN_LIMIT` | `64` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
-| `IP_CONN_LIMIT` | `8` | Per-client concurrent connection limit; `0` disables it. The first relevant request binds the connection to its client IP. |
+| `GLOBAL_CONN_LIMIT` | `96` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
+| `IP_CONN_LIMIT` | `12` | Per-client concurrent connection limit; `0` disables it. The first relevant request binds the connection to its client IP. |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
 | `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
 | `HEALTH_TIMEOUT_MS` | `1200` | Upstream probe timeout, milliseconds (must be > 0). |
@@ -191,7 +191,7 @@ The configuration is intentionally small for a low-CPU instance:
 - one MosDNS process, one small proxy process, and one health-probe helper invoked when checks run;
 - bounded RAM cache, an 8 KiB-per-entry warm snapshot, and bounded public request/connection state.
 
-For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume.
+For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume. The default DoH profile is intentionally more tolerant of normal client bursts than a strict anti-abuse profile to reduce false-positive throttling on browser DNS startup bursts.
 
 ## Repository scope
 
