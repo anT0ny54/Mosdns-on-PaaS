@@ -29,7 +29,7 @@ type warmNode struct {
 const maxWarmEntryBytes = 8 * 1024
 
 // Keep startup recovery bounded even if the on-disk snapshot is corrupted or
-// unexpectedly replaced. The normal 2048-entry snapshot is far below this.
+// unexpectedly replaced. The normal 4096-entry snapshot is far below this.
 const maxWarmSnapshotBytes = 64 << 20
 
 type warmDisk struct {
