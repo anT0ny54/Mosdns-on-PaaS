@@ -67,31 +67,31 @@ The persisted probe state is intentionally bounded. Oversized or malformed state
 
 ## Warm cache
 
-The normal query path uses MosDNS's memory cache. A small custom backend keeps a second, bounded copy for warm starts and writes it atomically to disk at `CACHE_DUMP_INTERVAL`. The warm copy is limited by both `CACHE_SIZE` and an 8 KiB per-entry cap, which keeps duplicate cached response data bounded on the 512 MB instance. Warm metadata keeps insertion/restore recency for snapshot eviction and restoration; ordinary hot-cache hits stay on the fast inner-cache path and do not take the warm-metadata lock. The snapshot is limited to the same warm-entry set, and expired or oversized entries are discarded before restore.
+The normal query path uses MosDNS's memory cache. A small custom backend keeps a second, bounded copy for warm starts and writes it atomically to disk at `CACHE_DUMP_INTERVAL`. The warm copy is limited by both `CACHE_SIZE` and an 8 KiB per-entry cap, which keeps duplicate cached response data bounded on the 512 MB instance (typical answers are a few hundred bytes, so the default 32768 entries use roughly 25-50 MB across the hot and warm copies). Warm metadata keeps insertion/restore recency for snapshot eviction and restoration; ordinary hot-cache hits stay on the fast inner-cache path and do not take the warm-metadata lock. The snapshot is limited to the same warm-entry set, and expired or oversized entries are discarded before restore.
 
 Local service storage may be ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after a service replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting.
 
-With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=8192`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=64`, `IP_CONN_LIMIT=16`, `UPSTREAM_MAX_CONNS=4`, and the public DoH limiter at 100 requests/60s sustained per client IP + host with an 80-request burst (up to 80 DNS lookups in a short burst). The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Multiple devices behind one public IP share the same host bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
+With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=32768`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=256`, `IP_CONN_LIMIT=16`, `UPSTREAM_MAX_CONNS=4`, and the public DoH limiter at 5 requests/second (300/minute) sustained per client IP + host with a 100-request burst, under a service-wide budget of 80 requests/second with a 160-request burst. The service-wide budget is sized so that cache hits and misses together stay well inside a 0.25 vCPU CPU quota (roughly 0.2-0.5 ms of CPU per request) with headroom left for garbage collection, snapshots and health probes; that is enough for several hundred regular users, since a typical user averages well under one query per second. The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Multiple devices behind one public IP share the same host bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
 
 ## DoH proxy
 
 `content/ip_conn_proxy.go` sits in front of MosDNS and enforces:
 
 ```text
-per-IP+Host rate: DOH_RATE_LIMIT / second (100 requests/60s sustained), burst DOH_RATE_BURST
+per-IP+Host rate: DOH_RATE_LIMIT / second (default 5/s = 300 requests/minute), burst DOH_RATE_BURST (default 100)
 tracked IP+Host buckets: DOH_RATE_MAX_IPS
-service rate:     GLOBAL_RATE_LIMIT / second, burst GLOBAL_RATE_BURST (default 10/s, burst 80)
+service rate:     GLOBAL_RATE_LIMIT / second, burst GLOBAL_RATE_BURST (default 80/s, burst 160)
 health rate:      HEALTH_RATE_LIMIT / second, burst HEALTH_RATE_BURST
 health aggregate: GLOBAL_HEALTH_RATE_LIMIT / second, burst GLOBAL_HEALTH_RATE_BURST
-connections:      GLOBAL_CONN_LIMIT (accept-time atomic cap; default 64)
-per-IP conn:      IP_CONN_LIMIT (bound to the client IP on the first DoH/health request; default 16)
+connections:      GLOBAL_CONN_LIMIT (accept-time atomic cap; default 256)
+per-IP conn:      IP_CONN_LIMIT (follows the client IP of the connection's latest DoH/health request; default 16)
 source state:     DOH_RATE_MAX_IPS (fixed-size sharded table, hard cap 4096)
 request size:     DOH_MAX_BODY_BYTES
 ```
 
 Each DoH request is checked against the per-client rate limit first and the global limit second, so one abusive client cannot use up the shared budget. Only RFC 8484-style GET and POST requests are accepted at `DOH_PATH`. POST requests require `Content-Type: application/dns-message`. Requests that are too large, malformed, or use another method are rejected before being sent to MosDNS.
 
-The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. This identity model requires a trusted reverse proxy or edge in front of the service that appends the real client address to `X-Forwarded-For` and prevents direct untrusted access to the proxy. Do not expose the proxy directly and then rely on a client-supplied `X-Forwarded-For` value for identity. The global TCP connection cap is enforced by an atomic accept-and-close listener, while the per-source-IP cap is bound to the first relevant request on the connection so multiple clients sharing one public edge address are not treated as the same client. Source-IP rate/connection state is held in a fixed sharded table rather than an attacker-growable map. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
+The proxy uses the final element of the last `X-Forwarded-For` header line for client limiting and removes client-controlled forwarding headers before proxying to MosDNS. This identity model requires a trusted reverse proxy or edge in front of the service that appends the real client address to `X-Forwarded-For` and prevents direct untrusted access to the proxy. Do not expose the proxy directly and then rely on a client-supplied `X-Forwarded-For` value for identity. The global TCP connection cap is enforced by an atomic accept-and-close listener, while the per-source-IP cap is charged from the request's client IP rather than the socket peer, so multiple clients sharing one public edge address are not treated as the same client. If the edge reuses one keep-alive connection for requests from different clients, the connection's slot moves to the client of the latest request (it is only refused when that client is already at `IP_CONN_LIMIT`); a request whose client identity cannot be determined is rejected rather than pooled into a shared bucket. Source-IP rate/connection state is held in a fixed sharded table rather than an attacker-growable map. Waiting for MosDNS response headers is capped at 12 seconds (returned to the client as `502`), so a hung backend cannot hold every proxy-to-MosDNS connection slot.
 
 The health endpoint is a separate `GET`/`HEAD` path. It checks that the MosDNS backend TCP listener is reachable and returns `200 OK` when it is. Health requests use their own per-client and aggregate rate budgets so public DoH traffic cannot starve service health checks, while repeated health polling is still bounded.
 
@@ -99,7 +99,7 @@ The repository is intentionally DoH-only and does not expose a raw DNS UDP/TCP l
 
 ## Environment variables
 
-The image has working defaults; no environment variable is required for the default deployment. The public proxy is the externally reachable rate limiter; MosDNS is kept behind its loopback listener and does not duplicate that per-client limiter.
+The image has working defaults (defined once, in `content/entrypoint.sh`); no environment variable is required for the default deployment. The public proxy is the externally reachable rate limiter; MosDNS is kept behind its loopback listener and does not duplicate that per-client limiter.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -111,27 +111,27 @@ The image has working defaults; no environment variable is required for the defa
 | `UPSTREAM_0_IP` | `188.34.161.210` | Built-in `root.hagezi.org` dial pin. |
 | `UPSTREAM_1_IP` | `159.69.155.94` | Built-in `wurzn.hagezi.org` dial pin. |
 | `UPSTREAM_2_IP` | `95.217.163.17` | Built-in `juuri.hagezi.org` dial pin. |
-| `CACHE_SIZE` | `8192` | Maximum cache entries in RAM and warm snapshot. |
+| `CACHE_SIZE` | `32768` | Maximum cache entries in RAM and warm snapshot. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
 | `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
 | `SERVER_TIMEOUT` | `8` | MosDNS query timeout, seconds. The proxy stops waiting for MosDNS after 12 s, so values above 12 only produce a startup warning. |
-| `UPSTREAM_IDLE_TIMEOUT` | `30` | Upstream idle connection timeout, seconds. |
+| `UPSTREAM_IDLE_TIMEOUT` | `60` | Upstream idle connection timeout, seconds. |
 | `UPSTREAM_MAX_CONNS` | `4` | Maximum upstream connections per endpoint. |
 | `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. `0` uses MosDNS v4.5.3's 10 s default. Valid explicit values are 6-3600 s. The proxy keeps pooled backend connections at least 5 s shorter, capped at 90 s. |
-| `DOH_RATE_LIMIT` | `1.6666667` | Per-client+Host request rate, equivalent to 100 requests/60s sustained. |
-| `DOH_RATE_BURST` | `80` | Per-client+Host burst allowance (up to 80 DNS lookups in a short burst). |
+| `DOH_RATE_LIMIT` | `5` | Per-client+Host request rate, requests/second (300 requests/minute sustained). |
+| `DOH_RATE_BURST` | `100` | Per-client+Host burst allowance (up to 100 DNS lookups in a short burst). |
 | `DOH_RATE_MAX_IPS` | `4096` | Maximum IP+Host rate buckets retained; hard-capped at 4096. |
-| `GLOBAL_RATE_LIMIT` | `10` | Global request rate, requests/second. |
-| `GLOBAL_RATE_BURST` | `80` | Global DoH burst allowance. |
+| `GLOBAL_RATE_LIMIT` | `80` | Global request rate, requests/second. |
+| `GLOBAL_RATE_BURST` | `160` | Global DoH burst allowance. |
 | `HEALTH_RATE_LIMIT` | `2` | Per-client health request rate, requests/second. |
 | `HEALTH_RATE_BURST` | `4` | Per-client health burst allowance. |
 | `GLOBAL_HEALTH_RATE_LIMIT` | `10` | Aggregate health request rate, requests/second. |
 | `GLOBAL_HEALTH_RATE_BURST` | `20` | Aggregate health burst allowance. |
-| `GLOBAL_CONN_LIMIT` | `64` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
+| `GLOBAL_CONN_LIMIT` | `256` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
 | `IP_CONN_LIMIT` | `16` | Per-client concurrent connection limit; `0` disables it. The first relevant request binds the connection to its client IP. |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
 | `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
-| `HEALTH_TIMEOUT_MS` | `1200` | Upstream probe timeout, milliseconds (must be > 0). |
+| `HEALTH_TIMEOUT_MS` | `2000` | Upstream probe timeout, milliseconds (must be > 0). A probe opens a cold TLS connection, so leave room for a few round trips from distant regions. |
 | `HEALTH_INTERVAL` | `300` | Runtime probe interval, seconds. |
 | `HEALTH_FAILS_TO_SWITCH` | `2` | Consecutive active-upstream failures before switching. |
 | `HEALTH_RESTART_COOLDOWN` | `900` | Minimum seconds between supervisor-triggered restarts. |
@@ -144,7 +144,7 @@ The image has working defaults; no environment variable is required for the defa
 | `GOMEMLIMIT` | `288MiB` | Go memory soft limit for the main MosDNS process. The DoH proxy is launched with `80MiB`, and the health-probe helper uses `32MiB`. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
-Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-4096, `CACHE_SIZE` at least 1024, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter. Numeric environment values accept ordinary decimal and exponent notation consistently with the Go helpers.
+Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-4096, `CACHE_SIZE` 1024-1048576, `IP_CONN_LIMIT` and `GLOBAL_CONN_LIMIT` at most 65535, burst values at most 1000000, rate limits at most 1000000000, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter. Numeric environment values accept ordinary decimal and exponent notation consistently with the Go helpers. `DOH_PATH`, `CACHE_DUMP_FILE` and `HAGEZI_UPSTREAM` must not contain `__UPPERCASE__` placeholder-like text, because they are substituted into the config template.
 
 ## Deploy as an HTTP service
 
@@ -182,6 +182,8 @@ The configuration is intentionally small for a low-CPU instance:
 - bounded RAM cache, an 8 KiB-per-entry warm snapshot, and bounded public request/connection state.
 
 For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume. The default DoH profile is intentionally more tolerant of normal client bursts than a strict anti-abuse profile to reduce false-positive throttling on browser DNS startup bursts.
+
+Rough memory budget on the 512 MB instance (soft Go heap targets, not hard caps): MosDNS `GOMEMLIMIT=288MiB` (about 40 MB baseline plus the cache), proxy `80MiB` (normally 10-20 MB), and a short-lived probe helper at `32MiB`. Doubling `CACHE_SIZE` roughly doubles the cache share of MosDNS memory; keep the total comfortably below the container limit. The service-wide `GLOBAL_RATE_LIMIT` is the main CPU protection: raise it only if CPU stays well below the 0.25 vCPU quota under real traffic.
 
 ## Repository scope
 

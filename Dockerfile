@@ -50,7 +50,7 @@ RUN go test ./probe ./proxy \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./proxy \
  && /out/mosdns version
 
-FROM --platform=linux/amd64 alpine:3.24.2
+FROM --platform=linux/amd64 alpine:3.24
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S mosdns \
@@ -68,44 +68,10 @@ RUN chmod 0755 ./entrypoint.sh \
     && mkdir -p /var/cache/mosdns \
     && chown -R mosdns:mosdns /etc/mosdns /var/cache/mosdns
 
-ENV PORT=8080 \
-    MOSDNS_BACKEND_PORT=18080 \
-    IP_CONN_LIMIT=16 \
-    DOH_RATE_LIMIT=1.6666667 \
-    DOH_RATE_BURST=80 \
-    DOH_RATE_MAX_IPS=4096 \
-    GLOBAL_RATE_LIMIT=10 \
-    GLOBAL_RATE_BURST=80 \
-    HEALTH_RATE_LIMIT=2 \
-    HEALTH_RATE_BURST=4 \
-    GLOBAL_HEALTH_RATE_LIMIT=10 \
-    GLOBAL_HEALTH_RATE_BURST=20 \
-    GLOBAL_CONN_LIMIT=64 \
-    DOH_MAX_BODY_BYTES=4096 \
-    DOH_IDLE_TIMEOUT=120 \
-    UPSTREAM_IDLE_TIMEOUT=30 \
-    UPSTREAM_MAX_CONNS=4 \
-    CACHE_SIZE=8192 \
-    CACHE_DUMP_INTERVAL=3300 \
-    HEALTH_TIMEOUT_MS=1200 \
-    HEALTH_BACKEND_TIMEOUT_MS=1000 \
-    HEALTH_CHECK=true \
-    HEALTH_EWMA_ALPHA=0.35 \
-    HEALTH_FAILURE_PENALTY_MS=1500 \
-    HEALTH_SWITCH_MARGIN_PCT=0.20 \
-    HEALTH_SWITCH_MARGIN_MS=25 \
-    HEALTH_STATE_FILE=/tmp/mosdns-upstream-state.tsv \
-    HEALTH_INTERVAL=300 \
-    HEALTH_FAILS_TO_SWITCH=2 \
-    HEALTH_RESTART_COOLDOWN=900 \
-    GOMEMLIMIT=288MiB \
-    GOMAXPROCS=1 \
-    HAGEZI_UPSTREAM=rotate \
-    HEALTH_PATH=/health \
-    DOH_PATH=/dns-query \
-    UPSTREAM_0_IP=188.34.161.210 \
-    UPSTREAM_1_IP=159.69.155.94 \
-    UPSTREAM_2_IP=95.217.163.17
+# Runtime defaults (ports, rate limits, cache size, memory limits, upstream pins)
+# live in exactly one place: the `: "${NAME:=default}"` block at the top of
+# entrypoint.sh, which also validates every value. Override any of them with
+# service environment variables; see README.md for the full table.
 
 EXPOSE 8080
 STOPSIGNAL SIGTERM
