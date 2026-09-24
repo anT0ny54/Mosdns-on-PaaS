@@ -28,6 +28,8 @@ import (
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v4/pkg/upstream"
+	"github.com/miekg/dns"
+	"sync"
 	"time"
 )
 
@@ -39,9 +41,50 @@ func init() {
 
 var _ coremain.ExecutablePlugin = (*sequentialForward)(nil)
 
+const (
+	upstreamFailureTrip    = 2
+	upstreamFailureBackoff = 15 * time.Second
+)
+
+type upstreamState struct {
+	u upstream.Upstream
+
+	mu                  sync.Mutex
+	consecutiveFailures int
+	unhealthyUntil      time.Time
+}
+
+func (s *upstreamState) isCoolingDown(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.unhealthyUntil.IsZero() && now.Before(s.unhealthyUntil)
+}
+
+func (s *upstreamState) recordSuccess() {
+	s.mu.Lock()
+	s.consecutiveFailures = 0
+	s.unhealthyUntil = time.Time{}
+	s.mu.Unlock()
+}
+
+func (s *upstreamState) recordFailure(now time.Time) {
+	s.mu.Lock()
+	if s.consecutiveFailures < upstreamFailureTrip {
+		s.consecutiveFailures++
+	}
+	if s.consecutiveFailures >= upstreamFailureTrip {
+		s.unhealthyUntil = now.Add(upstreamFailureBackoff)
+	}
+	s.mu.Unlock()
+}
+
 type sequentialForward struct {
 	*coremain.BP
-	upstreams []upstream.Upstream
+	upstreams []*upstreamState
+}
+
+func shouldFailoverDNSResponse(r *dns.Msg) bool {
+	return r != nil && r.Rcode == dns.RcodeServerFailure
 }
 
 func initSequentialForward(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -79,12 +122,12 @@ func newSequentialForward(bp *coremain.BP, args *Args) (*sequentialForward, erro
 
 		u, err := upstream.NewUpstream(c.Addr, opt)
 		if err != nil {
-			for _, u := range f.upstreams {
-				_ = u.Close()
+			for _, state := range f.upstreams {
+				_ = state.u.Close()
 			}
 			return nil, fmt.Errorf("failed to init upstream #%d: %w", i, err)
 		}
-		f.upstreams = append(f.upstreams, u)
+		f.upstreams = append(f.upstreams, &upstreamState{u: u})
 	}
 	return f, nil
 }
@@ -106,35 +149,82 @@ func attemptContext(ctx context.Context, remaining int) (context.Context, contex
 }
 
 // Exec tries upstreams strictly in configured order. A later upstream is
-// contacted only when the previous exchange returns an error (including a
-// per-attempt timeout). A valid DNS response (including NXDOMAIN or SERVFAIL)
-// is considered a response and stops the chain, which avoids duplicate
-// upstream traffic and preserves bandwidth.
+// contacted when the previous exchange fails, times out, or returns SERVFAIL.
+// NXDOMAIN remains a valid policy answer and stops the chain, avoiding
+// duplicate upstream traffic and preserving bandwidth.
 func (f *sequentialForward) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
 	q := qCtx.Q()
 	if q == nil {
 		return errors.New("missing DNS query")
 	}
 
+	// If every upstream is temporarily cooling down, still probe the full
+	// configured set rather than turning a transient outage into a total outage.
+	now := time.Now()
+	anyAvailable := false
+	for _, state := range f.upstreams {
+		if !state.isCoolingDown(now) {
+			anyAvailable = true
+			break
+		}
+	}
+
 	var lastErr error
-	for i, u := range f.upstreams {
+	var lastSERVFAIL *dns.Msg
+	for i, state := range f.upstreams {
+		if anyAvailable && state.isCoolingDown(now) {
+			continue
+		}
+
+		remaining := 0
+		for j := i; j < len(f.upstreams); j++ {
+			if !anyAvailable || !f.upstreams[j].isCoolingDown(now) {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			continue
+		}
+
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// ExchangeContext must not retain or modify q, so reuse the same query
-		// object across fallback attempts and avoid an allocation/copy per hop.
-		attemptCtx, cancel := attemptContext(ctx, len(f.upstreams)-i)
-		r, err := u.ExchangeContext(attemptCtx, q)
+
+		// ExchangeContext in the patched MosDNS v4.5.3 DoH upstream now
+		// propagates this context into its HTTP request. That makes the split
+		// budget an actual cancellation boundary instead of an orphaned 5s
+		// request that can occupy the upstream connection pool after failover.
+		attemptCtx, cancel := attemptContext(ctx, remaining)
+		r, err := state.u.ExchangeContext(attemptCtx, q)
 		cancel()
-		if err == nil {
-			if r == nil {
-				lastErr = errors.New("upstream returned nil response")
+		if err == nil && r != nil {
+			if shouldFailoverDNSResponse(r) {
+				// SERVFAIL is a transport/service failure from the resolver to the
+				// caller. Try the next resolver rather than surfacing a transient
+				// failure when another healthy endpoint can answer.
+				lastSERVFAIL = r
+				if ctx.Err() == nil {
+					state.recordFailure(time.Now())
+				}
 				continue
 			}
+			state.recordSuccess()
 			qCtx.SetResponse(r)
 			return executable_seq.ExecChainNode(ctx, qCtx, next)
 		}
+
+		if err == nil {
+			err = errors.New("upstream returned nil response")
+		}
 		lastErr = err
+		if ctx.Err() == nil {
+			state.recordFailure(time.Now())
+		}
+	}
+
+	if lastSERVFAIL != nil {
+		qCtx.SetResponse(lastSERVFAIL)
+		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 	if lastErr == nil {
 		lastErr = errors.New("all upstreams failed")
@@ -144,8 +234,8 @@ func (f *sequentialForward) Exec(ctx context.Context, qCtx *query_context.Contex
 
 func (f *sequentialForward) Shutdown() error {
 	var firstErr error
-	for _, u := range f.upstreams {
-		if err := u.Close(); err != nil && firstErr == nil {
+	for _, state := range f.upstreams {
+		if err := state.u.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
