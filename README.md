@@ -58,7 +58,7 @@ The sequential forwarder also has a small in-memory circuit breaker: two consecu
 | `random` | Probe all three built-ins and randomly rotate among near-equal healthy candidates. |
 | `https://...` | Prefer this endpoint (a custom one takes the first built-in slot; a built-in URL is simply moved first) and keep the other two as fallbacks. It stays first while it passes its health probe; the probe only reorders the fallbacks. |
 
-The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart. When a switch happens, the complete measured order from the probe (not just the new first entry) becomes the new failover order. With a fixed `https://...` endpoint, latency never demotes it: it is moved down only after it has failed `HEALTH_FAILS_TO_SWITCH` probes in a row, and the supervisor moves it back to first (subject to `HEALTH_RESTART_COOLDOWN`) once it probes healthy again.
+The probe helper maintains an EWMA latency score and consecutive-failure count in `HEALTH_STATE_FILE`. Runtime checks happen every `HEALTH_INTERVAL` seconds. Hysteresis prevents a small latency difference from causing repeated upstream swaps, while repeated failures can trigger a reorder and MosDNS restart. Each successful probe must contain a complete, structurally valid DNS response for the probe question; header-only or truncated HTTP bodies are rejected. When a switch happens, the complete measured order from the probe (not just the new first entry) becomes the new failover order. With a fixed `https://...` endpoint, latency never demotes it: it is moved down only after it has failed `HEALTH_FAILS_TO_SWITCH` probes in a row, and the supervisor moves it back to first (subject to `HEALTH_RESTART_COOLDOWN`) once it probes healthy again.
 
 The three built-in IP variables are validated as IPv4 addresses before configuration is rendered. A custom `HAGEZI_UPSTREAM` is not pinned by these variables and is resolved normally.
 
@@ -68,9 +68,9 @@ The persisted probe state is intentionally bounded. Oversized or malformed state
 
 The normal query path uses MosDNS's memory cache. A small custom backend keeps a second, bounded copy for warm starts and writes it atomically to disk at `CACHE_DUMP_INTERVAL`. Hot-cache inserts are capped by `CACHE_MAX_ENTRY_BYTES` (8 KiB by default), and the warm copy uses the same 8 KiB per-entry ceiling. This prevents unusually large DNS responses from multiplying across the cache and keeps duplicate cached response data bounded on the 512 MB instance (typical answers are a few hundred bytes, so the default 8192 entries use roughly 6-16 MB across the hot and warm copies). Warm metadata keeps insertion/restore recency for snapshot eviction and restoration; ordinary hot-cache hits stay on the fast inner-cache path and do not take the warm-metadata lock. The snapshot is limited to the same warm-entry set, and expired or oversized entries are discarded before restore.
 
-Local service storage may be ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after a service replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting.
+Local service storage may be ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after a service replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting. `CACHE_DUMP_INTERVAL=0` disables snapshot writes, including the shutdown snapshot, while existing snapshot data can still be restored at startup.
 
-With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=8192`, `CACHE_MAX_ENTRY_BYTES=8192`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=256`, `IP_CONN_LIMIT=16`, `UPSTREAM_MAX_CONNS=8`, and the public DoH limiter at 5 requests/second (300/minute) sustained per client IP with a 100-request burst, under a service-wide budget of 80 requests/second with a 160-request burst. The service-wide budget is sized so that cache hits and misses together stay well inside a 0.25 vCPU CPU quota (roughly 0.2-0.5 ms of CPU per request) with headroom left for garbage collection, snapshots and health probes; that is enough for several hundred regular users, since a typical user averages well under one query per second. The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Successful backend DoH responses are buffered and DNS-validated before forwarding, with a 65535-byte response ceiling, so an unknown-length or prematurely terminated backend body cannot reach the client as a partial HTTP 200. Multiple devices behind one public IP share the same source-IP bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
+With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=8192`, `CACHE_MAX_ENTRY_BYTES=8192`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=256`, `IP_CONN_LIMIT=16`, `UPSTREAM_MAX_CONNS=8`, and the public DoH limiter at 5 requests/second (300/minute) sustained per client IP with a 100-request burst, under a service-wide budget of 80 requests/second with a 160-request burst. The service-wide budget is intentionally conservative for a 0.25 vCPU CPU quota; actual sustainable throughput depends on cache hit ratio, query size, upstream latency, and platform load, so raise `GLOBAL_RATE_LIMIT` only after measuring real CPU usage. The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Successful backend DoH responses are buffered and DNS-validated before forwarding, with a 65535-byte response ceiling, so an unknown-length or prematurely terminated backend body cannot reach the client as a partial HTTP 200. Multiple devices behind one public IP share the same source-IP bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
 
 ## DoH proxy
 
@@ -114,7 +114,7 @@ The image has working defaults (defined once, in `content/entrypoint.sh`); no en
 | `CACHE_MAX_ENTRY_BYTES` | `8192` | Maximum packed DNS response size eligible for the hot cache. Larger responses are served normally but are not cached. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
 | `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
-| `SERVER_TIMEOUT` | `10` | MosDNS query timeout, seconds. The proxy stops waiting for MosDNS after 12 s, so values above 12 only produce a startup warning. The sequential failover budget is divided across remaining upstream attempts. |
+| `SERVER_TIMEOUT` | `10` | MosDNS query timeout, seconds. Valid range is 1-10 s so the proxy's 12 s backend-response ceiling retains a margin for error handling. The sequential failover budget is divided across remaining upstream attempts. |
 | `UPSTREAM_IDLE_TIMEOUT` | `60` | Upstream idle connection timeout, seconds. |
 | `UPSTREAM_MAX_CONNS` | `8` | Maximum upstream connections per endpoint. Higher concurrency reduces head-of-line blocking when a sequentially preferred DoH endpoint has moderate latency. |
 | `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. `0` uses MosDNS v4.5.3's 10 s default. Valid explicit values are 6-3600 s. The proxy keeps pooled backend connections at least 5 s shorter, capped at 90 s. |
@@ -144,7 +144,7 @@ The image has working defaults (defined once, in `content/entrypoint.sh`); no en
 | `GOMEMLIMIT` | `288MiB` | Go memory soft limit for the main MosDNS process. The DoH proxy is launched with `80MiB`, and the health-probe helper uses `32MiB`. |
 | `GOMAXPROCS` | `1` | Go runtime CPU setting. |
 
-Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-4096, `CACHE_SIZE` 1024-8192, `CACHE_MAX_ENTRY_BYTES` 512-65535, `IP_CONN_LIMIT` and `GLOBAL_CONN_LIMIT` at most 65535, burst values at most 1000000, rate limits at most 1000000000, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `SERVER_TIMEOUT`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter. Floating-point environment values accept ordinary decimal and exponent notation; integer environment values must be decimal integers. `DOH_PATH`, `CACHE_DUMP_FILE` and `HAGEZI_UPSTREAM` must not contain `__UPPERCASE__` placeholder-like text, because they are substituted into the config template.
+Startup rejects out-of-range values: `PORT` and `MOSDNS_BACKEND_PORT` must be 1024-65535 and differ, `DOH_MAX_BODY_BYTES` 512-65535, `DOH_RATE_MAX_IPS` 1-4096, `CACHE_SIZE` 1024-8192, `CACHE_MAX_ENTRY_BYTES` 512-65535, `IP_CONN_LIMIT` and `GLOBAL_CONN_LIMIT` at most 65535, burst values at most 1000000, rate limits at most 1000000000, `SERVER_TIMEOUT` 1-10, `GOMAXPROCS` 1-2, `HEALTH_INTERVAL` at least 30, and `HEALTH_RESTART_COOLDOWN` at least `HEALTH_INTERVAL`. Burst values, `GLOBAL_CONN_LIMIT`, `UPSTREAM_MAX_CONNS`, `HEALTH_TIMEOUT_MS`, `HEALTH_BACKEND_TIMEOUT_MS` and `HEALTH_FAILS_TO_SWITCH` must be greater than 0. `DOH_IDLE_TIMEOUT` must be `0` or 6-3600 (`0` selects MosDNS v4.5.3's 10 s default). `IP_CONN_LIMIT` and `CACHE_DUMP_INTERVAL` may be `0` to disable, and a rate limit of `0` disables that rate limiter. Floating-point environment values accept ordinary decimal and exponent notation; integer environment values must be decimal integers. `DOH_PATH`, `HEALTH_PATH`, `CACHE_DUMP_FILE`, `HEALTH_STATE_FILE`, and `GOMEMLIMIT` are validated as printable text, and the template-substituted values must not contain `__UPPERCASE__` placeholder-like text.
 
 ## Deploy as an HTTP service
 
@@ -189,14 +189,6 @@ Rough memory budget on the 512 MB instance (soft Go heap targets, not hard caps)
 
 This repository is focused on a small containerized MosDNS deployment. Provider-specific deployment configuration is intentionally not included so the image can be used with different HTTP container platforms.
 
-## License
-
-See the repository's [LICENSE](LICENSE) file.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release notes.
-
 ## 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
@@ -223,3 +215,11 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 
 If you find this project useful, donations are appreciated:
 - **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
+## License
+
+See the repository's [LICENSE](LICENSE) file.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.

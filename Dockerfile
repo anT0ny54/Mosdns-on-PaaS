@@ -143,7 +143,8 @@ RUN chmod 0755 ./entrypoint.sh \
 
 # Runtime defaults (ports, rate limits, cache size, memory limits, upstream pins)
 # live in exactly one place: the `: "${NAME:=default}"` block at the top of
-# entrypoint.sh, which also validates every value. Override any of them with
+# entrypoint.sh, which validates bounded numeric values and supported text inputs.
+# Override any of them with
 # service environment variables; see README.md for the full table.
 
 EXPOSE 8080
