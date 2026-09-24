@@ -42,6 +42,8 @@ umask 077
 : "${UPSTREAM_0_IP:=188.34.161.210}"
 : "${UPSTREAM_1_IP:=159.69.155.94}"
 : "${UPSTREAM_2_IP:=95.217.163.17}"
+: "${EMERGENCY_UPSTREAM:=https://cloudflare-dns.com/dns-query}"
+: "${EMERGENCY_UPSTREAM_IP:=1.1.1.1}"
 
 validate_uint() {
   case "$2" in
@@ -150,9 +152,12 @@ validate_printable_ascii HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
 validate_no_placeholder DOH_PATH "$DOH_PATH"
 validate_no_placeholder CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
 validate_no_placeholder HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
+validate_printable_ascii EMERGENCY_UPSTREAM "$EMERGENCY_UPSTREAM"
+validate_no_placeholder EMERGENCY_UPSTREAM "$EMERGENCY_UPSTREAM"
 validate_ipv4 UPSTREAM_0_IP "$UPSTREAM_0_IP"
 validate_ipv4 UPSTREAM_1_IP "$UPSTREAM_1_IP"
 validate_ipv4 UPSTREAM_2_IP "$UPSTREAM_2_IP"
+validate_ipv4 EMERGENCY_UPSTREAM_IP "$EMERGENCY_UPSTREAM_IP"
 
 validate_nonnegative_float DOH_RATE_LIMIT "$DOH_RATE_LIMIT"
 validate_nonnegative_float GLOBAL_RATE_LIMIT "$GLOBAL_RATE_LIMIT"
@@ -184,6 +189,7 @@ case "$HEALTH_PATH" in /*) ;; *) echo "HEALTH_PATH must start with /" >&2; exit 
 case "$DOH_PATH" in *'?'*|*'#'*|*' '*) echo "DOH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in *'?'*|*'#'*|*' '*) echo "HEALTH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HAGEZI_UPSTREAM" in rotate|random|https://*) ;; *) echo "HAGEZI_UPSTREAM must be 'rotate', 'random', or an https:// endpoint" >&2; exit 1 ;; esac
+case "$EMERGENCY_UPSTREAM" in https://*) ;; *) echo "EMERGENCY_UPSTREAM must be an https:// endpoint" >&2; exit 1 ;; esac
 if [ "$SERVER_TIMEOUT" -gt 12 ]; then
   echo "WARNING: SERVER_TIMEOUT=${SERVER_TIMEOUT}s is above the DoH proxy's 12s backend response limit; slower queries are answered with 502 by the proxy" >&2
 fi
@@ -345,9 +351,11 @@ render_config() {
   U0_ESCAPED=$(yaml_single_quote "$ORDER_0" | sed 's/[\\&|]/\\&/g')
   U1_ESCAPED=$(yaml_single_quote "$ORDER_1" | sed 's/[\\&|]/\\&/g')
   U2_ESCAPED=$(yaml_single_quote "$ORDER_2" | sed 's/[\\&|]/\\&/g')
+  EMERGENCY_UPSTREAM_ESCAPED=$(yaml_single_quote "$EMERGENCY_UPSTREAM" | sed 's/[\\&|]/\\&/g')
   U0_IP_ESCAPED=$(yaml_single_quote "$ORDER_0_IP" | sed 's/[\\&|]/\\&/g')
   U1_IP_ESCAPED=$(yaml_single_quote "$ORDER_1_IP" | sed 's/[\\&|]/\\&/g')
   U2_IP_ESCAPED=$(yaml_single_quote "$ORDER_2_IP" | sed 's/[\\&|]/\\&/g')
+  EMERGENCY_UPSTREAM_IP_ESCAPED=$(yaml_single_quote "$EMERGENCY_UPSTREAM_IP" | sed 's/[\\&|]/\\&/g')
 
   candidate="${RUNTIME_CONFIG}.new"
   sed \
@@ -362,9 +370,11 @@ render_config() {
     -e "s|__UPSTREAM_0__|${U0_ESCAPED}|g" \
     -e "s|__UPSTREAM_1__|${U1_ESCAPED}|g" \
     -e "s|__UPSTREAM_2__|${U2_ESCAPED}|g" \
+    -e "s|__EMERGENCY_UPSTREAM__|${EMERGENCY_UPSTREAM_ESCAPED}|g" \
     -e "s|__UPSTREAM_0_IP__|${U0_IP_ESCAPED}|g" \
     -e "s|__UPSTREAM_1_IP__|${U1_IP_ESCAPED}|g" \
     -e "s|__UPSTREAM_2_IP__|${U2_IP_ESCAPED}|g" \
+    -e "s|__EMERGENCY_UPSTREAM_IP__|${EMERGENCY_UPSTREAM_IP_ESCAPED}|g" \
     -e "s|__DOH_IDLE_TIMEOUT__|${DOH_IDLE_TIMEOUT_ESCAPED}|g" \
     "$TEMPLATE" > "$candidate" || {
       # `set -e` is ignored while render_config runs inside `if !`, so a failed
@@ -457,6 +467,7 @@ mosdns version
 printf '%s\n' '======================'
 echo "Build: PaaS tiny-instance profile (512 MiB / 0.25 vCPU); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
+echo "Emergency DoH fallback: ${EMERGENCY_UPSTREAM} via ${EMERGENCY_UPSTREAM_IP}"
 echo "Sequential failover: enabled"
 echo "Plain DNS listener: disabled"
 echo "Health scoring: ${HEALTH_CHECK}, probe timeout ${HEALTH_TIMEOUT_MS}ms"

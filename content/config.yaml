@@ -38,6 +38,14 @@ plugins:
           idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
           max_conns: __UPSTREAM_MAX_CONNS__
 
+        # Independent last-resort resolver. This is intentionally outside the
+        # three HaGeZi candidates: normal health ordering never selects it, but
+        # sequential_failover can use it after all three policy upstreams fail.
+        - addr: __EMERGENCY_UPSTREAM__
+          dial_addr: __EMERGENCY_UPSTREAM_IP__
+          idle_timeout: __UPSTREAM_IDLE_TIMEOUT__
+          max_conns: 1
+
   - tag: forward
     type: sequence
     args:
