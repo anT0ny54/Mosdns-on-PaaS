@@ -122,3 +122,16 @@ func TestWarmBackendConcurrentSnapshotsRemainDecodable(t *testing.T) {
 		t.Fatal("final snapshot did not contain the newest generation")
 	}
 }
+
+func TestWarmBackendIntervalZeroDoesNotSnapshotAtClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "disabled.dump")
+	w := newWarmTestBackend(t, path, 8)
+	now := time.Now()
+	w.Store("a", []byte("a"), now, now.Add(time.Hour))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("disabled snapshot interval still created a file: err=%v", err)
+	}
+}

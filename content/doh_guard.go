@@ -10,7 +10,9 @@ import (
 
 const (
 	maxSourceStateHardCap = 4096
-	guardShardCount       = 8
+	// 32 shards keep the fixed tables bounded while reducing per-request linear scans
+	// on the 4096-source default without materially increasing memory usage.
+	guardShardCount = 32
 )
 
 // sourceEntry is fixed-size state. A hostile rotation of source IPs cannot grow

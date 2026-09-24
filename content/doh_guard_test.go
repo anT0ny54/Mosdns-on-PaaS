@@ -382,6 +382,9 @@ func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {
 	if got := sourceSlotCount(g.sources); got != maxSourceStateHardCap {
 		t.Fatalf("rate table slots = %d, want %d", got, maxSourceStateHardCap)
 	}
+	if g.sources.activeShards != guardShardCount {
+		t.Fatalf("rate table active shards = %d, want %d", g.sources.activeShards, guardShardCount)
+	}
 	connSlots := 0
 	for i := range g.connections.shards {
 		connSlots += len(g.connections.shards[i].entries)

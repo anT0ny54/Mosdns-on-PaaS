@@ -116,10 +116,11 @@ validate_uint_max CACHE_MAX_ENTRY_BYTES "$CACHE_MAX_ENTRY_BYTES" 65535
 validate_uint_max CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL" 604800
 validate_uint_max UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT" 3600
 validate_uint_max UPSTREAM_MAX_CONNS "$UPSTREAM_MAX_CONNS" 64
-validate_uint_max SERVER_TIMEOUT "$SERVER_TIMEOUT" 300
+validate_uint_max SERVER_TIMEOUT "$SERVER_TIMEOUT" 10
 validate_uint_max HEALTH_TIMEOUT_MS "$HEALTH_TIMEOUT_MS" 600000
 validate_uint_max HEALTH_BACKEND_TIMEOUT_MS "$HEALTH_BACKEND_TIMEOUT_MS" 600000
 validate_uint_max DOH_IDLE_TIMEOUT "$DOH_IDLE_TIMEOUT" 3600
+validate_uint_max GOMAXPROCS "$GOMAXPROCS" 2
 # MosDNS v4.5.3 treats idle_timeout <= 0 as its 10s default. The proxy keeps
 # its pooled backend connection at least 5s shorter, so explicit values 1-5s
 # cannot satisfy the required safety margin and are rejected. Zero is allowed
@@ -148,6 +149,8 @@ validate_no_placeholder() {
 validate_printable_ascii DOH_PATH "$DOH_PATH"
 validate_printable_ascii HEALTH_PATH "$HEALTH_PATH"
 validate_printable_ascii CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
+validate_printable_ascii HEALTH_STATE_FILE "$HEALTH_STATE_FILE"
+validate_printable_ascii GOMEMLIMIT "$GOMEMLIMIT"
 validate_printable_ascii HAGEZI_UPSTREAM "$HAGEZI_UPSTREAM"
 validate_no_placeholder DOH_PATH "$DOH_PATH"
 validate_no_placeholder CACHE_DUMP_FILE "$CACHE_DUMP_FILE"
@@ -181,15 +184,13 @@ validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 [ "$HEALTH_INTERVAL" -ge 30 ] || { echo "HEALTH_INTERVAL must be >= 30" >&2; exit 1; }
 [ "$HEALTH_FAILS_TO_SWITCH" -gt 0 ] || { echo "HEALTH_FAILS_TO_SWITCH must be > 0" >&2; exit 1; }
 [ "$HEALTH_RESTART_COOLDOWN" -ge "$HEALTH_INTERVAL" ] || { echo "HEALTH_RESTART_COOLDOWN must be >= HEALTH_INTERVAL" >&2; exit 1; }
+[ "$GOMAXPROCS" -gt 0 ] || { echo "GOMAXPROCS must be 1-2 for the 0.25 vCPU profile" >&2; exit 1; }
 
 case "$DOH_PATH" in /*) ;; *) echo "DOH_PATH must start with /" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in /*) ;; *) echo "HEALTH_PATH must start with /" >&2; exit 1 ;; esac
 case "$DOH_PATH" in *'?'*|*'#'*|*' '*) echo "DOH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in *'?'*|*'#'*|*' '*) echo "HEALTH_PATH must be a path without query, fragment, or spaces" >&2; exit 1 ;; esac
 case "$HAGEZI_UPSTREAM" in rotate|random|https://*) ;; *) echo "HAGEZI_UPSTREAM must be 'rotate', 'random', or an https:// endpoint" >&2; exit 1 ;; esac
-if [ "$SERVER_TIMEOUT" -gt 12 ]; then
-  echo "WARNING: SERVER_TIMEOUT=${SERVER_TIMEOUT}s is above the DoH proxy's 12s backend response limit; slower queries are answered with 502 by the proxy" >&2
-fi
 case "$HEALTH_CHECK" in true|false) ;; *) echo "HEALTH_CHECK must be true or false" >&2; exit 1 ;; esac
 if [ "$HEALTH_CHECK" = "true" ] && ! command -v mosdns-probe >/dev/null 2>&1; then
   echo "ERROR: mosdns-probe binary not found while HEALTH_CHECK=true" >&2

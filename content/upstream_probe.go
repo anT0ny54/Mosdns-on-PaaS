@@ -135,37 +135,20 @@ func probe(url string, timeout time.Duration) (int64, bool) {
 	if contentType != "application/dns-message" {
 		return 0, false
 	}
-	// DNS messages are bounded by the wire-format maximum. Only the 12-byte
-	// header is needed for validation; drain the remainder without retaining
-	// the full response so health probes stay allocation-light and memory-bounded.
+	// DNS messages are bounded by the wire-format maximum. Read the complete
+	// response so a header-only or otherwise truncated body cannot score as healthy.
 	const maxDNSMessageBytes = 65535
 	if resp.ContentLength > maxDNSMessageBytes {
 		return 0, false
 	}
-	var header [12]byte
-	if _, err := io.ReadFull(resp.Body, header[:]); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageBytes+1))
+	if err != nil || len(body) > maxDNSMessageBytes {
 		return 0, false
 	}
-	remaining := int64(maxDNSMessageBytes - len(header))
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, remaining+1))
-	if err != nil || n > remaining {
+	if resp.ContentLength >= 0 && int64(len(body)) != resp.ContentLength {
 		return 0, false
 	}
-	flags := binary.BigEndian.Uint16(header[2:4])
-	if binary.BigEndian.Uint16(header[0:2]) != id || flags&0x8000 == 0 {
-		return 0, false
-	}
-	// The probe sends one standard recursive DNS question. Require the normal
-	// query opcode and an echoed question count so a generic HTTP/DNS-shaped
-	// response cannot be mistaken for a healthy resolver.
-	if flags&0x7800 != 0 || flags&0x0200 != 0 || binary.BigEndian.Uint16(header[4:6]) != 1 {
-		return 0, false
-	}
-	// Treat only NOERROR and NXDOMAIN as healthy probe outcomes. Unknown or
-	// reserved RCODEs must not be accepted as evidence that the resolver is
-	// servicing DNS normally.
-	rcode := flags & 0x000f
-	if rcode != 0 && rcode != 3 {
+	if !validProbeDNSResponse(id, body) {
 		return 0, false
 	}
 	ms := time.Since(start).Milliseconds()
@@ -173,6 +156,126 @@ func probe(url string, timeout time.Duration) (int64, bool) {
 		ms = 1
 	}
 	return ms, true
+}
+
+// validProbeDNSResponse performs a bounded wire-level validation without pulling
+// the full DNS package into the one-shot probe helper. The probe only needs to
+// establish that the endpoint returned a complete, wire-structurally valid DNS
+// response with one A/IN question. RDATA is treated as opaque bytes; an empty
+// NOERROR answer is still a healthy resolver outcome.
+func validProbeDNSResponse(id uint16, body []byte) bool {
+	if len(body) < 12 || binary.BigEndian.Uint16(body[0:2]) != id {
+		return false
+	}
+	flags := binary.BigEndian.Uint16(body[2:4])
+	if flags&0x8000 == 0 || flags&0x7800 != 0 || flags&0x0200 != 0 {
+		return false
+	}
+	if binary.BigEndian.Uint16(body[4:6]) != 1 {
+		return false
+	}
+	rcode := flags & 0x000f
+	if rcode != 0 && rcode != 3 {
+		return false
+	}
+
+	questionEnd, ok := dnsNameEnd(body, 12)
+	if !ok || questionEnd+4 > len(body) {
+		return false
+	}
+	// The fixed health query asks for A/IN. Validate those fields so a random
+	// DNS-shaped payload cannot pass solely because its header looks plausible.
+	if binary.BigEndian.Uint16(body[questionEnd:questionEnd+2]) != 1 ||
+		binary.BigEndian.Uint16(body[questionEnd+2:questionEnd+4]) != 1 {
+		return false
+	}
+	offset := questionEnd + 4
+	for _, count := range []uint16{
+		binary.BigEndian.Uint16(body[6:8]),   // ANCOUNT
+		binary.BigEndian.Uint16(body[8:10]),  // NSCOUNT
+		binary.BigEndian.Uint16(body[10:12]), // ARCOUNT
+	} {
+		var ok bool
+		offset, ok = dnsRecordsEnd(body, offset, count)
+		if !ok {
+			return false
+		}
+	}
+	return offset == len(body)
+}
+
+// dnsRecordsEnd validates count generic DNS resource records starting at off and
+// returns the byte after the final RDATA field. RDATA is opaque because its exact
+// structure is type-specific, while RDLength still lets us prove the body is complete.
+func dnsRecordsEnd(msg []byte, off int, count uint16) (int, bool) {
+	for i := uint16(0); i < count; i++ {
+		nameEnd, ok := dnsNameEnd(msg, off)
+		if !ok || nameEnd+10 > len(msg) {
+			return 0, false
+		}
+		rdataLen := int(binary.BigEndian.Uint16(msg[nameEnd+8 : nameEnd+10]))
+		off = nameEnd + 10
+		if off+rdataLen > len(msg) {
+			return 0, false
+		}
+		off += rdataLen
+	}
+	return off, true
+}
+
+// dnsNameEnd returns the first byte after a DNS name field. It validates label
+// bounds and compression pointers, but does not allocate or expand the name.
+func dnsNameEnd(msg []byte, off int) (int, bool) {
+	if off < 0 || off >= len(msg) {
+		return 0, false
+	}
+	seen := make(map[int]struct{}, 4)
+	return dnsNameEndSeen(msg, off, seen, 0)
+}
+
+func dnsNameEndSeen(msg []byte, off int, seen map[int]struct{}, depth int) (int, bool) {
+	if depth > 16 || off < 0 || off >= len(msg) {
+		return 0, false
+	}
+	start := off
+	for {
+		if off >= len(msg) {
+			return 0, false
+		}
+		length := msg[off]
+		switch length & 0xc0 {
+		case 0x00:
+			off++
+			if length == 0 {
+				return off, true
+			}
+			if length > 63 || off+int(length) > len(msg) {
+				return 0, false
+			}
+			off += int(length)
+		case 0xc0:
+			if off+1 >= len(msg) {
+				return 0, false
+			}
+			pointer := int(length&0x3f)<<8 | int(msg[off+1])
+			if pointer >= len(msg) || pointer >= off {
+				return 0, false
+			}
+			if _, ok := seen[pointer]; ok {
+				return 0, false
+			}
+			seen[pointer] = struct{}{}
+			if _, ok := dnsNameEndSeen(msg, pointer, seen, depth+1); !ok {
+				return 0, false
+			}
+			return off + 2, true
+		default:
+			return 0, false
+		}
+		if off == start {
+			return 0, false
+		}
+	}
 }
 
 func envFloat(name string, def float64) float64 {

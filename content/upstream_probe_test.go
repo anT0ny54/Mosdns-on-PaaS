@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,5 +83,65 @@ func TestLoadStateRejectsMalformedInput(t *testing.T) {
 	}
 	if st, ok := got["https://ok.example/dns-query"]; !ok || st.ewma != 25.5 || st.failures != 1 {
 		t.Fatalf("valid state was not restored correctly: %#v", got)
+	}
+}
+
+func TestValidProbeDNSResponse(t *testing.T) {
+	const id = 0x1234
+	body := dnsQuery(id)
+	binary.BigEndian.PutUint16(body[2:4], 0x8180) // QR + RD + RA, NOERROR.
+	if !validProbeDNSResponse(id, body) {
+		t.Fatal("valid DNS response was rejected")
+	}
+}
+
+func TestValidProbeDNSResponseRejectsTruncatedBody(t *testing.T) {
+	const id = 0x1234
+	body := dnsQuery(id)
+	binary.BigEndian.PutUint16(body[2:4], 0x8180)
+	for _, truncated := range [][]byte{body[:12], body[:28]} {
+		if validProbeDNSResponse(id, truncated) {
+			t.Fatal("truncated DNS response was accepted")
+		}
+	}
+}
+
+func TestValidProbeDNSResponseRejectsWrongQuestion(t *testing.T) {
+	const id = 0x1234
+	body := dnsQuery(id)
+	binary.BigEndian.PutUint16(body[2:4], 0x8180)
+	binary.BigEndian.PutUint16(body[25:27], 28) // AAAA instead of the A health query.
+	if validProbeDNSResponse(id, body) {
+		t.Fatal("wrong DNS question type was accepted")
+	}
+}
+
+func TestValidProbeDNSResponseAcceptsNXDOMAIN(t *testing.T) {
+	const id = 0x1234
+	body := dnsQuery(id)
+	binary.BigEndian.PutUint16(body[2:4], 0x8183) // QR + RD + RA + NXDOMAIN.
+	if !validProbeDNSResponse(id, body) {
+		t.Fatal("NXDOMAIN response was rejected")
+	}
+}
+
+func TestValidProbeDNSResponseRejectsMalformedRecord(t *testing.T) {
+	const id = 0x1234
+	body := dnsQuery(id)
+	binary.BigEndian.PutUint16(body[2:4], 0x8180)
+	binary.BigEndian.PutUint16(body[6:8], 1) // one answer
+	body = append(body, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x05, 1, 2, 3, 4)
+	if validProbeDNSResponse(id, body) {
+		t.Fatal("DNS response with an incomplete RDATA field was accepted")
+	}
+}
+
+func TestValidProbeDNSResponseRejectsTrailingGarbage(t *testing.T) {
+	const id = 0x1234
+	body := dnsQuery(id)
+	binary.BigEndian.PutUint16(body[2:4], 0x8180)
+	body = append(body, 0xff)
+	if validProbeDNSResponse(id, body) {
+		t.Fatal("DNS response with trailing garbage was accepted")
 	}
 }

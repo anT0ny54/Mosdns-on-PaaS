@@ -29,8 +29,9 @@ type warmNode struct {
 const maxWarmEntryBytes = 8 * 1024
 
 // Keep startup recovery bounded even if the on-disk snapshot is corrupted or
-// unexpectedly replaced. The default snapshot is normally far below this for typical DNS answers.
-const maxWarmSnapshotBytes = 64 << 20
+// unexpectedly replaced. The limit leaves room for gob/map/order metadata around
+// the default 8192 x 8 KiB warm-entry budget without permitting a huge decode.
+const maxWarmSnapshotBytes = 96 << 20
 
 type warmDisk struct {
 	Entries map[string]warmEntry
@@ -204,7 +205,9 @@ func (w *warmBackend) Close() error {
 	w.closed = true
 	close(w.stop)
 	<-w.done
-	w.snapshot()
+	if w.interval > 0 {
+		w.snapshot()
+	}
 	return w.inner.Close()
 }
 
@@ -262,8 +265,16 @@ func (w *warmBackend) load() {
 	// New snapshots carry the exact list order. Walk it directly so a
 	// restart restores the same LRU state rather than reconstructing it from
 	// StoredTime (which is not an access-time signal).
-	seen := make(map[string]struct{}, len(d.Order))
-	nodes := make([]warmNode, 0, len(d.Entries))
+	seenCap := len(d.Order)
+	if w.maxEntries > 0 && seenCap > w.maxEntries {
+		seenCap = w.maxEntries
+	}
+	seen := make(map[string]struct{}, seenCap)
+	nodeCap := len(d.Entries)
+	if w.maxEntries > 0 && nodeCap > w.maxEntries {
+		nodeCap = w.maxEntries
+	}
+	nodes := make([]warmNode, 0, nodeCap)
 	for _, k := range d.Order {
 		if _, ok := seen[k]; ok {
 			continue
