@@ -3,7 +3,6 @@ package main
 import (
 	"net"
 	"net/netip"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,7 +65,7 @@ type connShard struct {
 }
 
 // connTable keeps per-IP connection accounting physically separate from the
-// IP+Host rate-state table. This prevents active connection entries from
+// source-IP rate-state table. This prevents active connection entries from
 // consuming rate-bucket capacity and preserves the full configured rate-state
 // bound even when source IPs have live connections.
 type connTable struct {
@@ -111,24 +110,15 @@ func ipKey(ip netip.Addr) string {
 	return ip.String()
 }
 
-func canonicalHost(host string) string {
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return ""
-	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-}
-
 // rateKey returns "" for an invalid source so allowRateKey fails closed instead
 // of letting every unidentifiable client share one "invalid IP" bucket.
-func rateKey(ip netip.Addr, host string) string {
+// The source IP is the only identity component by design; Host is never part
+// of rate-limit state.
+func rateKey(ip netip.Addr) string {
 	if !ip.IsValid() {
 		return ""
 	}
-	return ipKey(ip) + "\x00" + canonicalHost(host)
+	return ipKey(ip)
 }
 
 func (t *sourceTable) shardForKey(key string) *sourceShard {
@@ -352,15 +342,15 @@ func (b *tokenBucket) allow(now time.Time) bool {
 	return refill(&b.tokens, &b.lastNS, b.rate, b.burst, now.UnixNano())
 }
 
-func (g *publicGuard) allowDoH(ip netip.Addr, host string, now time.Time) bool {
-	if !g.sources.allowRateKey(rateKey(ip, host), now, g.dohRate, g.dohBurst, false) {
+func (g *publicGuard) allowDoH(ip netip.Addr, now time.Time) bool {
+	if !g.sources.allowRateKey(rateKey(ip), now, g.dohRate, g.dohBurst, false) {
 		return false
 	}
 	return g.globalDoH.allow(now)
 }
 
-func (g *publicGuard) allowHealth(ip netip.Addr, host string, now time.Time) bool {
-	if !g.sources.allowRateKey(rateKey(ip, host), now, g.healthRate, g.healthBurst, true) {
+func (g *publicGuard) allowHealth(ip netip.Addr, now time.Time) bool {
+	if !g.sources.allowRateKey(rateKey(ip), now, g.healthRate, g.healthBurst, true) {
 		return false
 	}
 	return g.globalHealth.allow(now)

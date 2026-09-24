@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -17,7 +18,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/miekg/dns"
 )
+
+const maxDoHResponseBytes = 65535
 
 func clientIPAddr(r *http.Request) netip.Addr {
 	// PaaS edge/proxy infrastructure appends the client address to XFF. Trust only
@@ -94,9 +99,8 @@ func main() {
 	// Upper-bounded to the DNS wire-format maximum message size (also enforced
 	// by entrypoint.sh's validate_uint_max). Enforcing it here too means the
 	// binary is safe even if it is ever launched without that shell wrapper.
-	const maxDNSMessageBytes = 65535
-	if maxBodyBytes < 1 || maxBodyBytes > maxDNSMessageBytes {
-		log.Fatalf("DOH_MAX_BODY_BYTES must be 1-%d", maxDNSMessageBytes)
+	if maxBodyBytes < 1 || maxBodyBytes > maxDoHResponseBytes {
+		log.Fatalf("DOH_MAX_BODY_BYTES must be 1-%d", maxDoHResponseBytes)
 	}
 	if dohIdleTimeoutSeconds < 0 || dohIdleTimeoutSeconds > 3600 || (dohIdleTimeoutSeconds > 0 && dohIdleTimeoutSeconds < 6) {
 		log.Fatalf("DOH_IDLE_TIMEOUT must be 0 or 6-3600 seconds (0 uses MosDNS v4.5.3's 10s default)")
@@ -108,10 +112,10 @@ func main() {
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
-		Proxy:               nil,
-		DisableCompression:  true,
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
-		ForceAttemptHTTP2:   false,
+		Proxy:              nil,
+		DisableCompression: true,
+		DialContext:        (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 60 * time.Second}).DialContext,
+		ForceAttemptHTTP2:  false,
 		// One loopback backend: allow enough concurrent cache-miss queries to
 		// overlap upstream latency, but keep a hard ceiling so a stalled
 		// backend cannot pile up unbounded goroutines on 0.25 vCPU.
@@ -142,6 +146,7 @@ func main() {
 		}
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
+	proxy.ModifyResponse = bufferDoHResponse
 
 	guard := newPublicGuard(
 		globalConnLimit,
@@ -179,7 +184,7 @@ func main() {
 			// Keep platform health checks independent from the public DoH request
 			// budget. A separate per-IP plus global health budget still prevents
 			// /health from becoming an unbounded backend-connect flood.
-			if !guard.allowHealth(ipAddr, r.Host, now) {
+			if !guard.allowHealth(ipAddr, now) {
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, "health rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -211,7 +216,7 @@ func main() {
 		// requests; health uses its own isolated limiters. Both run before body
 		// buffering or other parsing so rejected floods cost as little CPU and
 		// memory as possible.
-		if !guard.allowDoH(ipAddr, r.Host, now) {
+		if !guard.allowDoH(ipAddr, now) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -321,6 +326,45 @@ func main() {
 	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+// bufferDoHResponse fully reads successful DoH responses before ReverseProxy
+// starts writing the response to the client. This matters for chunked/unknown-
+// length backend responses: a premature EOF must become a 502, not a seemingly
+// successful HTTP 200 containing a truncated DNS message. Successful responses
+// are normalized to an explicit Content-Length after validation.
+func bufferDoHResponse(resp *http.Response) error {
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType != "application/dns-message" {
+		return fmt.Errorf("backend returned unsupported DoH content type %q", contentType)
+	}
+	if resp.ContentLength > maxDoHResponseBytes {
+		return fmt.Errorf("backend DoH response exceeds %d bytes", maxDoHResponseBytes)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDoHResponseBytes+1))
+	_ = resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("failed to read backend DoH response: %w", err)
+	}
+	if int64(len(body)) > maxDoHResponseBytes {
+		return fmt.Errorf("backend DoH response exceeds %d bytes", maxDoHResponseBytes)
+	}
+	if resp.ContentLength >= 0 && int64(len(body)) != resp.ContentLength {
+		return fmt.Errorf("backend DoH response length mismatch: got %d bytes, declared %d", len(body), resp.ContentLength)
+	}
+	msg := new(dns.Msg)
+	if err := msg.Unpack(body); err != nil {
+		return fmt.Errorf("invalid backend DoH DNS message: %w", err)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.TransferEncoding = nil
+	resp.Header.Del("Transfer-Encoding")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return nil
 }
 
 type connGuardKey struct{}

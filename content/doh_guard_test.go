@@ -66,7 +66,7 @@ func TestSourceStateHardCap(t *testing.T) {
 
 // allowIP exercises the production key path (rateKey + allowRateKey).
 func allowIP(tbl *sourceTable, ip netip.Addr, now time.Time, rate, burst float64) bool {
-	return tbl.allowRateKey(rateKey(ip, "test.example"), now, rate, burst, false)
+	return tbl.allowRateKey(rateKey(ip), now, rate, burst, false)
 }
 
 func sourceSlotCount(tbl *sourceTable) int {
@@ -121,13 +121,13 @@ func TestPerSourceRejectDoesNotConsumeGlobalRate(t *testing.T) {
 	base := time.Unix(200, 0)
 	a := mustAddr(t, "203.0.113.10")
 	b := mustAddr(t, "203.0.113.11")
-	if !g.allowDoH(a, "dns.example", base) {
+	if !g.allowDoH(a, base) {
 		t.Fatal("first source request should be allowed")
 	}
-	if g.allowDoH(a, "dns.example", base) {
+	if g.allowDoH(a, base) {
 		t.Fatal("second request from source A should be rejected by its own bucket")
 	}
-	if !g.allowDoH(b, "dns.example", base) {
+	if !g.allowDoH(b, base) {
 		t.Fatal("source B should still consume the second global token")
 	}
 }
@@ -241,19 +241,20 @@ func (g *publicGuard) globalCount() int64 {
 	return atomic.LoadInt64(&g.globalConn)
 }
 
-func TestSourceRateBucketsArePerIPAndHost(t *testing.T) {
+func TestSourceRateBucketsArePerIP(t *testing.T) {
 	g := newPublicGuard(8, 32, 0, 1, 1, 100, 100, 1, 1, 10, 10)
 	now := time.Unix(300, 0)
 	ip := mustAddr(t, "192.0.2.44")
+	otherIP := mustAddr(t, "192.0.2.45")
 
-	if !g.allowDoH(ip, "Example.Test.:443", now) {
+	if !g.allowDoH(ip, now) {
 		t.Fatal("first request should be admitted")
 	}
-	if g.allowDoH(ip, "example.test", now) {
-		t.Fatal("same IP+canonical host should be rate limited")
+	if g.allowDoH(ip, now) {
+		t.Fatal("same source IP must share one rate bucket regardless of Host")
 	}
-	if !g.allowDoH(ip, "other.example.test", now) {
-		t.Fatal("same IP with a different host should have an independent bucket")
+	if !g.allowDoH(otherIP, now) {
+		t.Fatal("different source IP should have an independent bucket")
 	}
 }
 
@@ -354,8 +355,8 @@ func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {
 
 	now := time.Unix(400, 0)
 	for i := 0; i < maxSourceStateHardCap; i++ {
-		key := "198.51.100.1\x00host-" + itoa(i) + ".example"
-		if !g.sources.allowRateKey(key, now, 1000, 1000, false) {
+		ip := mustAddr(t, "198.18."+itoa(i/256)+"."+itoa(i%256))
+		if !g.sources.allowRateKey(rateKey(ip), now, 1000, 1000, false) {
 			t.Fatalf("rate bucket %d was rejected", i)
 		}
 	}

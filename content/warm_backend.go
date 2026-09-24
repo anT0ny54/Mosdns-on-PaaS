@@ -29,7 +29,7 @@ type warmNode struct {
 const maxWarmEntryBytes = 8 * 1024
 
 // Keep startup recovery bounded even if the on-disk snapshot is corrupted or
-// unexpectedly replaced. The normal 8192-entry snapshot is far below this.
+// unexpectedly replaced. The default snapshot is normally far below this for typical DNS answers.
 const maxWarmSnapshotBytes = 64 << 20
 
 type warmDisk struct {
