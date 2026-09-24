@@ -23,6 +23,35 @@ RUN apk add --no-cache ca-certificates git \
 # edits do not force a full module re-download during image builds.
 RUN go mod download
 
+# MosDNS v4.5.3's DoH client internally replaces the caller context with a
+# fresh 5-second background context. That makes our sequential failover timeout
+# unable to cancel a stalled request, leaving orphaned HTTP exchanges behind and
+# exhausting the upstream connection pools. Patch only that context boundary:
+# keep the upstream's 5s hard cap, but make it inherit the caller's cancellation
+# and earlier deadline. The exact source shape is checked so a future MosDNS
+# change cannot silently invalidate the patch.
+RUN test "$(grep -Fc 'ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
+ && test "$(grep -Fc 'r, err := u.exchange(ctx, utils.BytesToStringUnsafe(urlBuf))' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
+ && awk ' \
+      index($0, "ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)") > 0 { \
+        print "\t\texchangeCtx := ctx"; \
+        print "\t\tcancel := func() {}"; \
+        print "\t\tif deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > defaultDoHTimeout {"; \
+        print "\t\t\texchangeCtx, cancel = context.WithTimeout(ctx, defaultDoHTimeout)"; \
+        print "\t\t}"; \
+        print "\t\tdefer cancel()"; \
+        skip = 1; \
+        next; \
+      } \
+      skip { skip = 0; next } \
+      { print }' /src/pkg/upstream/doh/upstream.go > /src/pkg/upstream/doh/upstream.go.tmp \
+ && mv /src/pkg/upstream/doh/upstream.go.tmp /src/pkg/upstream/doh/upstream.go \
+ && sed -i 's|r, err := u.exchange(ctx, utils.BytesToStringUnsafe(urlBuf))|r, err := u.exchange(exchangeCtx, utils.BytesToStringUnsafe(urlBuf))|' /src/pkg/upstream/doh/upstream.go \
+ && test "$(grep -Fc 'exchangeCtx := ctx' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
+ && test "$(grep -Fc 'exchangeCtx, cancel = context.WithTimeout(ctx, defaultDoHTimeout)' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
+ && test "$(grep -Fc 'r, err := u.exchange(exchangeCtx, utils.BytesToStringUnsafe(urlBuf))' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
+ && gofmt -w /src/pkg/upstream/doh/upstream.go
+
 # Keep the warm-start disk cache feature without maintaining a fork.
 COPY content/warm_backend.go /src/plugin/executable/cache/warm_backend.go
 RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tDumpFile          string `yaml:\"dump_file\"`"; print "\tDumpInterval      int    `yaml:\"dump_interval\"`"}' /src/plugin/executable/cache/cache.go > /src/plugin/executable/cache/cache.go.tmp \
@@ -43,8 +72,9 @@ COPY content/ip_conn_proxy_test.go /src/proxy/main_test.go
 COPY content/doh_guard_test.go /src/proxy/guard_test.go
 COPY content/upstream_probe_test.go /src/probe/main_test.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
+COPY content/sequential_forward_test.go /src/plugin/executable/fast_forward/sequential_forward_test.go
 
-RUN go test ./probe ./proxy \
+RUN go test ./plugin/executable/fast_forward ./probe ./proxy \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./proxy \
