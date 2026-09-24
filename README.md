@@ -62,6 +62,23 @@ The probe helper maintains an EWMA latency score and consecutive-failure count i
 
 The three built-in IP variables are validated as IPv4 addresses before configuration is rendered. A custom `HAGEZI_UPSTREAM` is not pinned by these variables and is resolved normally.
 
+## Browser strict-DoH profile
+
+The default limits are tuned for Chrome and Firefox strict DoH/maximum-protection modes, where the browser may create short bursts of DNS requests, open or close connections during navigation, and cancel in-flight requests when a page or network state changes. The defaults are:
+
+```text
+DOH_RATE_LIMIT=12
+DOH_RATE_BURST=200
+GLOBAL_RATE_LIMIT=80
+GLOBAL_RATE_BURST=200
+IP_CONN_LIMIT=32
+SERVER_TIMEOUT=6
+```
+
+A normal client disconnect is expected behavior and should not be logged or treated as an upstream failure. A backend timeout or invalid DNS response is different: it is converted to `502 Bad Gateway`, allowing the browser's strict DoH implementation to retry or report the lookup failure rather than receiving a truncated or malformed `200 OK` response. `SERVER_TIMEOUT` is the MosDNS query deadline; the sequential failover plugin shares that deadline across the remaining configured upstream attempts.
+
+The per-IP request limit is keyed only by source IP. Multiple devices behind the same public IP therefore share that quota, while changing `Host` headers cannot create additional rate-limit buckets.
+
 The persisted probe state is intentionally bounded. Oversized or malformed state files are ignored, and only a small number of valid entries are loaded, so a damaged state file cannot consume unbounded startup memory.
 
 ## Warm cache
@@ -70,20 +87,20 @@ The normal query path uses MosDNS's memory cache. A small custom backend keeps a
 
 Local service storage may be ephemeral, so the warm cache is an optimization only. DNS correctness does not depend on the snapshot being present after a service replacement. If the directory of `CACHE_DUMP_FILE` cannot be created, startup logs a warning and continues instead of aborting. `CACHE_DUMP_INTERVAL=0` disables snapshot writes, including the shutdown snapshot, while existing snapshot data can still be restored at startup.
 
-With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=8192`, `CACHE_MAX_ENTRY_BYTES=8192`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=256`, `IP_CONN_LIMIT=16`, `UPSTREAM_MAX_CONNS=8`, and the public DoH limiter at 5 requests/second (300/minute) sustained per client IP with a 100-request burst, under a service-wide budget of 80 requests/second with a 160-request burst. The service-wide budget is intentionally conservative for a 0.25 vCPU CPU quota; actual sustainable throughput depends on cache hit ratio, query size, upstream latency, and platform load, so raise `GLOBAL_RATE_LIMIT` only after measuring real CPU usage. The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Successful backend DoH responses are buffered and DNS-validated before forwarding, with a 65535-byte response ceiling, so an unknown-length or prematurely terminated backend body cannot reach the client as a partial HTTP 200. Multiple devices behind one public IP share the same source-IP bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
+With the default 512 MB / 0.25 vCPU profile, `CACHE_SIZE=8192`, `CACHE_MAX_ENTRY_BYTES=8192`, `DOH_RATE_MAX_IPS=4096`, `GLOBAL_CONN_LIMIT=256`, `IP_CONN_LIMIT=32`, `UPSTREAM_MAX_CONNS=8`, and the public DoH limiter at 12 requests/second (720/minute) sustained per client IP with a 200-request burst, under a service-wide budget of 80 requests/second with a 200-request burst. The service-wide budget is intentionally conservative for a 0.25 vCPU CPU quota; actual sustainable throughput depends on cache hit ratio, query size, upstream latency, and platform load, so raise `GLOBAL_RATE_LIMIT` only after measuring real CPU usage. The proxy is kept at `GOMEMLIMIT=80MiB` while MosDNS gets `GOMEMLIMIT=288MiB`; these are soft Go heap targets, not hard container-memory caps, so real headroom also depends on runtime/native memory and upstream latency. Successful backend DoH responses are buffered and DNS-validated before forwarding, with a 65535-byte response ceiling, so an unknown-length or prematurely terminated backend body cannot reach the client as a partial HTTP 200. Multiple devices behind one public IP share the same source-IP bucket; the burst absorbs short browser startup bursts, but sustained traffic above the quota will still receive HTTP 429 responses.
 
 ## DoH proxy
 
 `content/ip_conn_proxy.go` sits in front of MosDNS and enforces:
 
 ```text
-per-IP rate:        DOH_RATE_LIMIT / second (default 5/s = 300 requests/minute), burst DOH_RATE_BURST (default 100)
+per-IP rate:        DOH_RATE_LIMIT / second (default 12/s = 720 requests/minute), burst DOH_RATE_BURST (default 200)
 tracked IP buckets:  DOH_RATE_MAX_IPS
-service rate:     GLOBAL_RATE_LIMIT / second, burst GLOBAL_RATE_BURST (default 80/s, burst 160)
+service rate:     GLOBAL_RATE_LIMIT / second, burst GLOBAL_RATE_BURST (default 80/s, burst 200)
 health rate:      HEALTH_RATE_LIMIT / second, burst HEALTH_RATE_BURST
 health aggregate: GLOBAL_HEALTH_RATE_LIMIT / second, burst GLOBAL_HEALTH_RATE_BURST
 connections:      GLOBAL_CONN_LIMIT (accept-time atomic cap; default 256)
-per-IP conn:      IP_CONN_LIMIT (follows the client IP of the connection's latest DoH/health request; default 16)
+per-IP conn:      IP_CONN_LIMIT (follows the client IP of the connection's latest DoH/health request; default 32)
 source state:     DOH_RATE_MAX_IPS (fixed-size sharded table, hard cap 4096)
 request size:     DOH_MAX_BODY_BYTES
 ```
@@ -114,21 +131,21 @@ The image has working defaults (defined once, in `content/entrypoint.sh`); no en
 | `CACHE_MAX_ENTRY_BYTES` | `8192` | Maximum packed DNS response size eligible for the hot cache. Larger responses are served normally but are not cached. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
 | `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
-| `SERVER_TIMEOUT` | `10` | MosDNS query timeout, seconds. Valid range is 1-10 s so the proxy's 12 s backend-response ceiling retains a margin for error handling. The sequential failover budget is divided across remaining upstream attempts. |
+| `SERVER_TIMEOUT` | `6` | MosDNS query timeout, seconds. Valid range is 1-10 s. The sequential failover budget is divided across the remaining upstream attempts, so 6 s bounds the total DNS wait while still allowing all three configured upstreams to be tried. |
 | `UPSTREAM_IDLE_TIMEOUT` | `60` | Upstream idle connection timeout, seconds. |
 | `UPSTREAM_MAX_CONNS` | `8` | Maximum upstream connections per endpoint. Higher concurrency reduces head-of-line blocking when a sequentially preferred DoH endpoint has moderate latency. |
 | `DOH_IDLE_TIMEOUT` | `120` | Internal MosDNS DoH listener idle timeout, seconds. `0` uses MosDNS v4.5.3's 10 s default. Valid explicit values are 6-3600 s. The proxy keeps pooled backend connections at least 5 s shorter, capped at 90 s. |
-| `DOH_RATE_LIMIT` | `5` | Per-client source-IP request rate, requests/second (300 requests/minute sustained). |
-| `DOH_RATE_BURST` | `100` | Per-client source-IP burst allowance (up to 100 DNS lookups in a short burst). |
+| `DOH_RATE_LIMIT` | `12` | Per-client source-IP request rate, requests/second (720 requests/minute sustained). The higher sustained rate reduces false-positive throttling during browser startup bursts while retaining per-IP abuse control. |
+| `DOH_RATE_BURST` | `200` | Per-client source-IP burst allowance (up to 200 DNS lookups in a short burst). |
 | `DOH_RATE_MAX_IPS` | `4096` | Maximum source-IP rate buckets retained; hard-capped at 4096. |
 | `GLOBAL_RATE_LIMIT` | `80` | Global request rate, requests/second. |
-| `GLOBAL_RATE_BURST` | `160` | Global DoH burst allowance. |
+| `GLOBAL_RATE_BURST` | `200` | Global DoH burst allowance. |
 | `HEALTH_RATE_LIMIT` | `2` | Per-client health request rate, requests/second. |
 | `HEALTH_RATE_BURST` | `4` | Per-client health burst allowance. |
 | `GLOBAL_HEALTH_RATE_LIMIT` | `10` | Aggregate health request rate, requests/second. |
 | `GLOBAL_HEALTH_RATE_BURST` | `20` | Aggregate health burst allowance. |
 | `GLOBAL_CONN_LIMIT` | `256` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
-| `IP_CONN_LIMIT` | `16` | Per-client concurrent connection limit; `0` disables it. The first relevant request binds the connection to its client IP. |
+| `IP_CONN_LIMIT` | `32` | Per-client concurrent connection limit; `0` disables it. The higher ceiling tolerates browser connection churn and parallel DNS activity without making the per-IP guard unbounded. The first relevant request binds the connection to its client IP. |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
 | `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
 | `HEALTH_TIMEOUT_MS` | `2000` | Upstream probe timeout, milliseconds (must be > 0). A probe opens a cold TLS connection, so leave room for a few round trips from distant regions. |
@@ -181,7 +198,7 @@ The configuration is intentionally small for a low-CPU instance:
 - one MosDNS process, one small proxy process, and one health-probe helper invoked when checks run;
 - bounded RAM cache, an 8 KiB-per-entry warm snapshot, and bounded public request/connection state.
 
-For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume. The default DoH profile is intentionally more tolerant of normal client bursts than a strict anti-abuse profile to reduce false-positive throttling on browser DNS startup bursts.
+For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume. The default DoH profile is intentionally more tolerant of normal client bursts and connection churn than a strict anti-abuse profile: `DOH_RATE_LIMIT=12`, `DOH_RATE_BURST=200`, and `IP_CONN_LIMIT=32` reduce false-positive throttling during Chrome/Firefox startup, navigation, tab concurrency, and resolver retries. `SERVER_TIMEOUT=6` bounds a stalled DNS lookup; sequential failover shares that budget across the remaining configured upstreams. Strict DoH clients should still be expected to cancel in-flight requests during normal navigation or network changes; those client disconnects are not treated as upstream failures.
 
 Rough memory budget on the 512 MB instance (soft Go heap targets, not hard caps): MosDNS `GOMEMLIMIT=288MiB` (about 40 MB baseline plus the cache), proxy `80MiB` (normally 10-20 MB), and a short-lived probe helper at `32MiB`. Doubling `CACHE_SIZE` roughly doubles the cache share of MosDNS memory; keep the total comfortably below the container limit. The service-wide `GLOBAL_RATE_LIMIT` is the main CPU protection: raise it only if CPU stays well below the 0.25 vCPU quota under real traffic. The default concurrency limits deliberately leave CPU headroom for MosDNS, the proxy, garbage collection, and periodic health checks rather than trading that headroom for a higher request cap.
 
