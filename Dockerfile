@@ -62,11 +62,15 @@ RUN test "$(grep -Fc 'CompressResp      bool   `yaml:"compress_resp"`' /src/plug
       /CompressResp[[:space:]]+bool[[:space:]]+`yaml:"compress_resp"`/ { \
         print; \
         print "\tMaxEntryBytes    int    `yaml:\"max_entry_bytes\"`"; \
+        print "\tDumpFile         string `yaml:\"dump_file\"`"; \
+        print "\tDumpInterval     int    `yaml:\"dump_interval\"`"; \
         next; \
       } \
       { print }' /src/plugin/executable/cache/cache.go > /src/plugin/executable/cache/cache.go.tmp \
  && mv /src/plugin/executable/cache/cache.go.tmp /src/plugin/executable/cache/cache.go \
  && test "$(grep -Ec '^[[:space:]]*MaxEntryBytes[[:space:]]+int[[:space:]]+`yaml:"max_entry_bytes"`[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && test "$(grep -Ec '^[[:space:]]*DumpFile[[:space:]]+string[[:space:]]+`yaml:"dump_file"`[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && test "$(grep -Ec '^[[:space:]]*DumpInterval[[:space:]]+int[[:space:]]+`yaml:"dump_interval"`[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && test "$(grep -Fc 'v, err := r.Pack()' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && awk ' \
       /v, err := r.Pack\(\)/ { \
