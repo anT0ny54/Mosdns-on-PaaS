@@ -16,7 +16,7 @@ const (
 // sourceEntry is fixed-size state. A hostile rotation of source IPs cannot grow
 // a Go map; the table is allocated once and capped at maxSourceStateHardCap.
 type sourceEntry struct {
-	key          string
+	key          netip.Addr
 	lastSeenNS   int64
 	dohTokens    float64
 	dohLastNS    int64
@@ -46,15 +46,19 @@ func newSourceTable(maxPeers int) *sourceTable {
 		activeShards = maxPeers
 	}
 	t := &sourceTable{activeShards: activeShards}
-	for i := 0; i < maxPeers; i++ {
-		s := i % activeShards
-		t.shards[s].entries = append(t.shards[s].entries, sourceEntry{})
+	base, extra := maxPeers/activeShards, maxPeers%activeShards
+	for i := 0; i < activeShards; i++ {
+		n := base
+		if i < extra {
+			n++
+		}
+		t.shards[i].entries = make([]sourceEntry, n)
 	}
 	return t
 }
 
 type connEntry struct {
-	key         string
+	key         netip.Addr
 	lastSeenNS  int64
 	connections int
 }
@@ -86,46 +90,45 @@ func newConnTable(maxPeers, perConn int) *connTable {
 		activeShards = maxPeers
 	}
 	t := &connTable{activeShards: activeShards, perConn: perConn}
-	for i := 0; i < maxPeers; i++ {
-		s := i % activeShards
-		t.shards[s].entries = append(t.shards[s].entries, connEntry{})
+	base, extra := maxPeers/activeShards, maxPeers%activeShards
+	for i := 0; i < activeShards; i++ {
+		n := base
+		if i < extra {
+			n++
+		}
+		t.shards[i].entries = make([]connEntry, n)
 	}
 	return t
 }
 
 func (t *connTable) shardFor(ip netip.Addr) *connShard {
-	return &t.shards[hashKey(ipKey(ip))%uint64(t.activeShards)]
+	ip = ip.Unmap()
+	return &t.shards[hashAddr(ip)%uint64(t.activeShards)]
 }
 
-func hashKey(key string) uint64 {
+func hashAddr(ip netip.Addr) uint64 {
 	var h uint64 = 1469598103934665603
-	for i := 0; i < len(key); i++ {
-		h ^= uint64(key[i])
+	for _, b := range ip.As16() {
+		h ^= uint64(b)
 		h *= 1099511628211
 	}
 	return h
 }
 
-func ipKey(ip netip.Addr) string {
-	return ip.String()
-}
-
-// rateKey returns "" for an invalid source so allowRateKey fails closed instead
-// of letting every unidentifiable client share one "invalid IP" bucket.
-// The source IP is the only identity component by design; Host is never part
-// of rate-limit state.
-func rateKey(ip netip.Addr) string {
+// rateKey returns the canonical source address. The source IP is the only
+// identity component by design; Host is never part of rate-limit state.
+func rateKey(ip netip.Addr) netip.Addr {
 	if !ip.IsValid() {
-		return ""
+		return netip.Addr{}
 	}
-	return ipKey(ip)
+	return ip.Unmap()
 }
 
-func (t *sourceTable) shardForKey(key string) *sourceShard {
-	return &t.shards[hashKey(key)%uint64(t.activeShards)]
+func (t *sourceTable) shardForKey(key netip.Addr) *sourceShard {
+	return &t.shards[hashAddr(key)%uint64(t.activeShards)]
 }
 
-func findSourceLocked(sh *sourceShard, key string) *sourceEntry {
+func findSourceLocked(sh *sourceShard, key netip.Addr) *sourceEntry {
 	for i := range sh.entries {
 		if sh.entries[i].key == key {
 			return &sh.entries[i]
@@ -138,7 +141,7 @@ func findFreeSourceLocked(sh *sourceShard) *sourceEntry {
 	var oldest *sourceEntry
 	for i := range sh.entries {
 		e := &sh.entries[i]
-		if e.key == "" {
+		if !e.key.IsValid() {
 			return e
 		}
 		if oldest == nil || e.lastSeenNS < oldest.lastSeenNS {
@@ -148,15 +151,13 @@ func findFreeSourceLocked(sh *sourceShard) *sourceEntry {
 	return oldest
 }
 
-func (t *sourceTable) findOrCreateLocked(sh *sourceShard, key string, nowNS int64) *sourceEntry {
+func (t *sourceTable) findOrCreateLocked(sh *sourceShard, key netip.Addr, nowNS int64) *sourceEntry {
 	if e := findSourceLocked(sh, key); e != nil {
 		e.lastSeenNS = nowNS
 		return e
 	}
 	e := findFreeSourceLocked(sh)
 	if e == nil {
-		// This source shard is exhausted. Fail closed rather than allocating
-		// attacker-controlled state beyond the fixed bound.
 		return nil
 	}
 	*e = sourceEntry{key: key, lastSeenNS: nowNS}
@@ -186,12 +187,12 @@ func refill(tokens *float64, lastNS *int64, rate, burst float64, nowNS int64) bo
 	return true
 }
 
-func (t *sourceTable) allowRateKey(key string, now time.Time, rate, burst float64, health bool) bool {
+func (t *sourceTable) allowRateKey(key netip.Addr, now time.Time, rate, burst float64, health bool) bool {
+	if !key.IsValid() {
+		return false
+	}
 	if rate <= 0 || burst <= 0 {
 		return true
-	}
-	if key == "" {
-		return false
 	}
 	sh := t.shardForKey(key)
 	nowNS := now.UnixNano()
@@ -207,7 +208,7 @@ func (t *sourceTable) allowRateKey(key string, now time.Time, rate, burst float6
 	return refill(&e.dohTokens, &e.dohLastNS, rate, burst, nowNS)
 }
 
-func findConnLocked(sh *connShard, key string) *connEntry {
+func findConnLocked(sh *connShard, key netip.Addr) *connEntry {
 	for i := range sh.entries {
 		if sh.entries[i].key == key {
 			return &sh.entries[i]
@@ -220,7 +221,7 @@ func findFreeConnLocked(sh *connShard) *connEntry {
 	var oldest *connEntry
 	for i := range sh.entries {
 		e := &sh.entries[i]
-		if e.key == "" {
+		if !e.key.IsValid() {
 			return e
 		}
 		if e.connections == 0 && (oldest == nil || e.lastSeenNS < oldest.lastSeenNS) {
@@ -231,13 +232,17 @@ func findFreeConnLocked(sh *connShard) *connEntry {
 }
 
 func (t *connTable) acquireConn(ip netip.Addr) bool {
-	if t.perConn <= 0 || !ip.IsValid() {
+	if !ip.IsValid() {
+		return false
+	}
+	if t.perConn <= 0 {
 		return true
 	}
+	ip = ip.Unmap()
 	sh := t.shardFor(ip)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	key := ipKey(ip)
+	key := ip
 	e := findConnLocked(sh, key)
 	if e == nil {
 		e = findFreeConnLocked(sh)
@@ -260,10 +265,11 @@ func (t *connTable) releaseConn(ip netip.Addr) {
 	if t.perConn <= 0 || !ip.IsValid() {
 		return
 	}
+	ip = ip.Unmap()
 	sh := t.shardFor(ip)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if e := findConnLocked(sh, ipKey(ip)); e != nil {
+	if e := findConnLocked(sh, ip); e != nil {
 		if e.connections > 0 {
 			e.connections--
 		}
@@ -372,11 +378,11 @@ type guardedConn struct {
 // The old slot is released before the new one is acquired, and the two shard
 // locks are never held together, so the move cannot deadlock or double-count.
 func (c *guardedConn) bindSource(ip netip.Addr) bool {
-	if c.guard.connections.perConn <= 0 {
-		return true
-	}
 	if !ip.IsValid() {
 		return false
+	}
+	if c.guard.connections.perConn <= 0 {
+		return true
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

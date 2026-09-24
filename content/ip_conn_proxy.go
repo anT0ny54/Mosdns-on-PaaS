@@ -34,13 +34,13 @@ func clientIPAddr(r *http.Request) netip.Addr {
 		if i := strings.LastIndexByte(x, ','); i >= 0 {
 			x = x[i+1:]
 		}
-		if ip, err := netip.ParseAddr(strings.TrimSpace(x)); err == nil {
-			return ip
+		if ip, err := netip.ParseAddr(strings.TrimSpace(x)); err == nil && ip.Zone() == "" {
+			return ip.Unmap()
 		}
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if ip, err := netip.ParseAddr(host); err == nil {
-			return ip
+		if ip, err := netip.ParseAddr(host); err == nil && ip.Zone() == "" {
+			return ip.Unmap()
 		}
 	}
 	return netip.Addr{}
@@ -170,6 +170,10 @@ func main() {
 		}
 
 		ipAddr := clientIPAddr(r)
+		if !ipAddr.IsValid() {
+			http.Error(w, "client identity unavailable", http.StatusBadRequest)
+			return
+		}
 
 		if state, ok := r.Context().Value(connGuardKey{}).(*guardedConn); ok && !state.bindSource(ipAddr) {
 			w.Header().Set("Connection", "close")
@@ -411,7 +415,7 @@ func getenvInt(k string, d int) int {
 
 func getenvFloat(k string, d float64) float64 {
 	v, err := strconv.ParseFloat(getenv(k, strconv.FormatFloat(d, 'f', -1, 64)), 64)
-	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
 		return d
 	}
 	return v

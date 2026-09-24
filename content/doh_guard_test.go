@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -81,7 +82,7 @@ func TestBoundedSourceState(t *testing.T) {
 	tbl := newSourceTable(16)
 	now := time.Unix(0, 1)
 	for i := 1; i <= 200; i++ {
-		ip := mustAddr(t, "192.0.2."+itoa(i%250+1))
+		ip := mustAddr(t, "192.0.2."+strconv.Itoa(i%250+1))
 		_ = allowIP(tbl, ip, now.Add(time.Duration(i)*time.Millisecond), 100, 100)
 	}
 	for i := range tbl.shards {
@@ -116,6 +117,13 @@ func TestInvalidSourceFailsClosedWhenRateLimited(t *testing.T) {
 	}
 }
 
+func TestInvalidSourceFailsClosedWhenRateLimitDisabled(t *testing.T) {
+	tbl := newSourceTable(8)
+	if tbl.allowRateKey(netip.Addr{}, time.Unix(100, 0), 0, 12, false) {
+		t.Fatal("invalid source must be rejected even when per-source rate limiting is disabled")
+	}
+}
+
 func TestPerSourceRejectDoesNotConsumeGlobalRate(t *testing.T) {
 	g := newPublicGuard(8, 8, 0, 1, 1, 1, 2, 1, 1, 1, 1)
 	base := time.Unix(200, 0)
@@ -146,6 +154,38 @@ func TestGlobalConnectionLimitIsAtomic(t *testing.T) {
 	}
 }
 
+func TestPerSourceConnectionRejectsInvalidSourceWhenLimitDisabled(t *testing.T) {
+	g := newPublicGuard(8, 8, 0, 0, 1, 0, 1, 0, 1, 0, 1)
+	if g.connections.acquireConn(netip.Addr{}) {
+		t.Fatal("invalid source must not be accepted as an unlimited per-source connection")
+	}
+}
+
+func TestPerSourceConnectionCanonicalizesIPv4MappedAddress(t *testing.T) {
+	g := newPublicGuard(8, 8, 1, 1, 1, 100, 100, 1, 1, 10, 10)
+	v4 := mustAddr(t, "192.0.2.25")
+	mapped := mustAddr(t, "::ffff:192.0.2.25")
+
+	if g.connections.shardFor(mapped) != g.connections.shardFor(v4) {
+		t.Fatal("IPv4 and IPv4-mapped forms must select the same canonical connection shard")
+	}
+
+	if !g.connections.acquireConn(mapped) {
+		t.Fatal("IPv4-mapped source should acquire the per-source slot")
+	}
+	if g.connections.acquireConn(v4) {
+		t.Fatal("IPv4 and IPv4-mapped forms must share the same per-source slot")
+	}
+	g.connections.releaseConn(v4)
+	if !g.connections.acquireConn(v4) {
+		t.Fatal("released canonical slot must be reusable")
+	}
+	g.connections.releaseConn(mapped)
+	g.connections.releaseConn(v4)
+	if got := connCount(g, v4); got != 0 {
+		t.Fatalf("canonical source connection count = %d, want 0", got)
+	}
+}
 func TestPerSourceConnectionLimit(t *testing.T) {
 	g := newPublicGuard(8, 8, 2, 5, 12, 40, 80, 2, 4, 10, 20)
 	ip := mustAddr(t, "198.51.100.9")
@@ -161,26 +201,22 @@ func TestPerSourceConnectionLimit(t *testing.T) {
 	}
 }
 
-func itoa(v int) string {
-	if v == 0 {
-		return "0"
-	}
-	var out [20]byte
-	i := len(out)
-	for v > 0 {
-		i--
-		out[i] = byte('0' + v%10)
-		v /= 10
-	}
-	return string(out[i:])
-}
-
 func TestClientIPAddrUsesTrustedFinalXFFValue(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://example.test/health", nil)
 	r.RemoteAddr = "127.0.0.1:1234"
 	r.Header.Add("X-Forwarded-For", "10.0.0.1, 203.0.113.10")
 	r.Header.Add("X-Forwarded-For", "198.51.100.7")
 	want := mustAddr(t, "198.51.100.7")
+	if got := clientIPAddr(r); got != want {
+		t.Fatalf("clientIPAddr = %v, want %v", got, want)
+	}
+}
+
+func TestClientIPAddrUnmapsIPv4MappedAddress(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "http://example.test/health", nil)
+	r.RemoteAddr = "127.0.0.1:1234"
+	r.Header.Set("X-Forwarded-For", "::ffff:192.0.2.10")
+	want := mustAddr(t, "192.0.2.10")
 	if got := clientIPAddr(r); got != want {
 		t.Fatalf("clientIPAddr = %v, want %v", got, want)
 	}
@@ -259,10 +295,11 @@ func TestSourceRateBucketsArePerIP(t *testing.T) {
 }
 
 func connCount(g *publicGuard, ip netip.Addr) int {
+	ip = ip.Unmap()
 	sh := g.connections.shardFor(ip)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if e := findConnLocked(sh, ipKey(ip)); e != nil {
+	if e := findConnLocked(sh, ip); e != nil {
 		return e.connections
 	}
 	return 0
@@ -355,7 +392,7 @@ func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {
 
 	now := time.Unix(400, 0)
 	for i := 0; i < maxSourceStateHardCap; i++ {
-		ip := mustAddr(t, "198.18."+itoa(i/256)+"."+itoa(i%256))
+		ip := mustAddr(t, "198.18."+strconv.Itoa(i/256)+"."+strconv.Itoa(i%256))
 		if !g.sources.allowRateKey(rateKey(ip), now, 1000, 1000, false) {
 			t.Fatalf("rate bucket %d was rejected", i)
 		}
@@ -366,7 +403,7 @@ func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {
 		sh := &g.sources.shards[i]
 		sh.mu.Lock()
 		for _, e := range sh.entries {
-			if e.key != "" {
+			if e.key.IsValid() {
 				rateBuckets++
 			}
 		}

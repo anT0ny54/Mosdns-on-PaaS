@@ -18,12 +18,13 @@ umask 077
 : "${DOH_MAX_BODY_BYTES:=4096}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
-: "${CACHE_SIZE:=32768}"
+: "${CACHE_SIZE:=8192}"
+: "${CACHE_MAX_ENTRY_BYTES:=8192}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
 : "${CACHE_DUMP_INTERVAL:=3300}"
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${UPSTREAM_IDLE_TIMEOUT:=60}"
-: "${UPSTREAM_MAX_CONNS:=4}"
+: "${UPSTREAM_MAX_CONNS:=8}"
 : "${SERVER_TIMEOUT:=10}"
 : "${HEALTH_TIMEOUT_MS:=2000}"
 : "${HEALTH_BACKEND_TIMEOUT_MS:=1000}"
@@ -110,7 +111,8 @@ validate_uint_max HEALTH_RATE_BURST "$HEALTH_RATE_BURST" 1000000
 validate_uint_max GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST" 1000000
 validate_uint_max GLOBAL_CONN_LIMIT "$GLOBAL_CONN_LIMIT" 65535
 validate_uint_max DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES" 65535
-validate_uint_max CACHE_SIZE "$CACHE_SIZE" 1048576
+validate_uint_max CACHE_SIZE "$CACHE_SIZE" 8192
+validate_uint_max CACHE_MAX_ENTRY_BYTES "$CACHE_MAX_ENTRY_BYTES" 65535
 validate_uint_max CACHE_DUMP_INTERVAL "$CACHE_DUMP_INTERVAL" 604800
 validate_uint_max UPSTREAM_IDLE_TIMEOUT "$UPSTREAM_IDLE_TIMEOUT" 3600
 validate_uint_max UPSTREAM_MAX_CONNS "$UPSTREAM_MAX_CONNS" 64
@@ -169,6 +171,7 @@ validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 # below. Only reject a negative value here; validate_uint already did that.
 [ "$DOH_MAX_BODY_BYTES" -ge 512 ] || { echo "DOH_MAX_BODY_BYTES must be >= 512" >&2; exit 1; }
 [ "$CACHE_SIZE" -ge 1024 ] || { echo "CACHE_SIZE must be >= 1024" >&2; exit 1; }
+[ "$CACHE_MAX_ENTRY_BYTES" -ge 512 ] || { echo "CACHE_MAX_ENTRY_BYTES must be >= 512" >&2; exit 1; }
 [ "$SERVER_TIMEOUT" -gt 0 ] || { echo "SERVER_TIMEOUT must be > 0" >&2; exit 1; }
 [ "$HEALTH_TIMEOUT_MS" -gt 0 ] || { echo "HEALTH_TIMEOUT_MS must be > 0" >&2; exit 1; }
 [ "$HEALTH_BACKEND_TIMEOUT_MS" -gt 0 ] || { echo "HEALTH_BACKEND_TIMEOUT_MS must be > 0" >&2; exit 1; }
@@ -315,6 +318,7 @@ sed_escape_replacement() { printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }
 yaml_single_quote() { escaped=$(printf '%s' "$1" | sed "s/'/''/g"); printf "'%s'" "$escaped"; }
 
 CACHE_SIZE_ESCAPED=$(sed_escape_replacement "$CACHE_SIZE")
+CACHE_MAX_ENTRY_BYTES_ESCAPED=$(sed_escape_replacement "$CACHE_MAX_ENTRY_BYTES")
 CACHE_DUMP_FILE_ESCAPED=$(yaml_single_quote "$CACHE_DUMP_FILE" | sed 's/[\\&|]/\\&/g')
 CACHE_DUMP_INTERVAL_ESCAPED=$(sed_escape_replacement "$CACHE_DUMP_INTERVAL")
 MOSDNS_BACKEND_PORT_ESCAPED=$(sed_escape_replacement "$MOSDNS_BACKEND_PORT")
@@ -355,6 +359,7 @@ render_config() {
     -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
     -e "s|__DOH_PATH__|$(yaml_single_quote "$DOH_PATH" | sed 's/[\\&|]/\\&/g')|" \
     -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
+    -e "s|__CACHE_MAX_ENTRY_BYTES__|${CACHE_MAX_ENTRY_BYTES_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_INTERVAL__|${CACHE_DUMP_INTERVAL_ESCAPED}|g" \
     -e "s|__UPSTREAM_IDLE_TIMEOUT__|${UPSTREAM_IDLE_TIMEOUT_ESCAPED}|g" \
@@ -469,7 +474,7 @@ else
   echo "DoH listener idle timeout: ${DOH_IDLE_TIMEOUT}s; proxy backend pool timeout: 90s (capped)"
 fi
 echo "Server timeout: ${SERVER_TIMEOUT}s"
-echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s"
+echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s, max cached response ${CACHE_MAX_ENTRY_BYTES}B"
 echo "Runtime limits: GOMAXPROCS=${GOMAXPROCS}, GOMEMLIMIT=${GOMEMLIMIT}"
 echo "DoH endpoint: ${DOH_PATH}"
 echo "Anti-abuse: per-IP conn ${IP_CONN_LIMIT}, per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, fixed source state <= ${DOH_RATE_MAX_IPS}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"

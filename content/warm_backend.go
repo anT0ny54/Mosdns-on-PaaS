@@ -48,6 +48,7 @@ type warmBackend struct {
 
 	lifecycle           sync.RWMutex
 	mu                  sync.Mutex
+	snapshotMu          sync.Mutex
 	entries             map[string]*list.Element
 	order               *list.List // newest first; oldest entry is Back
 	stop                chan struct{}
@@ -362,6 +363,10 @@ func (w *warmBackend) snapshot() {
 	if w.path == "" {
 		return
 	}
+	// Loop and shutdown snapshots can otherwise overlap. Serializing them is
+	// required so an older, slower snapshot cannot rename over a newer one.
+	w.snapshotMu.Lock()
+	defer w.snapshotMu.Unlock()
 
 	w.mu.Lock()
 	w.pruneLocked(time.Now())
