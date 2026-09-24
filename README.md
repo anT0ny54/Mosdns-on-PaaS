@@ -45,7 +45,7 @@ Source: [HaGeZi DNS servers](https://github.com/hagezi/dns-servers).
 
 ### Sequential failover
 
-The custom `sequential_forward` plugin tries one upstream at a time. The next upstream is contacted when the previous exchange fails, times out, or returns `SERVFAIL`. Each attempt gets an equal share of the time left before the `SERVER_TIMEOUT` deadline (the last upstream keeps the remainder), and the Docker build patches MosDNS v4.5.3's DoH client so those per-attempt contexts actually cancel the underlying HTTP request instead of leaving an orphaned 5-second exchange behind. A successful DNS response, including `NXDOMAIN`, is returned immediately; `NXDOMAIN` is intentionally preserved because HaGeZi may use it as a policy/blocking answer.
+The custom `sequential_forward` plugin tries one upstream at a time. The next upstream is contacted when the previous exchange fails, times out, or returns `SERVFAIL`. The three normal HaGeZi attempts split the time left before the `SERVER_TIMEOUT` deadline, while an independent emergency fallback is reserved a small final budget. The Docker build patches MosDNS v4.5.3's DoH client so those per-attempt contexts actually cancel the underlying HTTP request instead of leaving an orphaned 5-second exchange behind. A successful DNS response, including `NXDOMAIN`, is returned immediately; `NXDOMAIN` is intentionally preserved because HaGeZi may use it as a policy/blocking answer.
 
 The sequential forwarder also has a small in-memory circuit breaker: two consecutive failures temporarily cool an upstream for 15 seconds. If all three are cooling down at once, the next query still tries the full configured set, so the breaker cannot create a total outage. This reduces repeated connection timeouts and CPU/network waste when one upstream is unreachable, while keeping the configured failover order intact.
 
@@ -101,7 +101,7 @@ The repository is intentionally DoH-only and does not expose a raw DNS UDP/TCP l
 
 ## Environment variables
 
-The image has working defaults (defined once, in `content/entrypoint.sh`); no environment variable is required for the default deployment. The public proxy is the externally reachable rate limiter; MosDNS is kept behind its loopback listener and does not duplicate that per-client limiter. The build also patches the v4.5.3 DoH client context boundary so request cancellation reaches the underlying transport during sequential failover.
+The image has working defaults (defined once, in `content/entrypoint.sh`); no environment variable is required for the default deployment. The public proxy is the externally reachable rate limiter; MosDNS is kept behind its loopback listener and does not duplicate that per-client limiter. The build also patches the v4.5.3 DoH client context boundary so request cancellation reaches the underlying transport during sequential failover. The three normal HaGeZi candidates remain the policy path; after all three fail by timeout/transport error/SERVFAIL, an independent Cloudflare DoH endpoint is available as a last-resort fallback. NXDOMAIN is still treated as a valid policy answer and is never bypassed by that fallback.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -113,6 +113,8 @@ The image has working defaults (defined once, in `content/entrypoint.sh`); no en
 | `UPSTREAM_0_IP` | `188.34.161.210` | Built-in `root.hagezi.org` dial pin. |
 | `UPSTREAM_1_IP` | `159.69.155.94` | Built-in `wurzn.hagezi.org` dial pin. |
 | `UPSTREAM_2_IP` | `95.217.163.17` | Built-in `juuri.hagezi.org` dial pin. |
+| `EMERGENCY_UPSTREAM` | `https://cloudflare-dns.com/dns-query` | Independent last-resort DoH fallback; not included in health ordering. |
+| `EMERGENCY_UPSTREAM_IP` | `1.1.1.1` | Cloudflare DoH dial pin for the last-resort fallback. |
 | `CACHE_SIZE` | `32768` | Maximum cache entries in RAM and warm snapshot. |
 | `CACHE_DUMP_FILE` | `/var/cache/mosdns/cache.dump` | Warm-cache snapshot path. |
 | `CACHE_DUMP_INTERVAL` | `3300` | Warm-cache snapshot interval, seconds. |
@@ -183,7 +185,7 @@ The configuration is intentionally small for a low-CPU instance:
 - one MosDNS process, one small proxy process, and one health-probe helper invoked when checks run;
 - bounded RAM cache, an 8 KiB-per-entry warm snapshot, and bounded public request/connection state.
 
-For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume. The default DoH profile is intentionally more tolerant of normal client bursts than a strict anti-abuse profile to reduce false-positive throttling on browser DNS startup bursts. Browser errors caused by intentionally blocked HaGeZi domains can still appear as `NXDOMAIN`/`ERR_NAME_NOT_RESOLVED`; the service cannot turn a policy `NXDOMAIN` into a valid address without bypassing the selected blocklist. The reliability changes target transient upstream `SERVFAIL`/transport failures and stalled upstream connections.
+For a small instance, `CACHE_SIZE` and the rate limits should be changed only after observing actual memory, CPU, latency, and query volume. The default DoH profile is intentionally more tolerant of normal client bursts than a strict anti-abuse profile to reduce false-positive throttling on browser DNS startup bursts. Browser errors caused by intentionally blocked HaGeZi domains can still appear as `NXDOMAIN`/`ERR_NAME_NOT_RESOLVED`; the service cannot turn a policy `NXDOMAIN` into a valid address without bypassing the selected blocklist. The reliability changes target transient upstream `SERVFAIL`/transport failures and stalled upstream connections. The emergency fallback is deliberately last-resort so normal HaGeZi filtering remains unchanged.
 
 Rough memory budget on the 512 MB instance (soft Go heap targets, not hard caps): MosDNS `GOMEMLIMIT=288MiB` (about 40 MB baseline plus the cache), proxy `80MiB` (normally 10-20 MB), and a short-lived probe helper at `32MiB`. Doubling `CACHE_SIZE` roughly doubles the cache share of MosDNS memory; keep the total comfortably below the container limit. The service-wide `GLOBAL_RATE_LIMIT` is the main CPU protection: raise it only if CPU stays well below the 0.25 vCPU quota under real traffic.
 
