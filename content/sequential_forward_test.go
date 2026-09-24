@@ -87,6 +87,10 @@ func (s *scriptedUpstream) ExchangeContext(ctx context.Context, _ *dns.Msg) (*dn
 	return s.response, nil
 }
 
+func (s *scriptedUpstream) CloseIdleConnections() {}
+
+func (s *scriptedUpstream) Close() error { return nil }
+
 func (s *scriptedUpstream) Calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -189,7 +189,10 @@ func TestReverseProxyRejectsTruncatedUnknownLengthDoHResponse(t *testing.T) {
 	proxy := newTestDoHProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		flusher := w.(http.Flusher)
-		_, _ = w.Write(body[:len(body)-1])
+		// Remove enough of the DNS wire message to make the truncated body
+		// unambiguously invalid; miekg/dns can legally parse some one-byte
+		// truncations because DNS name encoding has variable-length fields.
+		_, _ = w.Write(body[:4])
 		flusher.Flush()
 	}))
 
