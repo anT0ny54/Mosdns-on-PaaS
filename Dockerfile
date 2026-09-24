@@ -32,8 +32,10 @@ RUN go mod download
 # change cannot silently invalidate the patch.
 RUN test "$(grep -Fc 'ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
  && test "$(grep -Fc 'r, err := u.exchange(ctx, utils.BytesToStringUnsafe(urlBuf))' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
+ && test "$(grep -Fc 'We overwrite the ctx with a fixed timout context here.' /src/pkg/upstream/doh/upstream.go)" -eq 1 \
  && awk ' \
       index($0, "ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)") > 0 { \
+        print "\t\t// Keep a hard timeout while inheriting the caller cancellation."; \
         print "\t\texchangeCtx := ctx"; \
         print "\t\tcancel := func() {}"; \
         print "\t\tif deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > defaultDoHTimeout {"; \
@@ -54,10 +56,47 @@ RUN test "$(grep -Fc 'ctx, cancel := context.WithTimeout(context.Background(), d
 
 # Keep the warm-start disk cache feature without maintaining a fork.
 COPY content/warm_backend.go /src/plugin/executable/cache/warm_backend.go
-RUN awk '1; /WhenHit[[:space:]]*string[[:space:]]*`yaml:"when_hit"`/ {print "\tDumpFile          string `yaml:\"dump_file\"`"; print "\tDumpInterval      int    `yaml:\"dump_interval\"`"}' /src/plugin/executable/cache/cache.go > /src/plugin/executable/cache/cache.go.tmp \
+COPY content/warm_backend_test.go /src/plugin/executable/cache/warm_backend_test.go
+RUN test "$(grep -Fc 'CompressResp      bool   `yaml:"compress_resp"`' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && awk ' \
+      /CompressResp[[:space:]]+bool[[:space:]]+`yaml:"compress_resp"`/ { \
+        print; \
+        print "\tMaxEntryBytes    int    `yaml:\"max_entry_bytes\"`"; \
+        next; \
+      } \
+      { print }' /src/plugin/executable/cache/cache.go > /src/plugin/executable/cache/cache.go.tmp \
  && mv /src/plugin/executable/cache/cache.go.tmp /src/plugin/executable/cache/cache.go \
- && test "$(grep -Ec '^[[:space:]]*DumpFile[[:space:]]+string[[:space:]]+`yaml:"dump_file"`[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
- && test "$(grep -Ec '^[[:space:]]*DumpInterval[[:space:]]+int[[:space:]]+`yaml:"dump_interval"`[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && test "$(grep -Ec '^[[:space:]]*MaxEntryBytes[[:space:]]+int[[:space:]]+`yaml:"max_entry_bytes"`[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && test "$(grep -Fc 'v, err := r.Pack()' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && awk ' \
+      /v, err := r.Pack\(\)/ { \
+        print; \
+        after_pack = 1; \
+        next; \
+      } \
+      after_pack && /^[[:space:]]*if err != nil[[:space:]]*\{/ { \
+        print; \
+        in_pack_error = 1; \
+        next; \
+      } \
+      in_pack_error && /^[[:space:]]*\}/ { \
+        print; \
+        print "\tif c.args.MaxEntryBytes > 0 && len(v) > c.args.MaxEntryBytes {"; \
+        print "\t\treturn nil"; \
+        print "\t}"; \
+        in_pack_error = 0; \
+        after_pack = 0; \
+        next; \
+      } \
+      { print }' /src/plugin/executable/cache/cache.go > /src/plugin/executable/cache/cache.go.tmp \
+ && mv /src/plugin/executable/cache/cache.go.tmp /src/plugin/executable/cache/cache.go \
+ && test "$(grep -Fc 'if c.args.MaxEntryBytes > 0 && len(v) > c.args.MaxEntryBytes {' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && awk ' \
+      /v, err := r.Pack\(\)/ { pack = NR; next } \
+      pack && err_start == 0 && /^[[:space:]]*if err != nil[[:space:]]*\{/ { err_start = NR; next } \
+      err_start > 0 && err_end == 0 && /^[[:space:]]*\}/ { err_end = NR; next } \
+      err_end > 0 && limit_line == 0 && /if c.args.MaxEntryBytes > 0 && len\(v\) > c.args.MaxEntryBytes/ { limit_line = NR } \
+      END { exit !(pack > 0 && err_start > pack && err_end > err_start && limit_line > err_end) }' /src/plugin/executable/cache/cache.go \
  && test "$(grep -Ec '^[[:space:]]*c = mem_cache.NewMemCache\(args.Size, 0\)[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && sed -i 's|c = mem_cache.NewMemCache(args.Size, 0)|c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())|' /src/plugin/executable/cache/cache.go \
  && test "$(grep -Ec '^[[:space:]]*c = newWarmBackend\(mem_cache.NewMemCache\(args.Size, 0\), args.DumpFile, args.DumpInterval, args.Size, bp.L\(\)\)[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
@@ -74,7 +113,7 @@ COPY content/upstream_probe_test.go /src/probe/main_test.go
 COPY content/sequential_forward.go /src/plugin/executable/fast_forward/sequential_forward.go
 COPY content/sequential_forward_test.go /src/plugin/executable/fast_forward/sequential_forward_test.go
 
-RUN go test ./plugin/executable/fast_forward ./probe ./proxy \
+RUN go test ./plugin/executable/cache ./plugin/executable/fast_forward ./probe ./proxy \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns . \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/mosdns-probe ./probe \
  && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/ip-conn-proxy ./proxy \
