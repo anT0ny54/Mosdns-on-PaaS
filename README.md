@@ -144,7 +144,7 @@ The image has working defaults (defined once, in `content/entrypoint.sh`); no en
 | `HEALTH_RATE_BURST` | `4` | Per-client health burst allowance. |
 | `GLOBAL_HEALTH_RATE_LIMIT` | `10` | Aggregate health request rate, requests/second. |
 | `GLOBAL_HEALTH_RATE_BURST` | `20` | Aggregate health burst allowance. |
-| `GLOBAL_CONN_LIMIT` | `256` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. |
+| `GLOBAL_CONN_LIMIT` | `256` | Maximum concurrent public TCP connections; rejected sockets are closed at accept time. The per-source connection-accounting table is sized to at least this value (up to its own 65535 hard cap) independently of `DOH_RATE_MAX_IPS`, so raising this above `DOH_RATE_MAX_IPS` cannot cause spurious "too many connections" rejections. |
 | `IP_CONN_LIMIT` | `32` | Per-client concurrent connection limit; `0` disables it. The higher ceiling tolerates browser connection churn and parallel DNS activity without making the per-IP guard unbounded. The first relevant request binds the connection to its client IP. |
 | `DOH_MAX_BODY_BYTES` | `4096` | Maximum DoH POST body / GET `dns` parameter size; capped at 65535 bytes. |
 | `HEALTH_CHECK` | `true` | Enables startup and runtime upstream probing. |
