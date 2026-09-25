@@ -10,6 +10,15 @@ import (
 
 const (
 	maxSourceStateHardCap = 4096
+	// The connection table is sized off GLOBAL_CONN_LIMIT (validated up to 65535 by
+	// entrypoint.sh), not off the rate-state hard cap above: GLOBAL_CONN_LIMIT and
+	// DOH_RATE_MAX_IPS are independent knobs, and DOH_RATE_MAX_IPS can be
+	// configured lower than GLOBAL_CONN_LIMIT. Reusing maxSourceStateHardCap here
+	// would silently start rejecting connections with "too many connections" once
+	// more than 4096 distinct source IPs hold a slot, even though the configured
+	// global limit allows more. connEntry is small (~40 bytes), so the worst case
+	// (65535 entries, ~2.6 MiB) is negligible against the 512 MiB budget.
+	maxConnStateHardCap = 65535
 	// 32 shards keep the fixed tables bounded while reducing per-request linear scans
 	// on the 4096-source default without materially increasing memory usage.
 	guardShardCount = 32
@@ -84,8 +93,8 @@ func newConnTable(maxPeers, perConn int) *connTable {
 	if maxPeers < 1 {
 		maxPeers = 1
 	}
-	if maxPeers > maxSourceStateHardCap {
-		maxPeers = maxSourceStateHardCap
+	if maxPeers > maxConnStateHardCap {
+		maxPeers = maxConnStateHardCap
 	}
 	activeShards := guardShardCount
 	if maxPeers < activeShards {
@@ -295,10 +304,25 @@ type publicGuard struct {
 }
 
 func newPublicGuard(globalConnLimit, sourceStateLimit, perSourceConn int, dohRate, dohBurst, globalRate, globalBurst, healthRate, healthBurst, globalHealthRate, globalHealthBurst float64) *publicGuard {
+	// The connection table must hold at least one entry per source IP that can
+	// simultaneously occupy a global connection slot, and every entry also
+	// serves as active per-IP accounting: size it from whichever of
+	// GLOBAL_CONN_LIMIT and DOH_RATE_MAX_IPS is larger, so raising
+	// GLOBAL_CONN_LIMIT beyond DOH_RATE_MAX_IPS's default/configured value can
+	// never starve legitimate connections once the fixed table fills up.
+	// globalConnLimit <= 0 means "unlimited" (see acquireGlobalConn), so size
+	// for the same hard cap newConnTable itself enforces.
+	connStateLimit := sourceStateLimit
+	switch {
+	case globalConnLimit <= 0:
+		connStateLimit = maxConnStateHardCap
+	case globalConnLimit > connStateLimit:
+		connStateLimit = globalConnLimit
+	}
 	return &publicGuard{
 		globalConnLimit: int64(globalConnLimit),
 		sources:         newSourceTable(sourceStateLimit),
-		connections:     newConnTable(sourceStateLimit, perSourceConn),
+		connections:     newConnTable(connStateLimit, perSourceConn),
 		globalDoH:       newTokenBucket(globalRate, globalBurst),
 		globalHealth:    newTokenBucket(globalHealthRate, globalHealthBurst),
 		dohRate:         dohRate,
