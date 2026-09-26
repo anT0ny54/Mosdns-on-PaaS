@@ -3,14 +3,16 @@ log:
 
 # Public DoH only. No UDP/TCP DNS listener is exposed.
 plugins:
-  # Larger bounded hot cache plus bounded disk-backed warm-start copy.
+  # Bounded hot cache plus bounded disk-backed warm-start copy. Keep the cache
+  # key focused on simple DNS questions; full-request keys can fragment a public
+  # cache when clients send padding/Cookie/other EDNS options.
   - tag: mem_cache
     type: cache
     args:
       size: __CACHE_SIZE__
       lazy_cache_ttl: 43200
       lazy_cache_reply_ttl: 20
-      cache_everything: true
+      cache_everything: false
       max_entry_bytes: __CACHE_MAX_ENTRY_BYTES__
       dump_file: __CACHE_DUMP_FILE__
       dump_interval: __CACHE_DUMP_INTERVAL__

@@ -15,7 +15,7 @@ import (
 func newWarmTestBackend(t *testing.T, path string, maxEntries int) *warmBackend {
 	t.Helper()
 	inner := mem_cache.NewMemCache(maxEntries, 0)
-	return newWarmBackend(inner, path, 0, maxEntries, nil).(*warmBackend)
+	return newWarmBackend(inner, path, 0, maxEntries, maxWarmEntryBytes, nil).(*warmBackend)
 }
 
 func TestWarmBackendKeepsOversizedEntryServiceableWithoutWarmCopy(t *testing.T) {

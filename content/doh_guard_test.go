@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -36,13 +40,8 @@ func (l *stagedListener) Accept() (net.Conn, error) {
 	return c, nil
 }
 
-func (l *stagedListener) Close() error {
-	return nil
-}
-
-func (l *stagedListener) Addr() net.Addr {
-	return stagedAddr("test")
-}
+func (l *stagedListener) Close() error   { return nil }
+func (l *stagedListener) Addr() net.Addr { return stagedAddr("test") }
 
 type stagedAddr string
 
@@ -58,90 +57,45 @@ func mustAddr(t *testing.T, s string) netip.Addr {
 	return ip
 }
 
-func TestSourceStateHardCap(t *testing.T) {
-	tbl := newSourceTable(maxSourceStateHardCap + 128)
-	if got := sourceSlotCount(tbl); got != maxSourceStateHardCap {
-		t.Fatalf("source table allocated %d slots, want hard cap %d", got, maxSourceStateHardCap)
-	}
-}
-
-// allowIP exercises the production key path (rateKey + allowRateKey).
-func allowIP(tbl *sourceTable, ip netip.Addr, now time.Time, rate, burst float64) bool {
-	return tbl.allowRateKey(rateKey(ip), now, rate, burst, false)
-}
-
-func sourceSlotCount(tbl *sourceTable) int {
+func connSlotCount(g *publicGuard) int {
 	total := 0
-	for i := range tbl.shards {
-		total += len(tbl.shards[i].entries)
+	for i := range g.connections.shards {
+		total += len(g.connections.shards[i].entries)
 	}
 	return total
 }
 
-func TestBoundedSourceState(t *testing.T) {
-	tbl := newSourceTable(16)
-	now := time.Unix(0, 1)
-	for i := 1; i <= 200; i++ {
-		ip := mustAddr(t, "192.0.2."+strconv.Itoa(i%250+1))
-		_ = allowIP(tbl, ip, now.Add(time.Duration(i)*time.Millisecond), 100, 100)
+func connCount(g *publicGuard, ip netip.Addr) int {
+	ip = ip.Unmap()
+	sh := g.connections.shardFor(ip)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := findConnLocked(sh, ip); e != nil {
+		return e.connections
 	}
-	for i := range tbl.shards {
-		sh := &tbl.shards[i]
-		if len(sh.entries) > 2 {
-			t.Fatalf("shard retained %d slots, want <=2", len(sh.entries))
-		}
+	return 0
+}
+
+func TestConnectionStateHasBoundedSpareSlots(t *testing.T) {
+	g := newPublicGuard(128, 16)
+	if got := connSlotCount(g); got != 256 {
+		t.Fatalf("connection table allocated %d slots, want 256", got)
 	}
 }
 
-func TestSourceTokenBucket(t *testing.T) {
-	tbl := newSourceTable(8)
-	ip := mustAddr(t, "203.0.113.7")
-	base := time.Unix(100, 0)
-	for i := 0; i < 3; i++ {
-		if !allowIP(tbl, ip, base, 2, 3) {
-			t.Fatalf("initial burst request %d denied", i+1)
-		}
+func TestConnectionStateHardCap(t *testing.T) {
+	g := newPublicGuard(maxConnStateHardCap+128, 16)
+	if got := connSlotCount(g); got != maxConnStateHardCap {
+		t.Fatalf("connection table allocated %d slots, want hard cap %d", got, maxConnStateHardCap)
 	}
-	if allowIP(tbl, ip, base, 2, 3) {
-		t.Fatal("request beyond burst unexpectedly allowed")
-	}
-	if !allowIP(tbl, ip, base.Add(500*time.Millisecond), 2, 3) {
-		t.Fatal("one token should have refilled after 500ms")
-	}
-}
-
-func TestInvalidSourceFailsClosedWhenRateLimited(t *testing.T) {
-	tbl := newSourceTable(8)
-	if allowIP(tbl, netip.Addr{}, time.Unix(100, 0), 5, 12) {
-		t.Fatal("invalid source must not bypass a configured per-source rate limit")
-	}
-}
-
-func TestInvalidSourceFailsClosedWhenRateLimitDisabled(t *testing.T) {
-	tbl := newSourceTable(8)
-	if tbl.allowRateKey(netip.Addr{}, time.Unix(100, 0), 0, 12, false) {
-		t.Fatal("invalid source must be rejected even when per-source rate limiting is disabled")
-	}
-}
-
-func TestPerSourceRejectDoesNotConsumeGlobalRate(t *testing.T) {
-	g := newPublicGuard(8, 8, 0, 1, 1, 1, 2, 1, 1, 1, 1)
-	base := time.Unix(200, 0)
-	a := mustAddr(t, "203.0.113.10")
-	b := mustAddr(t, "203.0.113.11")
-	if !g.allowDoH(a, base) {
-		t.Fatal("first source request should be allowed")
-	}
-	if g.allowDoH(a, base) {
-		t.Fatal("second request from source A should be rejected by its own bucket")
-	}
-	if !g.allowDoH(b, base) {
-		t.Fatal("source B should still consume the second global token")
+	g = newPublicGuard(maxConnStateHardCap/2+1, 16)
+	if got := connSlotCount(g); got != maxConnStateHardCap {
+		t.Fatalf("2x connection table must stop at hard cap, got %d", got)
 	}
 }
 
 func TestGlobalConnectionLimitIsAtomic(t *testing.T) {
-	g := newPublicGuard(2, 8, 0, 5, 12, 40, 80, 2, 4, 10, 20)
+	g := newPublicGuard(2, 0)
 	if !g.acquireGlobalConn() || !g.acquireGlobalConn() {
 		t.Fatal("first two global slots must be accepted")
 	}
@@ -152,24 +106,28 @@ func TestGlobalConnectionLimitIsAtomic(t *testing.T) {
 	if !g.acquireGlobalConn() {
 		t.Fatal("released global slot must be reusable")
 	}
+	g.releaseGlobalConn()
+	g.releaseGlobalConn()
+	if got := atomic.LoadInt64(&g.globalConn); got != 0 {
+		t.Fatalf("global connection count = %d, want 0", got)
+	}
 }
 
-func TestPerSourceConnectionRejectsInvalidSourceWhenLimitDisabled(t *testing.T) {
-	g := newPublicGuard(8, 8, 0, 0, 1, 0, 1, 0, 1, 0, 1)
+func TestPerSourceConnectionRejectsInvalidSource(t *testing.T) {
+	g := newPublicGuard(8, 0)
 	if g.connections.acquireConn(netip.Addr{}) {
-		t.Fatal("invalid source must not be accepted as an unlimited per-source connection")
+		t.Fatal("invalid source must never be accepted")
 	}
 }
 
 func TestPerSourceConnectionCanonicalizesIPv4MappedAddress(t *testing.T) {
-	g := newPublicGuard(8, 8, 1, 1, 1, 100, 100, 1, 1, 10, 10)
+	g := newPublicGuard(8, 1)
 	v4 := mustAddr(t, "192.0.2.25")
 	mapped := mustAddr(t, "::ffff:192.0.2.25")
 
 	if g.connections.shardFor(mapped) != g.connections.shardFor(v4) {
-		t.Fatal("IPv4 and IPv4-mapped forms must select the same canonical connection shard")
+		t.Fatal("IPv4 and IPv4-mapped forms must select the same connection shard")
 	}
-
 	if !g.connections.acquireConn(mapped) {
 		t.Fatal("IPv4-mapped source should acquire the per-source slot")
 	}
@@ -186,8 +144,9 @@ func TestPerSourceConnectionCanonicalizesIPv4MappedAddress(t *testing.T) {
 		t.Fatalf("canonical source connection count = %d, want 0", got)
 	}
 }
+
 func TestPerSourceConnectionLimit(t *testing.T) {
-	g := newPublicGuard(8, 8, 2, 5, 12, 40, 80, 2, 4, 10, 20)
+	g := newPublicGuard(8, 2)
 	ip := mustAddr(t, "198.51.100.9")
 	if !g.connections.acquireConn(ip) || !g.connections.acquireConn(ip) {
 		t.Fatal("first two per-source connections must be accepted")
@@ -198,6 +157,242 @@ func TestPerSourceConnectionLimit(t *testing.T) {
 	g.connections.releaseConn(ip)
 	if !g.connections.acquireConn(ip) {
 		t.Fatal("released per-source connection must be reusable")
+	}
+	g.connections.releaseConn(ip)
+	g.connections.releaseConn(ip)
+}
+
+func TestPerSourceConnectionLimitSupports64ConcurrentConnections(t *testing.T) {
+	const (
+		limit = 64
+		extra = 1
+	)
+	g := newPublicGuard(128, limit)
+	ip := mustAddr(t, "198.51.100.64")
+
+	start := make(chan struct{})
+	results := make(chan bool, limit+extra)
+	var ready sync.WaitGroup
+	ready.Add(limit + extra)
+	for i := 0; i < limit+extra; i++ {
+		go func() {
+			ready.Done()
+			<-start
+			results <- g.connections.acquireConn(ip)
+		}()
+	}
+	ready.Wait()
+	close(start)
+
+	accepted := 0
+	for i := 0; i < limit+extra; i++ {
+		if <-results {
+			accepted++
+		}
+	}
+	if accepted != limit {
+		t.Fatalf("concurrent per-source accepts = %d, want exactly %d", accepted, limit)
+	}
+	if got := connCount(g, ip); got != limit {
+		t.Fatalf("source connection count = %d, want %d", got, limit)
+	}
+
+	for i := 0; i < limit; i++ {
+		g.connections.releaseConn(ip)
+	}
+	if got := connCount(g, ip); got != 0 {
+		t.Fatalf("source connection count after release = %d, want 0", got)
+	}
+}
+
+func TestGlobalConnectionCeilingSupports128ConnectionsAcrossMultipleSources(t *testing.T) {
+	const (
+		globalLimit = 128
+		sourceLimit = 64
+		sources     = 4
+	)
+	g := newPublicGuard(globalLimit, sourceLimit)
+	ips := make([]netip.Addr, sources)
+	for i := range ips {
+		ips[i] = mustAddr(t, "198.51.100."+strconv.Itoa(10+i))
+	}
+
+	start := make(chan struct{})
+	results := make(chan bool, globalLimit)
+	var ready sync.WaitGroup
+	ready.Add(globalLimit)
+	for i := 0; i < globalLimit; i++ {
+		ip := ips[i%len(ips)]
+		go func(ip netip.Addr) {
+			ready.Done()
+			<-start
+			if !g.acquireGlobalConn() {
+				results <- false
+				return
+			}
+			if !g.connections.acquireConn(ip) {
+				g.releaseGlobalConn()
+				results <- false
+				return
+			}
+			results <- true
+		}(ip)
+	}
+	ready.Wait()
+	close(start)
+
+	accepted := 0
+	for i := 0; i < globalLimit; i++ {
+		if <-results {
+			accepted++
+		}
+	}
+	if accepted != globalLimit {
+		t.Fatalf("concurrent global accepts = %d, want exactly %d", accepted, globalLimit)
+	}
+	if got := atomic.LoadInt64(&g.globalConn); got != globalLimit {
+		t.Fatalf("global connection count = %d, want %d", got, globalLimit)
+	}
+	for i, ip := range ips {
+		if got := connCount(g, ip); got != globalLimit/sources {
+			t.Fatalf("source %d connection count = %d, want %d", i, got, globalLimit/sources)
+		}
+	}
+	if g.acquireGlobalConn() {
+		t.Fatal("129th global connection must be rejected while 128 are active")
+	}
+
+	for _, ip := range ips {
+		for i := 0; i < globalLimit/sources; i++ {
+			g.connections.releaseConn(ip)
+			g.releaseGlobalConn()
+		}
+	}
+	if got := atomic.LoadInt64(&g.globalConn); got != 0 {
+		t.Fatalf("global connection count after release = %d, want 0", got)
+	}
+}
+
+func TestKeepAliveReusesOneGuardedConnectionForRepeatedDoHRequests(t *testing.T) {
+	const requests = 100
+	const dohBody = "\x00\x07\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+	g := newPublicGuard(128, 64)
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() failed: %v", err)
+	}
+	listener := &guardedListener{Listener: raw, guard: g}
+
+	var mu sync.Mutex
+	var firstConn *guardedConn
+	var handlerErr error
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state, ok := r.Context().Value(connGuardKey{}).(*guardedConn)
+		if !ok || state == nil {
+			mu.Lock()
+			handlerErr = errors.New("missing guarded connection in request context")
+			mu.Unlock()
+			http.Error(w, "guard missing", http.StatusInternalServerError)
+			return
+		}
+		ip := clientIPAddr(r)
+		if !state.bindSource(ip) {
+			mu.Lock()
+			handlerErr = errors.New("keep-alive request lost its per-source connection slot")
+			mu.Unlock()
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
+		}
+		mu.Lock()
+		if firstConn == nil {
+			firstConn = state
+		} else if firstConn != state && handlerErr == nil {
+			handlerErr = errors.New("repeated keep-alive requests used different guarded connections")
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte(dohBody))
+	})
+
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: time.Second,
+		ReadTimeout:       2 * time.Second,
+		WriteTimeout:      2 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if gc, ok := c.(*guardedConn); ok {
+				return context.WithValue(ctx, connGuardKey{}, gc)
+			}
+			return ctx
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(listener) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		select {
+		case err := <-done:
+			if !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("Server.Serve() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("server did not stop after Close()")
+		}
+	})
+
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DisableCompression:    true,
+		DisableKeepAlives:     false,
+		MaxIdleConns:          1,
+		MaxIdleConnsPerHost:   1,
+		MaxConnsPerHost:       1,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 2 * time.Second,
+	}
+	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
+	defer transport.CloseIdleConnections()
+	body := []byte(dohBody)
+
+	for i := 0; i < requests; i++ {
+		req, err := http.NewRequest(http.MethodPost, "http://"+raw.Addr().String()+"/dns-query", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("NewRequest() failed: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/dns-message")
+		req.Header.Set("X-Forwarded-For", "198.51.100.200")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("keep-alive DoH request %d failed: %v", i+1, err)
+		}
+		got, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("reading DoH response %d failed: %v", i+1, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("DoH response %d status = %d, want 200", i+1, resp.StatusCode)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("DoH response %d body changed", i+1)
+		}
+		if got := atomic.LoadInt64(&g.globalConn); got != 1 {
+			t.Fatalf("global connection count after request %d = %d, want 1", i+1, got)
+		}
+		if got := connCount(g, mustAddr(t, "198.51.100.200")); got != 1 {
+			t.Fatalf("source connection count after request %d = %d, want 1", i+1, got)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if handlerErr != nil {
+		t.Fatal(handlerErr)
+	}
+	if firstConn == nil {
+		t.Fatal("no guarded connection observed")
 	}
 }
 
@@ -223,7 +418,7 @@ func TestClientIPAddrUnmapsIPv4MappedAddress(t *testing.T) {
 }
 
 func TestGuardedListenerClosesOverCapImmediately(t *testing.T) {
-	g := newPublicGuard(1, 8, 0, 1, 1, 1, 1, 1, 1, 1, 1)
+	g := newPublicGuard(1, 0)
 	if !g.acquireGlobalConn() {
 		t.Fatal("failed to occupy the only global slot")
 	}
@@ -261,52 +456,20 @@ func TestGuardedListenerClosesOverCapImmediately(t *testing.T) {
 		if r.c == nil {
 			t.Fatal("guardedListener.Accept() returned nil connection")
 		}
-		if got := g.globalCount(); got != 1 {
+		if got := atomic.LoadInt64(&g.globalConn); got != 1 {
 			t.Fatalf("global connection count = %d, want 1 for admitted socket", got)
 		}
 		_ = r.c.Close()
 	case <-time.After(time.Second):
 		t.Fatal("admitted connection was not returned")
 	}
-	if got := g.globalCount(); got != 0 {
+	if got := atomic.LoadInt64(&g.globalConn); got != 0 {
 		t.Fatalf("global connection count after close = %d, want 0", got)
 	}
 }
 
-func (g *publicGuard) globalCount() int64 {
-	return atomic.LoadInt64(&g.globalConn)
-}
-
-func TestSourceRateBucketsArePerIP(t *testing.T) {
-	g := newPublicGuard(8, 32, 0, 1, 1, 100, 100, 1, 1, 10, 10)
-	now := time.Unix(300, 0)
-	ip := mustAddr(t, "192.0.2.44")
-	otherIP := mustAddr(t, "192.0.2.45")
-
-	if !g.allowDoH(ip, now) {
-		t.Fatal("first request should be admitted")
-	}
-	if g.allowDoH(ip, now) {
-		t.Fatal("same source IP must share one rate bucket regardless of Host")
-	}
-	if !g.allowDoH(otherIP, now) {
-		t.Fatal("different source IP should have an independent bucket")
-	}
-}
-
-func connCount(g *publicGuard, ip netip.Addr) int {
-	ip = ip.Unmap()
-	sh := g.connections.shardFor(ip)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if e := findConnLocked(sh, ip); e != nil {
-		return e.connections
-	}
-	return 0
-}
-
 func TestGuardedConnRebindsSharedEdgeConnection(t *testing.T) {
-	g := newPublicGuard(8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+	g := newPublicGuard(8, 1)
 	server, client := net.Pipe()
 	defer client.Close()
 	c := &guardedConn{Conn: server, guard: g}
@@ -321,7 +484,6 @@ func TestGuardedConnRebindsSharedEdgeConnection(t *testing.T) {
 	if got := connCount(g, a); got != 1 {
 		t.Fatalf("source A connection count = %d, want 1", got)
 	}
-	// A pooled edge connection may carry another client next: the slot moves.
 	if !c.bindSource(b) {
 		t.Fatal("shared connection was rejected when its client changed")
 	}
@@ -338,13 +500,10 @@ func TestGuardedConnRebindsSharedEdgeConnection(t *testing.T) {
 	if c.bindSource(a) {
 		t.Fatal("a closed connection must not take a new slot")
 	}
-	if got := connCount(g, a); got != 0 {
-		t.Fatalf("source A connection count after post-close bind = %d, want 0", got)
-	}
 }
 
 func TestGuardedConnRebindRespectsPerSourceLimit(t *testing.T) {
-	g := newPublicGuard(8, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+	g := newPublicGuard(8, 1)
 	s1, c1 := net.Pipe()
 	s2, c2 := net.Pipe()
 	defer c1.Close()
@@ -367,52 +526,4 @@ func TestGuardedConnRebindRespectsPerSourceLimit(t *testing.T) {
 	}
 	_ = conn1.Close()
 	_ = conn2.Close()
-}
-
-func TestRateStateCapacityIsIndependentFromConnectionState(t *testing.T) {
-	g := newPublicGuard(8, maxSourceStateHardCap, 16, 1000, 1000, 1000, 1000, 1, 1, 10, 10)
-	ip := mustAddr(t, "192.0.2.1")
-	if !g.connections.acquireConn(ip) {
-		t.Fatal("failed to allocate active per-IP connection state")
-	}
-
-	// The source-rate table is independently preallocated to the hard cap. The
-	// connection table may also hold the active client, but it must not consume
-	// any of the rate-state slots.
-	if got := sourceSlotCount(g.sources); got != maxSourceStateHardCap {
-		t.Fatalf("rate table slots = %d, want %d", got, maxSourceStateHardCap)
-	}
-	if g.sources.activeShards != guardShardCount {
-		t.Fatalf("rate table active shards = %d, want %d", g.sources.activeShards, guardShardCount)
-	}
-	connSlots := 0
-	for i := range g.connections.shards {
-		connSlots += len(g.connections.shards[i].entries)
-	}
-	if connSlots != maxSourceStateHardCap {
-		t.Fatalf("connection table slots = %d, want %d", connSlots, maxSourceStateHardCap)
-	}
-
-	now := time.Unix(400, 0)
-	for i := 0; i < maxSourceStateHardCap; i++ {
-		ip := mustAddr(t, "198.18."+strconv.Itoa(i/256)+"."+strconv.Itoa(i%256))
-		if !g.sources.allowRateKey(rateKey(ip), now, 1000, 1000, false) {
-			t.Fatalf("rate bucket %d was rejected", i)
-		}
-	}
-
-	rateBuckets := 0
-	for i := range g.sources.shards {
-		sh := &g.sources.shards[i]
-		sh.mu.Lock()
-		for _, e := range sh.entries {
-			if e.key.IsValid() {
-				rateBuckets++
-			}
-		}
-		sh.mu.Unlock()
-	}
-	if rateBuckets < maxSourceStateHardCap-16 {
-		t.Fatalf("rate buckets retained = %d, unexpectedly low for a full 4096-slot rate table", rateBuckets)
-	}
 }

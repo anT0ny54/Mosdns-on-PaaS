@@ -4,27 +4,18 @@ umask 077
 
 : "${PORT:=8080}"
 : "${MOSDNS_BACKEND_PORT:=18080}"
-: "${IP_CONN_LIMIT:=32}"
-: "${DOH_RATE_LIMIT:=12}"
-: "${DOH_RATE_BURST:=200}"
-: "${DOH_RATE_MAX_IPS:=4096}"
-: "${GLOBAL_RATE_LIMIT:=80}"
-: "${GLOBAL_RATE_BURST:=200}"
-: "${HEALTH_RATE_LIMIT:=2}"
-: "${HEALTH_RATE_BURST:=4}"
-: "${GLOBAL_HEALTH_RATE_LIMIT:=10}"
-: "${GLOBAL_HEALTH_RATE_BURST:=20}"
-: "${GLOBAL_CONN_LIMIT:=256}"
+: "${IP_CONN_LIMIT:=64}"
+: "${GLOBAL_CONN_LIMIT:=128}"
 : "${DOH_MAX_BODY_BYTES:=4096}"
 : "${HEALTH_PATH:=/health}"
 : "${DOH_PATH:=/dns-query}"
 : "${CACHE_SIZE:=8192}"
-: "${CACHE_MAX_ENTRY_BYTES:=8192}"
+: "${CACHE_MAX_ENTRY_BYTES:=4096}"
 : "${CACHE_DUMP_FILE:=/var/cache/mosdns/cache.dump}"
 : "${CACHE_DUMP_INTERVAL:=3300}"
 : "${HAGEZI_UPSTREAM:=rotate}"
 : "${UPSTREAM_IDLE_TIMEOUT:=60}"
-: "${UPSTREAM_MAX_CONNS:=8}"
+: "${UPSTREAM_MAX_CONNS:=4}"
 : "${SERVER_TIMEOUT:=6}"
 : "${HEALTH_TIMEOUT_MS:=2000}"
 : "${HEALTH_BACKEND_TIMEOUT_MS:=1000}"
@@ -34,9 +25,9 @@ umask 077
 : "${HEALTH_SWITCH_MARGIN_PCT:=0.20}"
 : "${HEALTH_SWITCH_MARGIN_MS:=25}"
 : "${HEALTH_STATE_FILE:=/tmp/mosdns-upstream-state.tsv}"
-: "${HEALTH_INTERVAL:=60}"
+: "${HEALTH_INTERVAL:=300}"
 : "${HEALTH_FAILS_TO_SWITCH:=2}"
-: "${HEALTH_RESTART_COOLDOWN:=120}"
+: "${HEALTH_RESTART_COOLDOWN:=600}"
 : "${GOMEMLIMIT:=288MiB}"
 : "${GOMAXPROCS:=1}"
 : "${DOH_IDLE_TIMEOUT:=120}"
@@ -89,26 +80,12 @@ validate_float01() {
   }
 }
 
-validate_nonnegative_float() {
-  awk -v v="$2" 'BEGIN {
-    if (v !~ /^[+-]?(0|[0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
-    exit !(v >= 0 && v <= 1000000000)
-  }' 2>/dev/null || {
-    echo "Invalid $1: $2 (must be a number from 0 to 1000000000)" >&2
-    exit 1
-  }
-}
 
 validate_port PORT "$PORT"
 validate_port MOSDNS_BACKEND_PORT "$MOSDNS_BACKEND_PORT"
 [ "$PORT" -ge 1024 ] || { echo "Invalid PORT: $PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
 [ "$MOSDNS_BACKEND_PORT" -ge 1024 ] || { echo "Invalid MOSDNS_BACKEND_PORT: $MOSDNS_BACKEND_PORT (must be 1024-65535 for the non-root runtime user)" >&2; exit 1; }
 validate_uint_max IP_CONN_LIMIT "$IP_CONN_LIMIT" 65535
-validate_uint_max DOH_RATE_BURST "$DOH_RATE_BURST" 1000000
-validate_uint_max DOH_RATE_MAX_IPS "$DOH_RATE_MAX_IPS" 4096
-validate_uint_max GLOBAL_RATE_BURST "$GLOBAL_RATE_BURST" 1000000
-validate_uint_max HEALTH_RATE_BURST "$HEALTH_RATE_BURST" 1000000
-validate_uint_max GLOBAL_HEALTH_RATE_BURST "$GLOBAL_HEALTH_RATE_BURST" 1000000
 validate_uint_max GLOBAL_CONN_LIMIT "$GLOBAL_CONN_LIMIT" 65535
 validate_uint_max DOH_MAX_BODY_BYTES "$DOH_MAX_BODY_BYTES" 65535
 validate_uint_max CACHE_SIZE "$CACHE_SIZE" 8192
@@ -159,19 +136,9 @@ validate_ipv4 UPSTREAM_0_IP "$UPSTREAM_0_IP"
 validate_ipv4 UPSTREAM_1_IP "$UPSTREAM_1_IP"
 validate_ipv4 UPSTREAM_2_IP "$UPSTREAM_2_IP"
 
-validate_nonnegative_float DOH_RATE_LIMIT "$DOH_RATE_LIMIT"
-validate_nonnegative_float GLOBAL_RATE_LIMIT "$GLOBAL_RATE_LIMIT"
-validate_nonnegative_float HEALTH_RATE_LIMIT "$HEALTH_RATE_LIMIT"
-validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 
-[ "$DOH_RATE_BURST" -gt 0 ] || { echo "DOH_RATE_BURST must be > 0" >&2; exit 1; }
-[ "$DOH_RATE_MAX_IPS" -gt 0 ] || { echo "DOH_RATE_MAX_IPS must be > 0" >&2; exit 1; }
-[ "$GLOBAL_RATE_BURST" -gt 0 ] || { echo "GLOBAL_RATE_BURST must be > 0" >&2; exit 1; }
-[ "$HEALTH_RATE_BURST" -gt 0 ] || { echo "HEALTH_RATE_BURST must be > 0" >&2; exit 1; }
-[ "$GLOBAL_HEALTH_RATE_BURST" -gt 0 ] || { echo "GLOBAL_HEALTH_RATE_BURST must be > 0" >&2; exit 1; }
-# GLOBAL_CONN_LIMIT=0 is a supported "unlimited" sentinel in ip-conn-proxy
-# (see ip_conn_proxy.go), the same convention used by the rate-limit env vars
-# below. Only reject a negative value here; validate_uint already did that.
+[ "$GLOBAL_CONN_LIMIT" -gt 0 ] || { echo "GLOBAL_CONN_LIMIT must be > 0" >&2; exit 1; }
+[ "$IP_CONN_LIMIT" -le "$GLOBAL_CONN_LIMIT" ] || { echo "IP_CONN_LIMIT must be <= GLOBAL_CONN_LIMIT" >&2; exit 1; }
 [ "$DOH_MAX_BODY_BYTES" -ge 512 ] || { echo "DOH_MAX_BODY_BYTES must be >= 512" >&2; exit 1; }
 [ "$CACHE_SIZE" -ge 1024 ] || { echo "CACHE_SIZE must be >= 1024" >&2; exit 1; }
 [ "$CACHE_MAX_ENTRY_BYTES" -ge 512 ] || { echo "CACHE_MAX_ENTRY_BYTES must be >= 512" >&2; exit 1; }
@@ -184,7 +151,7 @@ validate_nonnegative_float GLOBAL_HEALTH_RATE_LIMIT "$GLOBAL_HEALTH_RATE_LIMIT"
 [ "$HEALTH_INTERVAL" -ge 30 ] || { echo "HEALTH_INTERVAL must be >= 30" >&2; exit 1; }
 [ "$HEALTH_FAILS_TO_SWITCH" -gt 0 ] || { echo "HEALTH_FAILS_TO_SWITCH must be > 0" >&2; exit 1; }
 [ "$HEALTH_RESTART_COOLDOWN" -ge "$HEALTH_INTERVAL" ] || { echo "HEALTH_RESTART_COOLDOWN must be >= HEALTH_INTERVAL" >&2; exit 1; }
-[ "$GOMAXPROCS" -gt 0 ] || { echo "GOMAXPROCS must be 1-2 for the 0.25 vCPU profile" >&2; exit 1; }
+[ "$GOMAXPROCS" -gt 0 ] || { echo "GOMAXPROCS must be 1-2 for the low-CPU profile" >&2; exit 1; }
 
 case "$DOH_PATH" in /*) ;; *) echo "DOH_PATH must start with /" >&2; exit 1 ;; esac
 case "$HEALTH_PATH" in /*) ;; *) echo "HEALTH_PATH must start with /" >&2; exit 1 ;; esac
@@ -461,7 +428,7 @@ RELEASE_VERSION=$(cat /etc/mosdns/VERSION)
 echo "Release: ${RELEASE_VERSION}"
 mosdns version
 printf '%s\n' '======================'
-echo "Build: PaaS tiny-instance profile (512 MiB / 0.25 vCPU); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded warm cache; adaptive startup health ordering"
+echo "Build: Koyeb Free profile (512 MiB / 0.1 vCPU / 2 GiB SSD); MosDNS v4.5.3; public DoH GET/POST; strict DoH-only upstreams; bounded cache; adaptive upstream ordering"
 echo "Upstream mode: ${HAGEZI_UPSTREAM}"
 echo "Sequential failover: enabled"
 echo "Plain DNS listener: disabled"
@@ -478,7 +445,7 @@ echo "Server timeout: ${SERVER_TIMEOUT}s"
 echo "Warm cache: ${CACHE_DUMP_FILE}, snapshot every ${CACHE_DUMP_INTERVAL}s, max cached response ${CACHE_MAX_ENTRY_BYTES}B"
 echo "Runtime limits: GOMAXPROCS=${GOMAXPROCS}, GOMEMLIMIT=${GOMEMLIMIT}"
 echo "DoH endpoint: ${DOH_PATH}"
-echo "Anti-abuse: per-IP conn ${IP_CONN_LIMIT}, per-IP ${DOH_RATE_LIMIT}/s burst ${DOH_RATE_BURST}, fixed source state <= ${DOH_RATE_MAX_IPS}, global ${GLOBAL_RATE_LIMIT}/s burst ${GLOBAL_RATE_BURST}, global connections ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
+echo "Resource guards: per-IP conn ${IP_CONN_LIMIT}, global conn ${GLOBAL_CONN_LIMIT}, body <= ${DOH_MAX_BODY_BYTES}B"
 
 echo "Selecting upstream order..."
 unset HEALTH_ACTIVE_UPSTREAM 2>/dev/null || true
@@ -494,26 +461,17 @@ echo "  1. ${ORDER_0}"
 echo "  2. ${ORDER_1}"
 echo "  3. ${ORDER_2}"
 
-echo "Starting DoH anti-abuse proxy on :${PORT} -> 127.0.0.1:${MOSDNS_BACKEND_PORT}"
+echo "Starting DoH resource-guard proxy on :${PORT} -> 127.0.0.1:${MOSDNS_BACKEND_PORT}"
 LISTEN_ADDR=":${PORT}" \
-BACKEND_ADDR="127.0.0.1:${MOSDNS_BACKEND_PORT}" \
+BACKEND_PORT="${MOSDNS_BACKEND_PORT}" \
 IP_CONN_LIMIT="${IP_CONN_LIMIT}" \
-DOH_RATE_LIMIT="${DOH_RATE_LIMIT}" \
-DOH_RATE_BURST="${DOH_RATE_BURST}" \
-DOH_RATE_MAX_IPS="${DOH_RATE_MAX_IPS}" \
-GLOBAL_RATE_LIMIT="${GLOBAL_RATE_LIMIT}" \
-GLOBAL_RATE_BURST="${GLOBAL_RATE_BURST}" \
 GLOBAL_CONN_LIMIT="${GLOBAL_CONN_LIMIT}" \
 DOH_MAX_BODY_BYTES="${DOH_MAX_BODY_BYTES}" \
 HEALTH_PATH="${HEALTH_PATH}" \
-HEALTH_RATE_LIMIT="${HEALTH_RATE_LIMIT}" \
-HEALTH_RATE_BURST="${HEALTH_RATE_BURST}" \
-GLOBAL_HEALTH_RATE_LIMIT="${GLOBAL_HEALTH_RATE_LIMIT}" \
-GLOBAL_HEALTH_RATE_BURST="${GLOBAL_HEALTH_RATE_BURST}" \
 HEALTH_BACKEND_TIMEOUT_MS="${HEALTH_BACKEND_TIMEOUT_MS}" \
 DOH_PATH="${DOH_PATH}" \
 DOH_IDLE_TIMEOUT="${DOH_IDLE_TIMEOUT}" \
-GOMEMLIMIT=80MiB \
+GOMEMLIMIT=64MiB \
 GOMAXPROCS=1 \
 ip-conn-proxy &
 PROXY_PID=$!

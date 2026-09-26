@@ -26,12 +26,12 @@ type warmNode struct {
 	Entry warmEntry
 }
 
-const maxWarmEntryBytes = 8 * 1024
+const maxWarmEntryBytes = 4 * 1024
 
 // Keep startup recovery bounded even if the on-disk snapshot is corrupted or
 // unexpectedly replaced. The limit leaves room for gob/map/order metadata around
-// the default 8192 x 8 KiB warm-entry budget without permitting a huge decode.
-const maxWarmSnapshotBytes = 96 << 20
+// the default 8192 x 4 KiB warm-entry budget without permitting a huge decode.
+const maxWarmSnapshotBytes = 48 << 20
 
 type warmDisk struct {
 	Entries map[string]warmEntry
@@ -41,11 +41,12 @@ type warmDisk struct {
 }
 
 type warmBackend struct {
-	inner      cachepkg.Backend
-	path       string
-	interval   time.Duration
-	maxEntries int
-	logger     *zap.Logger
+	inner         cachepkg.Backend
+	path          string
+	interval      time.Duration
+	maxEntries    int
+	maxEntryBytes int
+	logger        *zap.Logger
 
 	lifecycle           sync.RWMutex
 	mu                  sync.Mutex
@@ -59,21 +60,28 @@ type warmBackend struct {
 	persistedGeneration uint64
 }
 
-func newWarmBackend(inner cachepkg.Backend, path string, intervalSeconds int, maxEntries int, logger *zap.Logger) cachepkg.Backend {
+func newWarmBackend(inner cachepkg.Backend, path string, intervalSeconds int, maxEntries int, maxEntryBytes int, logger *zap.Logger) cachepkg.Backend {
 	if path == "" {
 		return inner
 	}
 
+	if maxEntryBytes < 512 {
+		maxEntryBytes = 512
+	}
+	if maxEntryBytes > maxWarmEntryBytes {
+		maxEntryBytes = maxWarmEntryBytes
+	}
 	w := &warmBackend{
-		inner:      inner,
-		path:       path,
-		interval:   time.Duration(intervalSeconds) * time.Second,
-		maxEntries: maxEntries,
-		logger:     logger,
-		entries:    make(map[string]*list.Element),
-		order:      list.New(),
-		stop:       make(chan struct{}),
-		done:       make(chan struct{}),
+		inner:         inner,
+		path:          path,
+		interval:      time.Duration(intervalSeconds) * time.Second,
+		maxEntries:    maxEntries,
+		maxEntryBytes: maxEntryBytes,
+		logger:        logger,
+		entries:       make(map[string]*list.Element),
+		order:         list.New(),
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 	w.load()
 	if w.interval > 0 {
@@ -147,7 +155,7 @@ func (w *warmBackend) Store(key string, v []byte, storedTime, expirationTime tim
 	defer w.mu.Unlock()
 
 	if el, ok := w.entries[key]; ok {
-		if len(v) > maxWarmEntryBytes {
+		if len(v) > w.maxEntryBytes {
 			w.inner.Store(key, v, storedTime, expirationTime)
 			w.removeElementLocked(el)
 			return
@@ -169,7 +177,7 @@ func (w *warmBackend) Store(key string, v []byte, storedTime, expirationTime tim
 		return
 	}
 
-	if len(v) > maxWarmEntryBytes {
+	if len(v) > w.maxEntryBytes {
 		w.inner.Store(key, v, storedTime, expirationTime)
 		return
 	}
@@ -256,7 +264,7 @@ func (w *warmBackend) load() {
 		if !e.ExpirationTime.IsZero() && !e.ExpirationTime.After(now) {
 			return warmNode{}, false
 		}
-		if len(e.Value) == 0 || len(e.Value) > maxWarmEntryBytes {
+		if len(e.Value) == 0 || len(e.Value) > w.maxEntryBytes {
 			return warmNode{}, false
 		}
 		return warmNode{Key: k, Entry: e}, true
