@@ -45,7 +45,11 @@ plugins:
     type: sequence
     args:
       exec:
-        - _misc_optm
+        # NOTE: a prior "_misc_optm" step was removed here. It referenced no
+        # plugin tag defined anywhere in this file, the Dockerfile-injected
+        # Go sources, or the built-in mosdns plugin set, so it was a dead
+        # reference that would make mosdns fail to load this config (and
+        # crash-loop the instance) as soon as this sequence executed.
         - mem_cache
         - sequential_failover
         - _return
