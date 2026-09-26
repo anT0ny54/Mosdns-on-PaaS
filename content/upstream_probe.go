@@ -399,7 +399,11 @@ func scoreState(s state, failurePenalty int64) int64 {
 }
 
 func main() {
-	timeout := time.Duration(envIntOrDefault("HEALTH_TIMEOUT_MS", 1200)) * time.Millisecond
+	// 2000 matches entrypoint.sh's HEALTH_TIMEOUT_MS default and the value
+	// documented in README.md; kept in sync so a direct invocation of this
+	// binary (outside the shell wrapper) behaves the same as the deployed
+	// default instead of silently using a shorter timeout.
+	timeout := time.Duration(envIntOrDefault("HEALTH_TIMEOUT_MS", 2000)) * time.Millisecond
 	failsToSwitch := envIntOrDefault("HEALTH_FAILS_TO_SWITCH", 2)
 	alpha := envFloat("HEALTH_EWMA_ALPHA", 0.35)
 	failurePenalty := envInt64("HEALTH_FAILURE_PENALTY_MS", 1500)

@@ -294,6 +294,11 @@ UPSTREAM_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$UPSTREAM_IDLE_TIMEOUT")
 UPSTREAM_MAX_CONNS_ESCAPED=$(sed_escape_replacement "$UPSTREAM_MAX_CONNS")
 DOH_IDLE_TIMEOUT_ESCAPED=$(sed_escape_replacement "$DOH_IDLE_TIMEOUT")
 SERVER_TIMEOUT_ESCAPED=$(sed_escape_replacement "$SERVER_TIMEOUT")
+# DOH_PATH is fixed for the life of the process, so escape it once here rather
+# than re-forking sed on every render_config call (startup plus every runtime
+# health-triggered re-render), matching how the other static values above are
+# precomputed instead of recomputed per call.
+DOH_PATH_ESCAPED=$(yaml_single_quote "$DOH_PATH" | sed 's/[\\&|]/\\&/g')
 CACHE_DIR=$(dirname "$CACHE_DUMP_FILE")
 mkdir -p "$CACHE_DIR" 2>/dev/null || echo "WARNING: cannot create cache directory ${CACHE_DIR}; warm cache snapshots may be skipped" >&2
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy 2>/dev/null || true
@@ -325,7 +330,7 @@ render_config() {
   sed \
     -e "s|__SERVER_TIMEOUT__|${SERVER_TIMEOUT_ESCAPED}|g" \
     -e "s|__MOSDNS_BACKEND_PORT__|${MOSDNS_BACKEND_PORT_ESCAPED}|g" \
-    -e "s|__DOH_PATH__|$(yaml_single_quote "$DOH_PATH" | sed 's/[\\&|]/\\&/g')|" \
+    -e "s|__DOH_PATH__|${DOH_PATH_ESCAPED}|" \
     -e "s|__CACHE_SIZE__|${CACHE_SIZE_ESCAPED}|g" \
     -e "s|__CACHE_MAX_ENTRY_BYTES__|${CACHE_MAX_ENTRY_BYTES_ESCAPED}|g" \
     -e "s|__CACHE_DUMP_FILE__|${CACHE_DUMP_FILE_ESCAPED}|g" \
