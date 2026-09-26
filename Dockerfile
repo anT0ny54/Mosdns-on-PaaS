@@ -1,5 +1,5 @@
 # MosDNS v4.5.3, tuned for a tiny PaaS Web Service.
-# Runtime target: 512 MiB RAM / 0.25 vCPU / 2 GiB SSD.
+# Runtime target: 512 MiB RAM / 0.1 vCPU / 2 GiB SSD.
 #
 # Build stage MUST stay on Go 1.19.x: v4.5.3 transitively depends on
 # github.com/lucas-clemente/quic-go v0.30.0 (pulled in by the built-in
@@ -102,8 +102,8 @@ RUN test "$(grep -Fc 'CompressResp      bool   `yaml:"compress_resp"`' /src/plug
       err_end > 0 && limit_line == 0 && /if c.args.MaxEntryBytes > 0 && len\(v\) > c.args.MaxEntryBytes/ { limit_line = NR } \
       END { exit !(pack > 0 && err_start > pack && err_end > err_start && limit_line > err_end) }' /src/plugin/executable/cache/cache.go \
  && test "$(grep -Ec '^[[:space:]]*c = mem_cache.NewMemCache\(args.Size, 0\)[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
- && sed -i 's|c = mem_cache.NewMemCache(args.Size, 0)|c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, bp.L())|' /src/plugin/executable/cache/cache.go \
- && test "$(grep -Ec '^[[:space:]]*c = newWarmBackend\(mem_cache.NewMemCache\(args.Size, 0\), args.DumpFile, args.DumpInterval, args.Size, bp.L\(\)\)[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
+ && sed -i 's|c = mem_cache.NewMemCache(args.Size, 0)|c = newWarmBackend(mem_cache.NewMemCache(args.Size, 0), args.DumpFile, args.DumpInterval, args.Size, args.MaxEntryBytes, bp.L())|' /src/plugin/executable/cache/cache.go \
+ && test "$(grep -Ec '^[[:space:]]*c = newWarmBackend\(mem_cache.NewMemCache\(args.Size, 0\), args.DumpFile, args.DumpInterval, args.Size, args.MaxEntryBytes, bp.L\(\)\)[[:space:]]*$' /src/plugin/executable/cache/cache.go)" -eq 1 \
  && gofmt -w /src/plugin/executable/cache/cache.go /src/plugin/executable/cache/warm_backend.go
 
 # The probe helper and the DoH proxy are separate `package main` programs, so
@@ -141,7 +141,7 @@ RUN chmod 0755 ./entrypoint.sh \
     && mkdir -p /var/cache/mosdns \
     && chown -R mosdns:mosdns /etc/mosdns /var/cache/mosdns
 
-# Runtime defaults (ports, rate limits, cache size, memory limits, upstream pins)
+# Runtime defaults (ports, resource guards, cache size, memory limits, upstream pins)
 # live in exactly one place: the `: "${NAME:=default}"` block at the top of
 # entrypoint.sh, which validates bounded numeric values and supported text inputs.
 # Override any of them with
