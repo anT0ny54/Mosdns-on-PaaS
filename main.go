@@ -239,6 +239,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var err error
 	var bodyBuf []byte
+	var dnsParam string
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -263,16 +264,21 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		dnsParam := r.URL.Query().Get("dns")
+		dnsParam = r.URL.Query().Get("dns")
 		if !isValidDoHGetParameter(dnsParam, g.maxRequestBytes) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 	}
 
+	// Forward exactly the "dns" value that was just validated, not the raw
+	// query string. r.URL.Query().Get only inspects the first "dns" value,
+	// so blindly re-appending r.URL.RawQuery would let a second/duplicate
+	// "dns" parameter (or arbitrary extra parameters) reach the upstream
+	// completely unvalidated.
 	outURL := g.backendURL
-	if r.Method == http.MethodGet && r.URL.RawQuery != "" {
-		outURL += "?" + r.URL.RawQuery
+	if r.Method == http.MethodGet {
+		outURL += "?dns=" + dnsParam
 	}
 
 	var reader io.Reader
@@ -287,7 +293,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	copyRequestHeaders(req.Header, r.Header)
 	req.Header.Set("X-Forwarded-For", clientIP)
-	req.Header.Del("Host")
 	req.Header.Del("Accept-Encoding")
 	if r.Method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/dns-message")
