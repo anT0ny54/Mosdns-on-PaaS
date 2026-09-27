@@ -19,7 +19,8 @@ func testGateway(backend string, limit int, concurrency int) *gateway {
 		backendURL:       backend,
 		client:           newHTTPClient(),
 		limiter:          limiter,
-		concurrency:      make(chan struct{}, concurrency),
+		activeSlots:      make(chan struct{}, 5000),
+		processingSlots:  make(chan struct{}, concurrency),
 		upstreamTimeout:  2 * time.Second,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,
@@ -186,12 +187,15 @@ func TestDoHGETParameterValidationAllocs(t *testing.T) {
 	}
 }
 
-func TestConcurrencyCap(t *testing.T) {
-	entered := make(chan struct{})
+func TestProcessingConcurrencyQueues(t *testing.T) {
+	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		entered <- struct{}{}
-		<-release
+		select {
+		case entered <- struct{}{}:
+			<-release
+		default:
+		}
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write([]byte{0x01})
 	}))
@@ -201,28 +205,198 @@ func TestConcurrencyCap(t *testing.T) {
 
 	var wg sync.WaitGroup
 	firstDone := make(chan struct{})
-	wg.Add(1)
+	secondDone := make(chan struct{})
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
 		r.Header.Set("Content-Type", "application/dns-message")
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Errorf("first request: got %d, want %d", w.Code, http.StatusOK)
+		}
 		close(firstDone)
 	}()
 	<-entered
+
+	go func() {
+		defer wg.Done()
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+		r.Header.Set("Content-Type", "application/dns-message")
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Errorf("queued request: got %d, want %d", w.Code, http.StatusOK)
+		}
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("second request completed before processing slot was released")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	<-firstDone
+	<-secondDone
+	wg.Wait()
+}
+
+func TestActiveRequestCap(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+
+	limiter := newFixedWindowLimiterWithMaxKeys(100000, time.Minute, 16)
+	limiter.now = func() time.Time { return time.Unix(120, 0) }
+	g := &gateway{
+		backendURL:       backend.URL,
+		client:           newHTTPClient(),
+		limiter:          limiter,
+		activeSlots:      make(chan struct{}, 1),
+		processingSlots:  make(chan struct{}, 1),
+		upstreamTimeout:  2 * time.Second,
+		maxRequestBytes:  maxDNSMessageBytes,
+		maxResponseBytes: maxDNSMessageBytes,
+		trustedIPHeader:  "X-Forwarded-For",
+	}
+
+	g.activeSlots <- struct{}{}
+	defer func() { <-g.activeSlots }()
 
 	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
 	r.Header.Set("Content-Type", "application/dns-message")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("second request: got %d, want %d", w.Code, http.StatusServiceUnavailable)
+		t.Fatalf("got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestDefaultCapacityConfiguration(t *testing.T) {
+	if defaultRateLimitClients != 65536 {
+		t.Fatalf("default rate-limit client guard=%d, want 65536", defaultRateLimitClients)
+	}
+	if defaultMaxActiveRequests != 5000 {
+		t.Fatalf("default active-request capacity=%d, want 5000", defaultMaxActiveRequests)
+	}
+	if defaultConcurrency != 64 {
+		t.Fatalf("default backend processing cap=%d, want 64", defaultConcurrency)
+	}
+	transport := newHTTPClient().Transport.(*http.Transport)
+	if transport.MaxIdleConnsPerHost != defaultConcurrency {
+		t.Fatalf("MaxIdleConnsPerHost=%d, want %d", transport.MaxIdleConnsPerHost, defaultConcurrency)
+	}
+	if transport.MaxConnsPerHost != defaultConcurrency {
+		t.Fatalf("MaxConnsPerHost=%d, want %d", transport.MaxConnsPerHost, defaultConcurrency)
+	}
+}
+
+func TestFiveThousandActiveRequests(t *testing.T) {
+	const burst = 5000
+	const processingCap = 64
+
+	backendRelease := make(chan struct{})
+	backendEntered := make(chan struct{}, burst)
+	var backendMu sync.Mutex
+	backendActive := 0
+	backendPeak := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendMu.Lock()
+		backendActive++
+		if backendActive > backendPeak {
+			backendPeak = backendActive
+		}
+		backendMu.Unlock()
+		backendEntered <- struct{}{}
+		<-backendRelease
+		backendMu.Lock()
+		backendActive--
+		backendMu.Unlock()
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+
+	limiter := newFixedWindowLimiterWithMaxKeys(100000, time.Minute, burst)
+	limiter.now = func() time.Time { return time.Unix(120, 0) }
+	g := &gateway{
+		backendURL:       backend.URL,
+		client:           newHTTPClient(),
+		limiter:          limiter,
+		activeSlots:      make(chan struct{}, burst),
+		processingSlots:  make(chan struct{}, processingCap),
+		upstreamTimeout:  5 * time.Second,
+		maxRequestBytes:  maxDNSMessageBytes,
+		maxResponseBytes: maxDNSMessageBytes,
+		trustedIPHeader:  "X-Forwarded-For",
 	}
 
-	close(release)
-	<-firstDone
+	var wg sync.WaitGroup
+	results := make(chan int, burst)
+	wg.Add(burst)
+	for i := 0; i < burst; i++ {
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+			r.Header.Set("Content-Type", "application/dns-message")
+			r.Header.Set("X-Forwarded-For", "198.18.0.1")
+			w := httptest.NewRecorder()
+			g.ServeHTTP(w, r)
+			results <- w.Code
+		}()
+	}
+
+	// Once all 5,000 requests have been admitted, exactly 64 should have
+	// reached the MosDNS backend and the remaining requests should be queued.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(g.activeSlots) < burst && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(g.activeSlots); got != burst {
+		t.Fatalf("active slots reached %d, want %d", got, burst)
+	}
+	for i := 0; i < processingCap; i++ {
+		select {
+		case <-backendEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d backend requests entered; want %d", i, processingCap)
+		}
+	}
+
+	backendMu.Lock()
+	peak := backendPeak
+	backendMu.Unlock()
+	if peak > processingCap {
+		t.Fatalf("backend peak concurrency=%d, want <= %d", peak, processingCap)
+	}
+
+	close(backendRelease)
 	wg.Wait()
+	close(results)
+
+	ok := 0
+	for code := range results {
+		if code == http.StatusOK {
+			ok++
+		}
+	}
+	if ok != burst {
+		t.Fatalf("successful requests=%d, want %d", ok, burst)
+	}
+	if got := len(g.activeSlots); got != 0 {
+		t.Fatalf("active slots after completion=%d, want 0", got)
+	}
+	backendMu.Lock()
+	finalActive := backendActive
+	backendMu.Unlock()
+	if finalActive != 0 {
+		t.Fatalf("backend active requests after completion=%d, want 0", finalActive)
+	}
 }
 
 func TestHealthEndpoint(t *testing.T) {

@@ -24,8 +24,9 @@ const (
 	defaultBackend           = "http://127.0.0.1:8081/dns-query"
 	defaultRateLimit         = 100
 	defaultRateWindow        = 60 * time.Second
-	defaultRateLimitClients  = 8192
-	defaultConcurrency       = 16
+	defaultRateLimitClients  = 65536
+	defaultConcurrency       = 64
+	defaultMaxActiveRequests = 5000
 	defaultUpstreamTO        = 6 * time.Second
 	defaultReadHeaderTimeout = 5 * time.Second
 	defaultReadTimeout       = 8 * time.Second
@@ -38,6 +39,15 @@ var version = "dev"
 var dohGetDecodeBufferPool = sync.Pool{
 	New: func() interface{} {
 		return new([maxDNSMessageBytes]byte)
+	},
+}
+
+// dnsMessageBufferPool keeps the common <=4 KiB DoH request/response path
+// allocation-light. A one-byte guard is reserved so oversize payloads can be
+// detected without a second allocation.
+var dnsMessageBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, maxDNSMessageBytes+1)
 	},
 }
 
@@ -138,7 +148,8 @@ type gateway struct {
 	backendURL       string
 	client           *http.Client
 	limiter          *fixedWindowLimiter
-	concurrency      chan struct{}
+	activeSlots      chan struct{}
+	processingSlots  chan struct{}
 	upstreamTimeout  time.Duration
 	maxRequestBytes  int64
 	maxResponseBytes int64
@@ -194,18 +205,33 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admit bursts up to a hard active-request ceiling, but do not execute all
+	// admitted requests at once. Waiting handlers are cheap in Go and prevent a
+	// burst from being turned into immediate 503 responses.
 	select {
-	case g.concurrency <- struct{}{}:
-		defer func() { <-g.concurrency }()
+	case g.activeSlots <- struct{}{}:
+		defer func() { <-g.activeSlots }()
 	default:
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, "concurrency limit reached\n")
+		_, _ = io.WriteString(w, "active request limit reached\n")
 		return
 	}
 
+	select {
+	case g.processingSlots <- struct{}{}:
+		defer func() { <-g.processingSlots }()
+	case <-r.Context().Done():
+		w.WriteHeader(http.StatusGatewayTimeout)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), g.upstreamTimeout)
+	defer cancel()
+
 	var body []byte
 	var err error
+	var bodyBuf []byte
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -215,7 +241,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
-		body, err = io.ReadAll(io.LimitReader(r.Body, g.maxRequestBytes+1))
+		bodyBuf = dnsMessageBufferPool.Get().([]byte)
+		bodyBuf = bodyBuf[:0]
+		defer func() {
+			dnsMessageBufferPool.Put(bodyBuf[:cap(bodyBuf)])
+		}()
+		body, err = readBoundedBody(r.Body, bodyBuf, int(g.maxRequestBytes))
 		if err != nil {
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
 			return
@@ -231,9 +262,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), g.upstreamTimeout)
-	defer cancel()
 
 	outURL := g.backendURL
 	if r.Method == http.MethodGet && r.URL.RawQuery != "" {
@@ -270,7 +298,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBytes+1))
+	respBuf := dnsMessageBufferPool.Get().([]byte)
+	respBuf = respBuf[:0]
+	defer func() {
+		dnsMessageBufferPool.Put(respBuf[:cap(respBuf)])
+	}()
+	respBody, err := readBoundedBody(resp.Body, respBuf, int(g.maxResponseBytes))
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -293,6 +326,34 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
+}
+
+func readBoundedBody(r io.Reader, buf []byte, maxBytes int) ([]byte, error) {
+	if maxBytes < 1 || cap(buf) < maxBytes+1 {
+		return nil, errors.New("invalid body buffer")
+	}
+	buf = buf[:0]
+	for {
+		if len(buf) == cap(buf) {
+			return buf, nil
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		if n > 0 {
+			buf = buf[:len(buf)+n]
+			if len(buf) > maxBytes {
+				return buf, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return buf, nil
+			}
+			return nil, err
+		}
+		if n == 0 {
+			return nil, io.ErrNoProgress
+		}
+	}
 }
 
 func isValidDoHGetParameter(value string, maxBytes int64) bool {
@@ -395,9 +456,11 @@ func (g *gateway) backendReady(parent context.Context) bool {
 func extractClientIP(r *http.Request, preferredHeader string) string {
 	if preferredHeader != "" {
 		if values := r.Header.Values(preferredHeader); len(values) != 0 {
-			parts := strings.Split(strings.Join(values, ","), ",")
-			last := strings.TrimSpace(parts[len(parts)-1])
-			if ip := net.ParseIP(last); ip != nil {
+			value := values[len(values)-1]
+			if comma := strings.LastIndexByte(value, ','); comma >= 0 {
+				value = value[comma+1:]
+			}
+			if ip := net.ParseIP(strings.TrimSpace(value)); ip != nil {
 				return ip.String()
 			}
 		}
@@ -502,14 +565,15 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 
 func newHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        8,
-		MaxIdleConnsPerHost: 4,
-		MaxConnsPerHost:     16,
-		IdleConnTimeout:     20 * time.Second,
-		TLSHandshakeTimeout: 4 * time.Second,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   defaultConcurrency,
+		MaxConnsPerHost:       defaultConcurrency,
+		IdleConnTimeout:       15 * time.Second,
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     false,
 	}
 	return &http.Client{Transport: transport}
 }
@@ -519,7 +583,8 @@ func main() {
 	backend := envString("MOSDNS_DOH_URL", defaultBackend)
 	limit := envInt("RATE_LIMIT", defaultRateLimit)
 	window := envDuration("RATE_WINDOW", defaultRateWindow)
-	concurrency := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
+	processingConcurrency := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
+	maxActiveRequests := envInt("MAX_ACTIVE_REQUESTS", defaultMaxActiveRequests)
 	maxRateLimitClients := envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients)
 	upstreamTimeout := envDuration("UPSTREAM_TIMEOUT", defaultUpstreamTO)
 	trustedIPHeader := envString("CLIENT_IP_HEADER", "X-Forwarded-For")
@@ -528,7 +593,8 @@ func main() {
 		backendURL:       backend,
 		client:           newHTTPClient(),
 		limiter:          newFixedWindowLimiterWithMaxKeys(limit, window, maxRateLimitClients),
-		concurrency:      make(chan struct{}, concurrency),
+		activeSlots:      make(chan struct{}, maxActiveRequests),
+		processingSlots:  make(chan struct{}, processingConcurrency),
 		upstreamTimeout:  upstreamTimeout,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,
@@ -545,7 +611,7 @@ func main() {
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
-	log.Printf("doh-gateway %s listening on %s, backend=%s, rate=%d/%s, concurrency=%d", version, listen, backend, limit, window, concurrency)
+	log.Printf("doh-gateway %s listening on %s, backend=%s, rate=%d/%s, active=%d, processing=%d", version, listen, backend, limit, window, maxActiveRequests, processingConcurrency)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("server failed: %v", err)
 		os.Exit(1)
