@@ -1,6 +1,6 @@
 # MosDNS v4.5.3
 # Primary: race HaGeZiDNS1 + HaGeZiDNS2 and use the first response.
-# Fallback: use HaGeZiDNS3 when the primary path fails or remains unanswered for 5 seconds.
+# Fallback: use HaGeZiDNS3 if the primary path has not responded within 5 seconds.
 
 log:
   level: warn
@@ -15,7 +15,7 @@ plugins:
       lazy_cache_reply_ttl: 15
       cache_everything: false
 
-  # fast_forward sends to all configured upstreams concurrently.
+  # Primary: fast_forward sends to both upstreams concurrently.
   - tag: primary_fast
     type: fast_forward
     args:
@@ -31,6 +31,7 @@ plugins:
           idle_timeout: 60
           max_conns: 2
 
+  # Secondary: standby fallback endpoint.
   - tag: fallback_hagezi
     type: fast_forward
     args:
@@ -42,13 +43,16 @@ plugins:
           max_conns: 1
 
   # v4.5.3 sequence syntax.
-  # Do NOT use type: fallback, has_resp, or accept here.
-  # Fallback is an inline sequence operation in the v4 sequence engine.
+  # IMPORTANT: fallback is an inline sequence operation; it is NOT a plugin type.
+  # _return is the v4 sequence return command (not the v5 'accept' command).
   - tag: main_sequence
     type: sequence
     args:
       exec:
         - cache
+        - if: has_resp
+          exec:
+            - _return
         - primary:
             - primary_fast
           secondary:
@@ -56,14 +60,14 @@ plugins:
           fast_fallback: 5000
           always_standby: false
 
-  # Internal DoH endpoint consumed by doh-gateway.
-  - tag: doh_server
-    type: http_server
-    args:
-      entries:
-        - path: "/dns-query"
-          exec: main_sequence
-      src_ip_header: "X-Forwarded-For"
-      listen: "127.0.0.1:8081"
-      idle_timeout: 10
-      
+# v4.5.3 server configuration.
+# The external doh-gateway connects to this plaintext HTTP DoH endpoint.
+servers:
+  - exec: main_sequence
+    timeout: 5
+    listeners:
+      - protocol: http
+        addr: "127.0.0.1:8081"
+        url_path: "/dns-query"
+        get_user_ip_from_header: "X-Forwarded-For"
+        
