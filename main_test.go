@@ -34,7 +34,8 @@ func TestNormalizeListenAddr(t *testing.T) {
 		"127.0.0.1:8080": "127.0.0.1:8080",
 		"[::]:8080":      "[::]:8080",
 		"":               defaultListen,
-		"0":              "0",
+		"0":              defaultListen,
+		"65536":          defaultListen,
 	}
 	for in, want := range tests {
 		if got := normalizeListenAddr(in); got != want {
@@ -79,6 +80,23 @@ func TestRateLimitPerClient(t *testing.T) {
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("second client got %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestRateLimiterClientCap(t *testing.T) {
+	l := newFixedWindowLimiterWithMaxKeys(10, time.Minute, 2)
+	l.now = func() time.Time { return time.Unix(120, 0) }
+	if !l.allow("198.51.100.1") {
+		t.Fatal("first client denied")
+	}
+	if !l.allow("198.51.100.2") {
+		t.Fatal("second client denied")
+	}
+	if l.allow("198.51.100.3") {
+		t.Fatal("third client exceeded key cap but was allowed")
+	}
+	if !l.allow("198.51.100.1") {
+		t.Fatal("existing client denied after key cap reached")
 	}
 }
 
@@ -147,6 +165,9 @@ func TestDoHGETParameterValidation(t *testing.T) {
 	}
 	if isValidDoHGetParameter("AAAA", 1) {
 		t.Fatal("decoded payload above max size accepted")
+	}
+	if isValidDoHGetParameter(valid, maxDNSMessageBytes+1) {
+		t.Fatal("validation accepted a configured size above the hard DoH limit")
 	}
 }
 

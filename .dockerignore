@@ -7,3 +7,6 @@ LICENSE
 README.md
 CHANGELOG.md
 keep-alive.txt
+main_test.go
+Makefile
+check-config.sh

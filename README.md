@@ -1,6 +1,6 @@
 # MosDNS v4.5.3 + DoH Gateway for Koyeb
 
-A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, designed for a **512 MiB / 0.1 vCPU Koyeb web service**.
+A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, tuned for a **512 MiB / 0.1 vCPU Koyeb web service**.
 
 ## Architecture
 
@@ -55,11 +55,12 @@ The HTTPS hostname remains the TLS identity while `dial_addr` pins the connectio
 The gateway enforces:
 
 - **100 requests / 60 seconds / client IP** using a fixed-window limiter.
-- **64 concurrent requests per service instance**. Requests beyond the hard cap receive HTTP 503 instead of accumulating a large in-process queue.
+- At most **8192 distinct client keys per rate-limit window**; new clients are rejected with HTTP 429 once the memory guard is full.
+- **16 concurrent requests per service instance**. Requests beyond the hard cap receive HTTP 503 instead of accumulating a large in-process queue.
 - Maximum DoH DNS message size of **4096 bytes** for both request and response.
 - DoH POST requires `Content-Type: application/dns-message`.
-- DoH GET requires a valid URL-safe base64 `dns` parameter.
-- `ReadHeaderTimeout=5s`, `ReadTimeout=10s`, `WriteTimeout=10s`, `IdleTimeout=30s`.
+- DoH GET requires a valid unpadded URL-safe base64 `dns` parameter.
+- `ReadHeaderTimeout=5s`, `ReadTimeout=8s`, `WriteTimeout=8s`, `IdleTimeout=20s`.
 - No debug/info request logging by default.
 
 The client-IP source defaults to `X-Forwarded-For`, matching the Koyeb reverse-proxy deployment model. The gateway falls back to `X-Real-IP` and then the socket peer address.
@@ -72,9 +73,9 @@ The container is tuned for the requested limits:
 - Build toolchain: **Go 1.19.13**.
 - MosDNS: **v4.5.3**.
 - `GOMAXPROCS=1` to avoid oversubscribing a 0.1 vCPU instance.
-- `GOMEMLIMIT=128MiB` per process to keep the two Go processes well below the 512 MiB service ceiling.
-- Gateway concurrency is capped at **64 in-flight requests**, with at most **32** persistent gateway-to-MosDNS HTTP connections; this prevents large internal queues on a 0.1 vCPU instance.
-- MosDNS cache is deliberately small (4096 entries) to avoid turning cache memory into the dominant resident set.
+- `GOGC=150` reduces garbage-collection frequency while `GOMEMLIMIT=128MiB` still provides a soft runtime memory target per Go process.
+- Gateway concurrency is capped at **16 in-flight requests**, with at most **16** gateway-to-MosDNS connections and **4** idle connections retained per host.
+- MosDNS keeps an **8192-entry cache** while avoiding `cache_everything` to limit memory use from EDNS variants.
 - DoH upstream HTTP/3 is not enabled; persistent HTTP connections/pipelining are used instead to reduce CPU overhead.
 - The unused loopback UDP/TCP MosDNS listeners are omitted; the gateway is the sole consumer of the MosDNS HTTP endpoint.
 
@@ -102,13 +103,13 @@ The same service can be deployed from this repository using Koyeb's Docker build
 
 ## Build
 
-The root `Makefile` contains the only Makefile in the project. `make test` requires Python 3.8+ with PyYAML because the configuration test parses YAML structurally.
+`make test` runs the YAML/schema check, `go vet`, and the Go test suite. The configuration check requires Python 3.8+ with PyYAML.
 
 ```sh
 python3 -m pip install pyyaml
 make test
 make build
-./check-config.sh mosdns.yaml
+sh ./check-config.sh mosdns.yaml
 ```
 
 Container build:

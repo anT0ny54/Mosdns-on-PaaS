@@ -1,16 +1,16 @@
 # MosDNS v4.5.3
 # Primary: race two HaGeZi DoH endpoints and use the first response.
-# Fallback: use the standby HaGeZi endpoint after 5 seconds.
+# Fallback: use the standby HaGeZi endpoint after 2 seconds.
 
 log:
-  level: warn
+  level: error
   file: ""
 
 plugins:
   - tag: cache
     type: cache
     args:
-      size: 4096
+      size: 8192
       lazy_cache_ttl: 3600
       lazy_cache_reply_ttl: 15
       cache_everything: false
@@ -23,13 +23,13 @@ plugins:
         - addr: "https://root.hagezi.org/dns-query"
           dial_addr: "188.34.161.210"
           enable_pipeline: true
-          idle_timeout: 60
-          max_conns: 2
+          idle_timeout: 20
+          max_conns: 1
         - addr: "https://wurzn.hagezi.org/dns-query"
           dial_addr: "159.69.155.94"
           enable_pipeline: true
-          idle_timeout: 60
-          max_conns: 2
+          idle_timeout: 20
+          max_conns: 1
 
   - tag: fallback_hagezi
     type: fast_forward
@@ -38,7 +38,7 @@ plugins:
         - addr: "https://juuri.hagezi.org/dns-query"
           dial_addr: "95.217.163.17"
           enable_pipeline: true
-          idle_timeout: 30
+          idle_timeout: 20
           max_conns: 1
 
   - tag: main_sequence
@@ -50,15 +50,15 @@ plugins:
             - primary_fast
           secondary:
             - fallback_hagezi
-          fast_fallback: 5000
+          fast_fallback: 2000
           always_standby: false
 
 servers:
   - exec: main_sequence
-    timeout: 5
+    timeout: 4
     listeners:
       - protocol: http
         addr: "127.0.0.1:8081"
         url_path: "/dns-query"
         get_user_ip_from_header: "X-Forwarded-For"
-        idle_timeout: 30
+        idle_timeout: 20

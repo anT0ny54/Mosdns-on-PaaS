@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -19,14 +18,19 @@ import (
 )
 
 const (
-	maxDNSMessageBytes = 4096
-	maxHeaderBytes     = 8 * 1024
-	defaultListen      = ":8080"
-	defaultBackend     = "http://127.0.0.1:8081/dns-query"
-	defaultRateLimit   = 100
-	defaultRateWindow  = 60 * time.Second
-	defaultConcurrency = 64
-	defaultUpstreamTO  = 8 * time.Second
+	maxDNSMessageBytes       = 4096
+	maxHeaderBytes           = 8 * 1024
+	defaultListen            = ":8080"
+	defaultBackend           = "http://127.0.0.1:8081/dns-query"
+	defaultRateLimit         = 100
+	defaultRateWindow        = 60 * time.Second
+	defaultRateLimitClients  = 8192
+	defaultConcurrency       = 16
+	defaultUpstreamTO        = 6 * time.Second
+	defaultReadHeaderTimeout = 5 * time.Second
+	defaultReadTimeout       = 8 * time.Second
+	defaultWriteTimeout      = 8 * time.Second
+	defaultIdleTimeout       = 20 * time.Second
 )
 
 var version = "dev"
@@ -61,23 +65,32 @@ type fixedWindowLimiter struct {
 	mu       sync.Mutex
 	limit    int
 	window   time.Duration
+	maxKeys  int
 	windowID int64
 	counts   map[string]int
 	now      func() time.Time
 }
 
 func newFixedWindowLimiter(limit int, window time.Duration) *fixedWindowLimiter {
+	return newFixedWindowLimiterWithMaxKeys(limit, window, defaultRateLimitClients)
+}
+
+func newFixedWindowLimiterWithMaxKeys(limit int, window time.Duration, maxKeys int) *fixedWindowLimiter {
 	if limit < 1 {
 		limit = defaultRateLimit
 	}
 	if window <= 0 {
 		window = defaultRateWindow
 	}
+	if maxKeys < 1 {
+		maxKeys = defaultRateLimitClients
+	}
 	return &fixedWindowLimiter{
-		limit:  limit,
-		window: window,
-		counts: make(map[string]int),
-		now:    time.Now,
+		limit:   limit,
+		window:  window,
+		maxKeys: maxKeys,
+		counts:  make(map[string]int),
+		now:     time.Now,
 	}
 }
 
@@ -92,10 +105,14 @@ func (l *fixedWindowLimiter) allow(key string) bool {
 		l.windowID = windowID
 		l.counts = make(map[string]int)
 	}
-	if l.counts[key] >= l.limit {
+	count, exists := l.counts[key]
+	if !exists && len(l.counts) >= l.maxKeys {
 		return false
 	}
-	l.counts[key]++
+	if count >= l.limit {
+		return false
+	}
+	l.counts[key] = count + 1
 	return true
 }
 
@@ -177,6 +194,16 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	select {
+	case g.concurrency <- struct{}{}:
+		defer func() { <-g.concurrency }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "concurrency limit reached\n")
+		return
+	}
+
 	var body []byte
 	var err error
 	if r.Method == http.MethodPost {
@@ -203,16 +230,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-	}
-
-	select {
-	case g.concurrency <- struct{}{}:
-		defer func() { <-g.concurrency }()
-	default:
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, "concurrency limit reached\n")
-		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), g.upstreamTimeout)
@@ -279,7 +296,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 }
 
 func isValidDoHGetParameter(value string, maxBytes int64) bool {
-	if value == "" || maxBytes <= 0 {
+	if value == "" || maxBytes <= 0 || maxBytes > maxDNSMessageBytes {
 		return false
 	}
 	if int64(len(value)) > int64(base64.RawURLEncoding.EncodedLen(int(maxBytes))) {
@@ -450,8 +467,11 @@ func normalizeListenAddr(value string) string {
 	if v == "" {
 		return defaultListen
 	}
-	if port, err := strconv.Atoi(v); err == nil && port >= 1 && port <= 65535 {
-		return ":" + strconv.Itoa(port)
+	if port, err := strconv.Atoi(v); err == nil {
+		if port >= 1 && port <= 65535 {
+			return ":" + strconv.Itoa(port)
+		}
+		return defaultListen
 	}
 	return v
 }
@@ -482,15 +502,14 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 
 func newHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          16,
-		MaxIdleConnsPerHost:   8,
-		MaxConnsPerHost:       32,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 500 * time.Millisecond,
-		DisableCompression:    true,
-		ForceAttemptHTTP2:     false,
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        8,
+		MaxIdleConnsPerHost: 4,
+		MaxConnsPerHost:     16,
+		IdleConnTimeout:     20 * time.Second,
+		TLSHandshakeTimeout: 4 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   false,
 	}
 	return &http.Client{Transport: transport}
 }
@@ -501,13 +520,14 @@ func main() {
 	limit := envInt("RATE_LIMIT", defaultRateLimit)
 	window := envDuration("RATE_WINDOW", defaultRateWindow)
 	concurrency := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
+	maxRateLimitClients := envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients)
 	upstreamTimeout := envDuration("UPSTREAM_TIMEOUT", defaultUpstreamTO)
 	trustedIPHeader := envString("CLIENT_IP_HEADER", "X-Forwarded-For")
 
 	g := &gateway{
 		backendURL:       backend,
 		client:           newHTTPClient(),
-		limiter:          newFixedWindowLimiter(limit, window),
+		limiter:          newFixedWindowLimiterWithMaxKeys(limit, window, maxRateLimitClients),
 		concurrency:      make(chan struct{}, concurrency),
 		upstreamTimeout:  upstreamTimeout,
 		maxRequestBytes:  maxDNSMessageBytes,
@@ -518,15 +538,16 @@ func main() {
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           g,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: defaultReadHeaderTimeout,
+		ReadTimeout:       defaultReadTimeout,
+		WriteTimeout:      defaultWriteTimeout,
+		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
 	log.Printf("doh-gateway %s listening on %s, backend=%s, rate=%d/%s, concurrency=%d", version, listen, backend, limit, window, concurrency)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(fmt.Sprintf("server failed: %v", err))
+		log.Printf("server failed: %v", err)
+		os.Exit(1)
 	}
 }
