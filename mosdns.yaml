@@ -43,14 +43,18 @@ plugins:
           max_conns: 1
 
   # v4.5.3 sequence syntax.
-  # IMPORTANT: fallback is an inline sequence operation; it is NOT a plugin type.
-  # _return is the v4 sequence return command (not the v5 'accept' command).
+  # NOTE: "matches:" (not "if:") is required to use the built-in has_resp
+  # quick-setup matcher without defining it as a separate plugin. "if:" only
+  # accepts a reference to an already-defined plugin tag, which is why
+  # "if: has_resp" failed with "cannot find matcher has_resp".
+  # The primary/secondary/fast_fallback block below is a valid inline
+  # fallback node embedded directly in the sequence (not a plugin type).
   - tag: main_sequence
     type: sequence
     args:
       exec:
         - cache
-        - if: has_resp
+        - matches: has_resp
           exec:
             - _return
         - primary:
@@ -60,14 +64,18 @@ plugins:
           fast_fallback: 5000
           always_standby: false
 
-# v4.5.3 server configuration.
-# The external doh-gateway connects to this plaintext HTTP DoH endpoint.
-servers:
-  - exec: main_sequence
-    timeout: 5
-    listeners:
-      - protocol: http
-        addr: "127.0.0.1:8081"
-        url_path: "/dns-query"
-        get_user_ip_from_header: "X-Forwarded-For"
-        
+  # v4.5.3 server configuration.
+  # NOTE: mosdns v4.5.3 does not support the top-level "servers:" shortcut
+  # section used in newer versions. The listener must be defined as an
+  # explicit plugin of type "http_server", which is what was missing and
+  # caused "plugin type http_server not defined".
+  - tag: http_server
+    type: http_server
+    args:
+      entries:
+        - path: "/dns-query"
+          exec: main_sequence
+      listen: "127.0.0.1:8081"
+      src_ip_header: "X-Forwarded-For"
+      idle_timeout: 30
+      
