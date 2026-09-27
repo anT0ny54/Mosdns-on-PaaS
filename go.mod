@@ -1,4 +1,4 @@
 module example.com/mosdns-koyeb-doh-gateway
 
-go 1.19.13
+go 1.19
 
