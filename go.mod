@@ -1,4 +1,4 @@
-module example.com/mosdns-koyeb-doh-gateway
+module github.com/anT0ny54/Mosdns-on-PaaS
 
 go 1.19
 
