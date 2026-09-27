@@ -1,6 +1,6 @@
 # MosDNS v4.5.3
 # Primary: race HaGeZiDNS1 + HaGeZiDNS2 and use the first response.
-# Fallback: use HaGeZiDNS3 when the primary path fails or exceeds 5 seconds.
+# Fallback: use HaGeZiDNS3 when the primary path fails or remains unanswered for 5 seconds.
 
 log:
   level: warn
@@ -15,6 +15,7 @@ plugins:
       lazy_cache_reply_ttl: 15
       cache_everything: false
 
+  # fast_forward sends to all configured upstreams concurrently.
   - tag: primary_fast
     type: fast_forward
     args:
@@ -40,25 +41,22 @@ plugins:
           idle_timeout: 30
           max_conns: 1
 
-  # MosDNS v4 fallback plugin.
-  - tag: dns_fallback
-    type: fallback
-    args:
-      primary: primary_fast
-      secondary: fallback_hagezi
-      threshold: 5000
-      always_standby: false
-
-  # MosDNS v4 sequence syntax: matches + exec.
+  # v4.5.3 sequence syntax.
+  # Do NOT use type: fallback, has_resp, or accept here.
+  # Fallback is an inline sequence operation in the v4 sequence engine.
   - tag: main_sequence
     type: sequence
     args:
-      - exec: $cache
-      - matches: has_resp
-        exec: accept
-      - exec: $dns_fallback
+      exec:
+        - cache
+        - primary:
+            - primary_fast
+          secondary:
+            - fallback_hagezi
+          fast_fallback: 5000
+          always_standby: false
 
-  # MosDNS v4 HTTP DoH server used by doh-gateway.
+  # Internal DoH endpoint consumed by doh-gateway.
   - tag: doh_server
     type: http_server
     args:
