@@ -70,7 +70,7 @@ plugins:
 servers:
   - exec: main_sequence
     timeout: 5
-    listener:
+    listeners:
       - protocol: http
         addr: "127.0.0.1:8081"
         url_path: "/dns-query"
