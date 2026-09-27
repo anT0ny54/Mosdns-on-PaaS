@@ -1,16 +1,13 @@
 # MosDNS v4.5.3
 # Primary: race HaGeZiDNS1 + HaGeZiDNS2 and use the first response.
-# Fallback: keep HaGeZiDNS3 standby and invoke it only when the primary
-# path fails or remains unanswered for 5 seconds.
-# The three dial_addr values are the supplied fixed IPv4 endpoints; the HTTPS
-# hostname remains the TLS name/SNI used for certificate validation.
+# Fallback: keep HaGeZiDNS3 standby and invoke it when the primary path
+# fails or remains unanswered for 5 seconds.
 
 log:
   level: warn
   file: ""
 
 plugins:
-  # Small in-memory DNS cache sized for a 512 MiB service.
   - tag: cache
     type: cache
     args:
@@ -19,7 +16,8 @@ plugins:
       lazy_cache_reply_ttl: 15
       cache_everything: false
 
-  # PRIMARY: both upstreams are queried in parallel by fast_forward.
+  # fast_forward sends to all configured upstreams concurrently and uses
+  # the first valid response.
   - tag: primary_fast
     type: fast_forward
     args:
@@ -35,7 +33,6 @@ plugins:
           idle_timeout: 60
           max_conns: 2
 
-  # SECONDARY: standby-only fallback endpoint.
   - tag: fallback_hagezi
     type: fast_forward
     args:
@@ -46,32 +43,31 @@ plugins:
           idle_timeout: 30
           max_conns: 1
 
+  # IMPORTANT: this is MosDNS v4 sequence syntax.
+  # fallback is an inline sequence command, NOT a plugin type.
   - tag: main_sequence
     type: sequence
     args:
       exec:
-        - exec: $cache
-        - matches: has_resp
-          exec: accept
-
-        # MosDNS v4 fallback is an inline sequence operation, not a standalone
-        # plugin type. fast_fallback is in milliseconds; 5000 = 5 seconds.
+        - cache
+        - if: has_resp
+          exec:
+            - accept
         - primary:
-            - $primary_fast
+            - primary_fast
           secondary:
-            - $fallback_hagezi
+            - fallback_hagezi
           fast_fallback: 5000
           always_standby: false
-        - matches: has_resp
-          exec: accept
 
-  # Internal DoH endpoint consumed by the lightweight gateway.
-  - tag: doh_server
-    type: http_server
-    args:
-      entries:
-        - path: "/dns-query"
-          exec: main_sequence
-      src_ip_header: "X-Forwarded-For"
-      listen: "127.0.0.1:8081"
-      idle_timeout: 10
+# MosDNS v4.5.3 HTTP DoH listener.
+# The external doh-gateway connects to http://127.0.0.1:8081/dns-query.
+servers:
+  - exec: main_sequence
+    timeout: 5
+    listeners:
+      - protocol: http
+        addr: "127.0.0.1:8081"
+        url_path: "/dns-query"
+        get_user_ip_from_header: "X-Forwarded-For"
+        
