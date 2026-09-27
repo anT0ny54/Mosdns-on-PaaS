@@ -1,6 +1,6 @@
 # MosDNS v4.5.3 + DoH Gateway for Koyeb
 
-A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, designed for a **512 MiB / 0.25 vCPU Koyeb web service**.
+A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, designed for a **512 MiB / 0.1 vCPU Koyeb web service**.
 
 ## Architecture
 
@@ -71,9 +71,9 @@ The container is tuned for the requested limits:
 - Runtime: **Alpine Linux 3.24.2**.
 - Build toolchain: **Go 1.19.13**.
 - MosDNS: **v4.5.3**.
-- `GOMAXPROCS=1` to avoid oversubscribing a 0.25 vCPU instance.
+- `GOMAXPROCS=1` to avoid oversubscribing a 0.1 vCPU instance.
 - `GOMEMLIMIT=128MiB` per process to keep the two Go processes well below the 512 MiB service ceiling.
-- Gateway concurrency is capped at **64 in-flight requests**, with at most **32** persistent gateway-to-MosDNS HTTP connections; this prevents large internal queues on a 0.25 vCPU instance.
+- Gateway concurrency is capped at **64 in-flight requests**, with at most **32** persistent gateway-to-MosDNS HTTP connections; this prevents large internal queues on a 0.1 vCPU instance.
 - MosDNS cache is deliberately small (4096 entries) to avoid turning cache memory into the dominant resident set.
 - DoH upstream HTTP/3 is not enabled; persistent HTTP connections/pipelining are used instead to reduce CPU overhead.
 - The unused loopback UDP/TCP MosDNS listeners are omitted; the gateway is the sole consumer of the MosDNS HTTP endpoint.
