@@ -31,6 +31,29 @@ const (
 
 var version = "dev"
 
+var dohGetDecodeBufferPool = sync.Pool{
+	New: func() interface{} {
+		return new([maxDNSMessageBytes]byte)
+	},
+}
+
+var base64URLDecodeTable = func() [256]uint8 {
+	var table [256]uint8
+	for i := range table {
+		table[i] = 0xff
+	}
+	for i := byte(0); i < 26; i++ {
+		table['A'+i] = i
+		table['a'+i] = 26 + i
+	}
+	for i := byte(0); i < 10; i++ {
+		table['0'+i] = 52 + i
+	}
+	table['-'] = 62
+	table['_'] = 63
+	return table
+}()
+
 // fixedWindowLimiter implements an exact N requests per aligned time window per key.
 // It intentionally uses one map per active window so old keys are released without
 // a background goroutine or unbounded per-client history.
@@ -176,12 +199,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		dnsParam := r.URL.Query().Get("dns")
-		if dnsParam == "" || len(dnsParam) > base64.RawURLEncoding.EncodedLen(int(g.maxRequestBytes)) {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		decoded, err := decodeDoHGet(dnsParam)
-		if err != nil || int64(len(decoded)) > g.maxRequestBytes {
+		if !isValidDoHGetParameter(dnsParam, g.maxRequestBytes) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -260,8 +278,69 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(respBody)
 }
 
-func decodeDoHGet(value string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(value)
+func isValidDoHGetParameter(value string, maxBytes int64) bool {
+	if value == "" || maxBytes <= 0 {
+		return false
+	}
+	if int64(len(value)) > int64(base64.RawURLEncoding.EncodedLen(int(maxBytes))) {
+		return false
+	}
+
+	fullGroups := len(value) / 4
+	remainder := len(value) & 3
+	if remainder == 1 {
+		return false
+	}
+	decodedLen := fullGroups * 3
+	if remainder == 2 {
+		decodedLen++
+	} else if remainder == 3 {
+		decodedLen += 2
+	}
+	if decodedLen < 1 || int64(decodedLen) > maxBytes {
+		return false
+	}
+
+	buf := dohGetDecodeBufferPool.Get().(*[maxDNSMessageBytes]byte)
+	defer dohGetDecodeBufferPool.Put(buf)
+
+	out := buf[:decodedLen]
+	ti := 0
+	oi := 0
+
+	for ; ti+4 <= len(value); ti, oi = ti+4, oi+3 {
+		a := base64URLDecodeTable[value[ti]]
+		b := base64URLDecodeTable[value[ti+1]]
+		c := base64URLDecodeTable[value[ti+2]]
+		d := base64URLDecodeTable[value[ti+3]]
+		if a == 0xff || b == 0xff || c == 0xff || d == 0xff {
+			return false
+		}
+		out[oi] = a<<2 | b>>4
+		out[oi+1] = b<<4 | c>>2
+		out[oi+2] = c<<6 | d
+	}
+
+	switch remainder {
+	case 2:
+		a := base64URLDecodeTable[value[ti]]
+		b := base64URLDecodeTable[value[ti+1]]
+		if a == 0xff || b == 0xff {
+			return false
+		}
+		out[oi] = a<<2 | b>>4
+	case 3:
+		a := base64URLDecodeTable[value[ti]]
+		b := base64URLDecodeTable[value[ti+1]]
+		c := base64URLDecodeTable[value[ti+2]]
+		if a == 0xff || b == 0xff || c == 0xff {
+			return false
+		}
+		out[oi] = a<<2 | b>>4
+		out[oi+1] = b<<4 | c>>2
+	}
+
+	return true
 }
 
 func isStrictDoHContentType(value string) bool {

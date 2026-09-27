@@ -1,10 +1,13 @@
 PROJECT := mosdns-koyeb-doh-gateway
 IMAGE ?= $(PROJECT):local
 
-.PHONY: test build docker-build run
+.PHONY: test check-config build docker-build run
 
-test:
+test: check-config
 	go test ./...
+
+check-config:
+	sh ./check-config.sh mosdns.yaml
 
 build:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w -buildid=' -o doh-gateway .

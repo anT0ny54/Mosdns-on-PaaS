@@ -1,17 +1,12 @@
 # MosDNS v4.5.3
-# Primary: race HaGeZiDNS1 + HaGeZiDNS2 and use the first response.
-# Fallback: use HaGeZiDNS3 if the primary path has not responded within 5 seconds.
+# Primary: race two HaGeZi DoH endpoints and use the first response.
+# Fallback: use the standby HaGeZi endpoint after 5 seconds.
 
 log:
   level: warn
   file: ""
 
 plugins:
-  # v4.5.3 has no "has_resp" plugin or matcher at all (that concept only
-  # exists in mosdns v5). Instead, use the cache plugin's built-in
-  # "when_hit" option: on a cache hit, jump straight to the pre-initialized
-  # "_return" plugin, which skips the rest of this sequence (i.e. skips
-  # forwarding) since we already have a response.
   - tag: cache
     type: cache
     args:
@@ -21,7 +16,6 @@ plugins:
       cache_everything: false
       when_hit: _return
 
-  # Primary: fast_forward sends to both upstreams concurrently.
   - tag: primary_fast
     type: fast_forward
     args:
@@ -37,7 +31,6 @@ plugins:
           idle_timeout: 60
           max_conns: 2
 
-  # Secondary: standby fallback endpoint.
   - tag: fallback_hagezi
     type: fast_forward
     args:
@@ -60,13 +53,6 @@ plugins:
           fast_fallback: 5000
           always_standby: false
 
-# v4.5.3 server configuration.
-# NOTE: listener plugins (http_server, udp_server, etc.) are NOT a
-# registrable plugin type in v4 - that's why defining one under "plugins:"
-# always failed with "not defined". Listeners are handled natively via this
-# top-level "servers:" block. The key is "listener:" (singular) - the
-# original config used "listeners:" (plural), which was silently ignored,
-# leaving the server with no listener and causing the same error.
 servers:
   - exec: main_sequence
     timeout: 5
@@ -76,4 +62,3 @@ servers:
         url_path: "/dns-query"
         get_user_ip_from_header: "X-Forwarded-For"
         idle_timeout: 30
-        

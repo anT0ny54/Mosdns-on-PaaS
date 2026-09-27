@@ -1,6 +1,6 @@
 # MosDNS v4.5.3 + DoH Gateway for Koyeb
 
-A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, designed for a **512 MiB / 0.1 vCPU Koyeb web service**.
+A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, designed for a **512 MiB / 0.25 vCPU Koyeb web service**.
 
 ## Architecture
 
@@ -71,9 +71,9 @@ The container is tuned for the requested limits:
 - Runtime: **Alpine Linux 3.24.2**.
 - Build toolchain: **Go 1.19.13**.
 - MosDNS: **v4.5.3**.
-- `GOMAXPROCS=1` to avoid oversubscribing a 0.1 vCPU instance.
+- `GOMAXPROCS=1` to avoid oversubscribing a 0.25 vCPU instance.
 - `GOMEMLIMIT=128MiB` per process to keep the two Go processes well below the 512 MiB service ceiling.
-- Gateway concurrency is capped at **64 in-flight requests**, with at most **32** persistent gateway-to-MosDNS HTTP connections; this prevents large internal queues on a 0.1 vCPU instance.
+- Gateway concurrency is capped at **64 in-flight requests**, with at most **32** persistent gateway-to-MosDNS HTTP connections; this prevents large internal queues on a 0.25 vCPU instance.
 - MosDNS cache is deliberately small (4096 entries) to avoid turning cache memory into the dominant resident set.
 - DoH upstream HTTP/3 is not enabled; persistent HTTP connections/pipelining are used instead to reduce CPU overhead.
 - The unused loopback UDP/TCP MosDNS listeners are omitted; the gateway is the sole consumer of the MosDNS HTTP endpoint.
@@ -102,12 +102,13 @@ The same service can be deployed from this repository using Koyeb's Docker build
 
 ## Build
 
-The root `Makefile` contains the only Makefile in the project.
+The root `Makefile` contains the only Makefile in the project. `make test` requires Python 3.8+ with PyYAML because the configuration test parses YAML structurally.
 
 ```sh
+python3 -m pip install pyyaml
 make test
 make build
-sh check-config.sh mosdns.yaml
+./check-config.sh mosdns.yaml
 ```
 
 Container build:
@@ -141,3 +142,33 @@ The image builds MosDNS v4.5.3 from its tagged source with Go 1.19.13, then buil
 - MosDNS v4.5.3: https://github.com/IrineSistiana/mosdns/tree/v4.5.3
 - HaGeZi DNS: https://github.com/hagezi/dns-servers
 - Koyeb service exposure: https://www.koyeb.com/docs/build-and-deploy/exposing-your-service
+
+## 🌐 Free DNS Services
+
+High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
+
+| Blocklist | DNS-over-HTTPS (DoH) |
+| :--- | :--- |
+| Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+
+## ⚡ Bandwidth Hero Server
+
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
+
+Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
+
+🖥️ **Live Demo:** [Bandwidth Hero](https://bhserv.netlify.app/).
+
+## Supporting the Project
+
+If you find this project useful, donations are appreciated:
+
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
+
+## License
+
+See [`LICENSE`](LICENSE).

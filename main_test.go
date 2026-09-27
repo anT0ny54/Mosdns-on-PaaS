@@ -134,6 +134,37 @@ func TestGETBase64Validation(t *testing.T) {
 	}
 }
 
+func TestDoHGETParameterValidation(t *testing.T) {
+	valid := base64.RawURLEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0x03})
+	if !isValidDoHGetParameter(valid, maxDNSMessageBytes) {
+		t.Fatal("valid raw base64url parameter rejected")
+	}
+	if isValidDoHGetParameter("AQ==", maxDNSMessageBytes) {
+		t.Fatal("padded base64url parameter accepted")
+	}
+	if isValidDoHGetParameter(strings.Repeat("A", base64.RawURLEncoding.EncodedLen(maxDNSMessageBytes)+1), maxDNSMessageBytes) {
+		t.Fatal("oversize base64url parameter accepted")
+	}
+	if isValidDoHGetParameter("AAAA", 1) {
+		t.Fatal("decoded payload above max size accepted")
+	}
+}
+
+func TestDoHGETParameterValidationAllocs(t *testing.T) {
+	valid := base64.RawURLEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07})
+	if !isValidDoHGetParameter(valid, maxDNSMessageBytes) {
+		t.Fatal("valid raw base64url parameter rejected")
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		if !isValidDoHGetParameter(valid, maxDNSMessageBytes) {
+			t.Fatal("valid raw base64url parameter rejected during allocation check")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("validation allocated %.2f times per call, want 0", allocs)
+	}
+}
+
 func TestConcurrencyCap(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
