@@ -8,5 +8,6 @@ README.md
 CHANGELOG.md
 keep-alive.txt
 main_test.go
+throughput_test.go
 Makefile
 check-config.sh
