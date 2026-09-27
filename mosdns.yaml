@@ -42,25 +42,28 @@ plugins:
           idle_timeout: 30
           max_conns: 1
 
-  # v4.5.3 sequence syntax.
-  # NOTE: "matches:" (not "if:") is required to use the built-in has_resp
-  # quick-setup matcher without defining it as a separate plugin. "if:" only
-  # accepts a reference to an already-defined plugin tag, which is why
-  # "if: has_resp" failed with "cannot find matcher has_resp".
-  # The primary/secondary/fast_fallback block below is a valid inline
-  # fallback node embedded directly in the sequence (not a plugin type).
+  # v4.5.3 sequence syntax uses the wrapped "args: { exec: [...] }" form.
+  # In that form, conditions use "if:", which requires a reference to an
+  # already-defined plugin tag (unlike the "matches:" quick-setup shorthand
+  # used in other mosdns config styles, which isn't supported here).
+  # So has_resp must be defined as its own plugin and referenced by tag.
+  - tag: is_resp
+    type: has_resp
+
   - tag: main_sequence
     type: sequence
     args:
-      - exec: cache
-      - matches: has_resp
-        exec: _return
-      - primary:
-          - primary_fast
-        secondary:
-          - fallback_hagezi
-        fast_fallback: 5000
-        always_standby: false
+      exec:
+        - cache
+        - if: is_resp
+          exec:
+            - _return
+        - primary:
+            - primary_fast
+          secondary:
+            - fallback_hagezi
+          fast_fallback: 5000
+          always_standby: false
 
   # v4.5.3 server configuration.
   # NOTE: mosdns v4.5.3 does not support the top-level "servers:" shortcut
