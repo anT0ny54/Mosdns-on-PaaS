@@ -52,17 +52,15 @@ plugins:
   - tag: main_sequence
     type: sequence
     args:
-      exec:
-        - cache
-        - matches: has_resp
-          exec:
-            - _return
-        - primary:
-            - primary_fast
-          secondary:
-            - fallback_hagezi
-          fast_fallback: 5000
-          always_standby: false
+      - exec: cache
+      - matches: has_resp
+        exec: _return
+      - primary:
+          - primary_fast
+        secondary:
+          - fallback_hagezi
+        fast_fallback: 5000
+        always_standby: false
 
   # v4.5.3 server configuration.
   # NOTE: mosdns v4.5.3 does not support the top-level "servers:" shortcut
