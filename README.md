@@ -57,12 +57,12 @@ The gateway enforces:
 - **100 requests / 60 seconds / client IP** using a fixed-window limiter.
 - At most **65536 distinct client keys per rate-limit window in the shipped Docker image**; new clients are rejected with HTTP 429 once the memory guard is full. The Go source default is also 65536 when `RATE_LIMIT_CLIENTS` is not set.
 - Up to **512 active requests per service instance** can be admitted; requests beyond that receive an immediate HTTP 503.
-- The shipped Docker image limits backend processing to **24 requests at once** (`MAX_CONCURRENT_REQUESTS=24`). A queued request waits at most **100ms** (`QUEUE_WAIT=100ms`) for a processing slot; if no slot opens, it receives HTTP 503 immediately instead of accumulating long tail latency. This separates burst absorption from CPU/upstream concurrency.
+- The shipped Docker image limits backend processing to **32 requests at once** (`MAX_CONCURRENT_REQUESTS=32`). A queued request waits at most **100ms** (`QUEUE_WAIT=100ms`) for a processing slot; if no slot opens, it receives HTTP 503 immediately instead of accumulating long tail latency. This separates burst absorption from CPU/upstream concurrency.
 - Maximum DoH DNS message size of **4096 bytes** for both request and response.
 - DoH POST requires `Content-Type: application/dns-message`.
 - DoH GET requires a valid unpadded URL-safe base64 `dns` parameter.
 - `ReadHeaderTimeout=5s`, `ReadTimeout=8s`, `WriteTimeout=8s`, `IdleTimeout=20s`.
-- Upstream response-header timeout is **5s**; the shipped Docker image sets the gateway's overall upstream request context timeout to **4s** (`UPSTREAM_TIMEOUT=4s`). The HTTP client permits up to **24 connections per MosDNS host**.
+- Upstream response-header timeout is **5s**; the shipped Docker image sets the gateway's overall upstream request context timeout to **4s** (`UPSTREAM_TIMEOUT=4s`). The HTTP client permits up to **32 connections per MosDNS host**.
 - Request logging is disabled by default.
 
 The client-IP source defaults to `X-Forwarded-For`, matching the Koyeb reverse-proxy deployment model. The gateway falls back to `X-Real-IP` and then the socket peer address.
@@ -76,8 +76,8 @@ The container is configured for the target limits:
 - MosDNS: **v4.5.3**.
 - `GOMAXPROCS=1` keeps the gateway and MosDNS from oversubscribing a 0.1 vCPU instance.
 - `GOGC=150` reduces garbage-collection frequency while `GOMEMLIMIT=160MiB` provides the configured soft runtime memory target per Go process in the shipped image.
-- The gateway admits up to **512 active requests**, but the shipped image limits backend processing to **24** at once and fast-rejects requests that wait more than **100ms** for a processing slot. This keeps burst memory and upstream work bounded for a 0.1 vCPU instance.
-- The HTTP client allows up to **24 connections per MosDNS host** and **128 idle connections globally**. The 24-connection transport limit matches the processing semaphore.
+- The gateway admits up to **512 active requests**, but the shipped image limits backend processing to **32** at once and fast-rejects requests that wait more than **100ms** for a processing slot. This keeps burst memory and upstream work bounded for a 0.1 vCPU instance.
+- The HTTP client allows up to **32 connections per MosDNS host** and **128 idle connections globally**. The 32-connection transport limit matches the processing semaphore.
 - MosDNS uses a **32768-entry cache** and a **30-second lazy-cache reply TTL**, with `lazy_cache_ttl=3600s` and `cache_everything=false`, to reduce repeated upstream traffic without caching every response indiscriminately.
 - DoH upstream HTTP/3 is not enabled; the configured upstream entries enable MosDNS upstream connection pipelining, use `idle_timeout=20s`, and allow `max_conns=2` per upstream.
 - The unused loopback UDP/TCP MosDNS listeners are omitted; the gateway is the sole consumer of the MosDNS HTTP endpoint.
@@ -92,11 +92,11 @@ These are the effective defaults baked into the Docker image and `mosdns.yaml`:
 | `RATE_LIMIT` | `100` requests / `60s` | Dockerfile |
 | `RATE_LIMIT_CLIENTS` | `65536` | Dockerfile |
 | `MAX_ACTIVE_REQUESTS` | `512` | Go default |
-| `MAX_CONCURRENT_REQUESTS` | `24` | Dockerfile |
+| `MAX_CONCURRENT_REQUESTS` | `32` | Dockerfile |
 | `QUEUE_WAIT` | `100ms` | Dockerfile |
 | `UPSTREAM_TIMEOUT` | `4s` | Dockerfile |
 | HTTP response-header timeout | `5s` | Go transport |
-| HTTP max connections per MosDNS host | `24` | Go transport |
+| HTTP max connections per MosDNS host | `32` | Go transport |
 | HTTP max idle connections | `128` | Go transport |
 | `GOMAXPROCS` | `1` | Dockerfile |
 | `GOGC` | `150` | Dockerfile |
@@ -106,7 +106,7 @@ These are the effective defaults baked into the Docker image and `mosdns.yaml`:
 | MosDNS lazy-cache TTL | `3600s` | `mosdns.yaml` |
 | MosDNS `cache_everything` | `false` | `mosdns.yaml` |
 
-The Go source defaults are **24 concurrent backend requests**, **65536 rate-limit client keys**, and a **4s upstream timeout** when the corresponding environment variables are not set. The shipped Docker image keeps the upstream timeout at the Go default of **4s**; its concurrency and client-key values match the Go defaults.
+The Go source defaults are **32 concurrent backend requests**, **65536 rate-limit client keys**, and a **4s upstream timeout** when the corresponding environment variables are not set. The shipped Docker image keeps the upstream timeout at the Go default of **4s**; its concurrency and client-key values match the Go defaults.
 
 ## Koyeb deployment
 

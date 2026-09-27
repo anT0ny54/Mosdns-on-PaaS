@@ -25,7 +25,7 @@ const (
 	defaultRateLimit         = 100
 	defaultRateWindow        = 60 * time.Second
 	defaultRateLimitClients  = 65536
-	defaultConcurrency       = 24
+	defaultConcurrency       = 32
 	defaultMaxActiveRequests = 512
 	defaultUpstreamTO        = 4 * time.Second
 	defaultReadHeaderTimeout = 5 * time.Second

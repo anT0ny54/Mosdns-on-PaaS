@@ -285,8 +285,8 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 	if defaultMaxActiveRequests != 512 {
 		t.Fatalf("default active-request capacity=%d, want 512", defaultMaxActiveRequests)
 	}
-	if defaultConcurrency != 24 {
-		t.Fatalf("default backend processing cap=%d, want 24", defaultConcurrency)
+	if defaultConcurrency != 32 {
+		t.Fatalf("default backend processing cap=%d, want 32", defaultConcurrency)
 	}
 	transport := newHTTPClient().Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost != defaultConcurrency {
@@ -299,7 +299,7 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 
 func TestActiveRequestBurstCapacity(t *testing.T) {
 	const burst = 512
-	const processingCap = 24
+	const processingCap = 32
 
 	backendRelease := make(chan struct{})
 	backendEntered := make(chan struct{}, burst)
@@ -353,7 +353,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 		}()
 	}
 
-	// Once the burst is admitted, exactly 24 should have
+	// Once the burst is admitted, exactly 32 should have
 	// reached the MosDNS backend and the remaining requests should be queued.
 	deadline := time.Now().Add(2 * time.Second)
 	for len(g.activeSlots) < burst && time.Now().Before(deadline) {
