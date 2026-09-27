@@ -60,18 +60,20 @@ plugins:
           fast_fallback: 5000
           always_standby: false
 
-  # v4.5.3 server configuration.
-  # NOTE: mosdns v4.5.3 does not support the top-level "servers:" shortcut
-  # section used in newer versions. The listener must be defined as an
-  # explicit plugin of type "http_server", which is what was missing and
-  # caused "plugin type http_server not defined".
-  - tag: http_server
-    type: http_server
-    args:
-      entries:
-        - path: "/dns-query"
-          exec: main_sequence
-      listen: "127.0.0.1:8081"
-      src_ip_header: "X-Forwarded-For"
-      idle_timeout: 30
-      
+# v4.5.3 server configuration.
+# NOTE: listener plugins (http_server, udp_server, etc.) are NOT a
+# registrable plugin type in v4 - that's why defining one under "plugins:"
+# always failed with "not defined". Listeners are handled natively via this
+# top-level "servers:" block. The key is "listener:" (singular) - the
+# original config used "listeners:" (plural), which was silently ignored,
+# leaving the server with no listener and causing the same error.
+servers:
+  - exec: main_sequence
+    timeout: 5
+    listener:
+      - protocol: http
+        addr: "127.0.0.1:8081"
+        url_path: "/dns-query"
+        get_user_ip_from_header: "X-Forwarded-For"
+        idle_timeout: 30
+        
