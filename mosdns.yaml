@@ -1,7 +1,7 @@
 # MosDNS v4.5.3
 # Primary: race HaGeZiDNS1 + HaGeZiDNS2 and use the first response.
 # Fallback: keep HaGeZiDNS3 standby and invoke it only when the primary
-# path fails or remains unanswered past the 5-second threshold.
+# path fails or remains unanswered for 5 seconds.
 # The three dial_addr values are the supplied fixed IPv4 endpoints; the HTTPS
 # hostname remains the TLS name/SNI used for certificate validation.
 
@@ -46,17 +46,6 @@ plugins:
           idle_timeout: 30
           max_conns: 1
 
-  # Native MosDNS fallback keeps the primary path authoritative while allowing
-  # the secondary to take over after a primary failure/5-second slow response.
-  # always_standby=false avoids sending every query to the fallback endpoint.
-  - tag: hagezi_fallback
-    type: fallback
-    args:
-      primary: primary_fast
-      secondary: fallback_hagezi
-      threshold: 5000
-      always_standby: false
-
   - tag: main_sequence
     type: sequence
     args:
@@ -64,7 +53,13 @@ plugins:
       - matches: has_resp
         exec: accept
 
-      - exec: $hagezi_fallback
+      # MosDNS v4 fallback is an inline sequence operation, not a standalone
+      # plugin type. fast_fallback is in milliseconds; 5000 = 5 seconds.
+      - exec:
+          primary: $primary_fast
+          secondary: $fallback_hagezi
+          fast_fallback: 5000
+          always_standby: false
       - matches: has_resp
         exec: accept
 
