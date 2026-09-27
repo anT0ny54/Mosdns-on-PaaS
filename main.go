@@ -25,10 +25,11 @@ const (
 	defaultRateLimit         = 100
 	defaultRateWindow        = 60 * time.Second
 	defaultRateLimitClients  = 65536
-	defaultConcurrency       = 64
-	defaultMaxActiveRequests = 5000
-	defaultUpstreamTO        = 6 * time.Second
+	defaultConcurrency       = 24
+	defaultMaxActiveRequests = 512
+	defaultUpstreamTO        = 4 * time.Second
 	defaultReadHeaderTimeout = 5 * time.Second
+	defaultQueueWait         = 100 * time.Millisecond
 	defaultReadTimeout       = 8 * time.Second
 	defaultWriteTimeout      = 8 * time.Second
 	defaultIdleTimeout       = 20 * time.Second
@@ -150,6 +151,7 @@ type gateway struct {
 	limiter          *fixedWindowLimiter
 	activeSlots      chan struct{}
 	processingSlots  chan struct{}
+	queueWait        time.Duration
 	upstreamTimeout  time.Duration
 	maxRequestBytes  int64
 	maxResponseBytes int64
@@ -218,11 +220,16 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	queueTimer := time.NewTimer(g.queueWait)
+	defer queueTimer.Stop()
 	select {
 	case g.processingSlots <- struct{}{}:
 		defer func() { <-g.processingSlots }()
+	case <-queueTimer.C:
+		w.Header().Set("Retry-After", "1")
+		writeText(w, http.StatusServiceUnavailable, "server busy\n")
+		return
 	case <-r.Context().Done():
-		w.WriteHeader(http.StatusGatewayTimeout)
 		return
 	}
 
@@ -485,8 +492,9 @@ func writeText(w http.ResponseWriter, status int, body string) {
 }
 
 func copyRequestHeaders(dst, src http.Header) {
+	connectionTokens := connectionHeaderTokens(src)
 	for k, values := range src {
-		if isHopByHopHeader(k) || strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "X-Forwarded-For") {
+		if isHopByHopHeader(k) || connectionTokens[strings.ToLower(k)] || strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "X-Forwarded-For") {
 			continue
 		}
 		for _, v := range values {
@@ -496,14 +504,28 @@ func copyRequestHeaders(dst, src http.Header) {
 }
 
 func copyResponseHeaders(dst, src http.Header) {
+	connectionTokens := connectionHeaderTokens(src)
 	for k, values := range src {
-		if isHopByHopHeader(k) || strings.EqualFold(k, "Content-Length") {
+		if isHopByHopHeader(k) || connectionTokens[strings.ToLower(k)] || strings.EqualFold(k, "Content-Length") {
 			continue
 		}
 		for _, v := range values {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func connectionHeaderTokens(h http.Header) map[string]bool {
+	tokens := make(map[string]bool)
+	for _, value := range h.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token != "" {
+				tokens[strings.ToLower(token)] = true
+			}
+		}
+	}
+	return tokens
 }
 
 func isHopByHopHeader(name string) bool {
@@ -586,6 +608,7 @@ func main() {
 	processingConcurrency := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
 	maxActiveRequests := envInt("MAX_ACTIVE_REQUESTS", defaultMaxActiveRequests)
 	maxRateLimitClients := envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients)
+	queueWait := envDuration("QUEUE_WAIT", defaultQueueWait)
 	upstreamTimeout := envDuration("UPSTREAM_TIMEOUT", defaultUpstreamTO)
 	trustedIPHeader := envString("CLIENT_IP_HEADER", "X-Forwarded-For")
 
@@ -595,6 +618,7 @@ func main() {
 		limiter:          newFixedWindowLimiterWithMaxKeys(limit, window, maxRateLimitClients),
 		activeSlots:      make(chan struct{}, maxActiveRequests),
 		processingSlots:  make(chan struct{}, processingConcurrency),
+		queueWait:        queueWait,
 		upstreamTimeout:  upstreamTimeout,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,

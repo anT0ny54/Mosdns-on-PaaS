@@ -117,6 +117,7 @@ func throughputHarness() (*gateway, *httptest.Server, *http.Client, func()) {
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, defaultMaxActiveRequests),
 		processingSlots:  make(chan struct{}, defaultConcurrency),
+		queueWait:        defaultQueueWait,
 		upstreamTimeout:  2 * time.Second,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,

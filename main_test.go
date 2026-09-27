@@ -21,6 +21,7 @@ func testGateway(backend string, limit int, concurrency int) *gateway {
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, 5000),
 		processingSlots:  make(chan struct{}, concurrency),
+		queueWait:        defaultQueueWait,
 		upstreamTimeout:  2 * time.Second,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,
@@ -281,11 +282,11 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 	if defaultRateLimitClients != 65536 {
 		t.Fatalf("default rate-limit client guard=%d, want 65536", defaultRateLimitClients)
 	}
-	if defaultMaxActiveRequests != 5000 {
-		t.Fatalf("default active-request capacity=%d, want 5000", defaultMaxActiveRequests)
+	if defaultMaxActiveRequests != 512 {
+		t.Fatalf("default active-request capacity=%d, want 512", defaultMaxActiveRequests)
 	}
-	if defaultConcurrency != 64 {
-		t.Fatalf("default backend processing cap=%d, want 64", defaultConcurrency)
+	if defaultConcurrency != 24 {
+		t.Fatalf("default backend processing cap=%d, want 24", defaultConcurrency)
 	}
 	transport := newHTTPClient().Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost != defaultConcurrency {
@@ -296,9 +297,9 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 	}
 }
 
-func TestFiveThousandActiveRequests(t *testing.T) {
-	const burst = 5000
-	const processingCap = 64
+func TestActiveRequestBurstCapacity(t *testing.T) {
+	const burst = 512
+	const processingCap = 24
 
 	backendRelease := make(chan struct{})
 	backendEntered := make(chan struct{}, burst)
@@ -330,6 +331,7 @@ func TestFiveThousandActiveRequests(t *testing.T) {
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, burst),
 		processingSlots:  make(chan struct{}, processingCap),
+		queueWait:        5 * time.Second,
 		upstreamTimeout:  5 * time.Second,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,
@@ -351,7 +353,7 @@ func TestFiveThousandActiveRequests(t *testing.T) {
 		}()
 	}
 
-	// Once all 5,000 requests have been admitted, exactly 64 should have
+	// Once the burst is admitted, exactly 24 should have
 	// reached the MosDNS backend and the remaining requests should be queued.
 	deadline := time.Now().Add(2 * time.Second)
 	for len(g.activeSlots) < burst && time.Now().Before(deadline) {
@@ -420,6 +422,29 @@ type failingReader struct {
 
 func (r failingReader) Read([]byte) (int, error) { return 0, r.readErr }
 func (r failingReader) Close() error             { return nil }
+
+func TestConnectionHeaderTokensAreStripped(t *testing.T) {
+	src := make(http.Header)
+	src.Add("Connection", "X-Request-Token, X-Another")
+	src.Set("X-Request-Token", "secret")
+	src.Set("X-Another", "secret2")
+	src.Set("X-Keep", "safe")
+
+	dst := make(http.Header)
+	copyRequestHeaders(dst, src)
+	if dst.Get("X-Request-Token") != "" || dst.Get("X-Another") != "" {
+		t.Fatalf("connection-token request headers leaked: %v", dst)
+	}
+	if dst.Get("X-Keep") != "safe" {
+		t.Fatalf("ordinary request header lost: %v", dst)
+	}
+
+	dst = make(http.Header)
+	copyResponseHeaders(dst, src)
+	if dst.Get("X-Request-Token") != "" || dst.Get("X-Another") != "" {
+		t.Fatalf("connection-token response headers leaked: %v", dst)
+	}
+}
 
 func TestKoyebClientIPUsesLastXForwardedFor(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
