@@ -7,6 +7,11 @@ log:
   file: ""
 
 plugins:
+  # v4.5.3 has no "has_resp" plugin or matcher at all (that concept only
+  # exists in mosdns v5). Instead, use the cache plugin's built-in
+  # "when_hit" option: on a cache hit, jump straight to the pre-initialized
+  # "_return" plugin, which skips the rest of this sequence (i.e. skips
+  # forwarding) since we already have a response.
   - tag: cache
     type: cache
     args:
@@ -14,6 +19,7 @@ plugins:
       lazy_cache_ttl: 3600
       lazy_cache_reply_ttl: 15
       cache_everything: false
+      when_hit: _return
 
   # Primary: fast_forward sends to both upstreams concurrently.
   - tag: primary_fast
@@ -42,22 +48,11 @@ plugins:
           idle_timeout: 30
           max_conns: 1
 
-  # v4.5.3 sequence syntax uses the wrapped "args: { exec: [...] }" form.
-  # In that form, conditions use "if:", which requires a reference to an
-  # already-defined plugin tag (unlike the "matches:" quick-setup shorthand
-  # used in other mosdns config styles, which isn't supported here).
-  # So has_resp must be defined as its own plugin and referenced by tag.
-  - tag: is_resp
-    type: has_resp
-
   - tag: main_sequence
     type: sequence
     args:
       exec:
         - cache
-        - if: is_resp
-          exec:
-            - _return
         - primary:
             - primary_fast
           secondary:
