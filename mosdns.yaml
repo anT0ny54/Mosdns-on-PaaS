@@ -49,19 +49,21 @@ plugins:
   - tag: main_sequence
     type: sequence
     args:
-      - exec: $cache
-      - matches: has_resp
-        exec: accept
+      exec:
+        - exec: $cache
+        - matches: has_resp
+          exec: accept
 
-      # MosDNS v4 fallback is an inline sequence operation, not a standalone
-      # plugin type. fast_fallback is in milliseconds; 5000 = 5 seconds.
-      - exec:
-          primary: $primary_fast
-          secondary: $fallback_hagezi
+        # MosDNS v4 fallback is an inline sequence operation, not a standalone
+        # plugin type. fast_fallback is in milliseconds; 5000 = 5 seconds.
+        - primary:
+            - $primary_fast
+          secondary:
+            - $fallback_hagezi
           fast_fallback: 5000
           always_standby: false
-      - matches: has_resp
-        exec: accept
+        - matches: has_resp
+          exec: accept
 
   # Internal DoH endpoint consumed by the lightweight gateway.
   - tag: doh_server
