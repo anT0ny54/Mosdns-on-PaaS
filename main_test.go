@@ -285,7 +285,7 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 	if defaultMaxActiveRequests != 512 {
 		t.Fatalf("default active-request capacity=%d, want 512", defaultMaxActiveRequests)
 	}
-	if defaultConcurrency != 32 {
+	if defaultConcurrency != 20 {
 		t.Fatalf("default backend processing cap=%d, want 32", defaultConcurrency)
 	}
 	transport := newHTTPClient().Transport.(*http.Transport)
@@ -298,8 +298,8 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 }
 
 func TestActiveRequestBurstCapacity(t *testing.T) {
-	const burst = 512
-	const processingCap = 32
+	const burst = 128
+	const processingCap = 20
 
 	backendRelease := make(chan struct{})
 	backendEntered := make(chan struct{}, burst)
@@ -331,7 +331,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, burst),
 		processingSlots:  make(chan struct{}, processingCap),
-		queueWait:        5 * time.Second,
+		queueWait:        10 * time.Second,
 		upstreamTimeout:  5 * time.Second,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,
@@ -353,7 +353,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 		}()
 	}
 
-	// Once the burst is admitted, exactly 32 should have
+	// Once the burst is admitted, exactly 20 should have
 	// reached the MosDNS backend and the remaining requests should be queued.
 	deadline := time.Now().Add(2 * time.Second)
 	for len(g.activeSlots) < burst && time.Now().Before(deadline) {
@@ -480,8 +480,11 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 
 func TestReadyEndpointTracksBackend(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("dns") == "" {
+			t.Fatal("readiness probe did not send a dns parameter")
+		}
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte{0, 1, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
 	}))
 	g := testGateway(backend.URL, 100, 10)
 	w := httptest.NewRecorder()
@@ -489,12 +492,51 @@ func TestReadyEndpointTracksBackend(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("live backend: got %d", w.Code)
 	}
-	backend.Close()
 
+	backend.Close()
 	w = httptest.NewRecorder()
 	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("dead backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestReadyEndpointRejectsServfail(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0, 1, 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("SERVFAIL backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	g := testGateway("http://127.0.0.1:1", 100, 1)
+	g.metrics.requestsTotal.Add(7)
+	g.metrics.queueWaitSamples.Add(2)
+	g.metrics.queueWaitNanos.Add(uint64(150 * time.Millisecond))
+
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"doh_gateway_requests_total 7",
+		"doh_gateway_queue_timeout_total",
+		"doh_gateway_ready_probe_total{result=\"ready\"}",
+		"doh_gateway_queue_wait_seconds_avg 0.075000",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q in %s", want, body)
+		}
 	}
 }
 

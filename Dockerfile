@@ -17,7 +17,7 @@ FROM golang:${GO_VERSION}-bookworm AS gateway-builder
 WORKDIR /src
 COPY go.mod ./
 COPY main.go ./
-ARG GATEWAY_VERSION=0.3.0
+ARG GATEWAY_VERSION=0.4.0
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${GATEWAY_VERSION}" \
@@ -27,7 +27,7 @@ FROM alpine:${ALPINE_VERSION}
 
 ARG BUILD_DATE=unknown
 ARG MOSDNS_VERSION=v4.5.3
-ARG GATEWAY_VERSION=0.3.0
+ARG GATEWAY_VERSION=0.4.0
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S app \
@@ -44,13 +44,13 @@ RUN chmod 0755 /usr/local/bin/mosdns /usr/local/bin/doh-gateway /usr/local/bin/e
 ENV PORT=8080 \
     MOSDNS_CONFIG=/etc/mosdns/config.yaml \
     MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query \
-    RATE_LIMIT=100 \
+    RATE_LIMIT=240 \
     RATE_WINDOW=60s \
     RATE_LIMIT_CLIENTS=65536 \
     MAX_ACTIVE_REQUESTS=512 \
-    MAX_CONCURRENT_REQUESTS=32 \
-    QUEUE_WAIT=100ms \
-    UPSTREAM_TIMEOUT=4s \
+    MAX_CONCURRENT_REQUESTS=20 \
+    QUEUE_WAIT=200ms \
+    UPSTREAM_TIMEOUT=2s \
     CLIENT_IP_HEADER=X-Forwarded-For \
     GOMAXPROCS=1 \
     GOGC=150 \

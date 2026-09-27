@@ -1,6 +1,6 @@
 # MosDNS v4.5.3
 # Primary: race two HaGeZi DoH endpoints and use the first response.
-# Fallback: use the standby HaGeZi endpoint after 2 seconds.
+# Fallback: use the standby HaGeZi endpoint after 400 ms.
 
 log:
   level: error
@@ -50,12 +50,12 @@ plugins:
             - primary_fast
           secondary:
             - fallback_hagezi
-          fast_fallback: 2000
+          fast_fallback: 400
           always_standby: false
 
 servers:
   - exec: main_sequence
-    timeout: 5
+    timeout: 2
     listeners:
       - protocol: http
         addr: "127.0.0.1:8081"
