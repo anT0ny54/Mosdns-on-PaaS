@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -474,9 +475,9 @@ func TestKoyebClientIPUsesLastXForwardedFor(t *testing.T) {
 }
 
 func TestPOSTReadErrorRejected(t *testing.T) {
-	called := false
+	var called atomic.Bool
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
+		called.Store(true)
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write([]byte{0x01})
 	}))
@@ -491,32 +492,40 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("got %d, want %d", w.Code, http.StatusBadRequest)
 	}
-	if called {
+	if called.Load() {
 		t.Fatal("backend was called after request body read failure")
 	}
 }
 
-// probeReplyIDBytes extracts the transaction ID (the first two wire bytes)
-// from a readiness probe's base64url-encoded "dns" query parameter, so a
-// test backend can echo it back rather than guessing the gateway's
-// internal sequence counter.
-func probeReplyIDBytes(t *testing.T, r *http.Request) (byte, byte) {
+// probeResponse builds a minimal but well-formed DNS response to a readiness
+// probe: it echoes the probe's transaction ID and question section and sets
+// the given RCODE, so tests exercise the gateway's full response validation.
+func probeResponse(t *testing.T, r *http.Request, rcode byte) []byte {
+	// Called from HTTP handler goroutines, where t.Fatal/FailNow is not
+	// allowed, so failures are reported with t.Errorf and an empty reply.
 	dns := r.URL.Query().Get("dns")
 	if dns == "" {
-		t.Fatal("readiness probe did not send a dns parameter")
+		t.Errorf("readiness probe did not send a dns parameter")
+		return nil
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(dns)
-	if err != nil || len(decoded) < 2 {
-		t.Fatalf("readiness probe sent an unparseable dns parameter: %q", dns)
+	if err != nil || len(decoded) <= 12 {
+		t.Errorf("readiness probe sent an unparseable dns parameter: %q", dns)
+		return nil
 	}
-	return decoded[0], decoded[1]
+	resp := make([]byte, 12, len(decoded))
+	copy(resp, decoded[:2]) // transaction ID
+	resp[2] = 0x81          // QR + RD
+	resp[3] = 0x80 | rcode  // RA + RCODE
+	resp[5] = 0x01          // QDCOUNT = 1
+	resp = append(resp, decoded[12:]...) // echo the question section
+	return resp
 }
 
 func TestReadyEndpointTracksBackend(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		idLo, idHi := probeReplyIDBytes(t, r)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{idLo, idHi, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
+		_, _ = w.Write(probeResponse(t, r, 0))
 	}))
 	g := testGateway(backend.URL, 100, 10)
 	w := httptest.NewRecorder()
@@ -535,9 +544,8 @@ func TestReadyEndpointTracksBackend(t *testing.T) {
 
 func TestReadyEndpointRejectsServfail(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		idLo, idHi := probeReplyIDBytes(t, r)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{idLo, idHi, 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0})
+		_, _ = w.Write(probeResponse(t, r, 2)) // SERVFAIL
 	}))
 	defer backend.Close()
 
@@ -549,13 +557,35 @@ func TestReadyEndpointRejectsServfail(t *testing.T) {
 	}
 }
 
+func TestReadyEndpointRejectsBareHeader(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := probeResponse(t, r, 0)
+		if len(resp) >= 12 {
+			resp = resp[:12] // strip the echoed question
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(resp)
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("question-less backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
 func TestReadyEndpointRejectsMismatchedID(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		probeReplyIDBytes(t, r) // validate the probe shape, then ignore the real ID
-		w.Header().Set("Content-Type", "application/dns-message")
+		resp := probeResponse(t, r, 0)
 		// Deliberately echo the wrong transaction ID; the gateway must
-		// treat this as not ready even though QR/RCODE look fine.
-		_, _ = w.Write([]byte{0xff, 0xff, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
+		// treat this as not ready even though QR/RCODE/question look fine.
+		if len(resp) >= 2 {
+			resp[0], resp[1] = 0xff, 0xff
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(resp)
 	}))
 	defer backend.Close()
 
@@ -593,7 +623,7 @@ func TestMetricsEndpoint(t *testing.T) {
 
 func TestResponseBoundsAndContentType(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Header.Get("X-Test-Mode") {
+		switch r.URL.Query().Get("mode") {
 		case "oversize":
 			w.Header().Set("Content-Type", "application/dns-message")
 			_, _ = w.Write(make([]byte, maxDNSMessageBytes+1))
@@ -614,10 +644,12 @@ func TestResponseBoundsAndContentType(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := testGateway(backend.URL, 100, 10)
+			// Client headers are never forwarded, so the backend mode is
+			// selected through the backend URL's own query string.
+			g.backendURL = backend.URL + "?mode=" + tc.mode
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 			r.Header.Set("Content-Type", "application/dns-message")
-			r.Header.Set("X-Test-Mode", tc.mode)
 			g.ServeHTTP(w, r)
 			if w.Code != tc.want {
 				t.Fatalf("got %d, want %d", w.Code, tc.want)
@@ -656,12 +688,35 @@ func TestGETRejectsPaddedBase64URL(t *testing.T) {
 	}
 }
 
+func TestGETPreservesExistingBackendQuery(t *testing.T) {
+	payload := []byte(testDNSBody)
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("static") != "yes" {
+			t.Errorf("backend lost its static query param: %q", r.URL.RawQuery)
+		}
+		if r.URL.Query().Get("dns") != encoded {
+			t.Errorf("backend got dns=%q, want %q", r.URL.Query().Get("dns"), encoded)
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(payload)
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL+"?static=yes", 100, 10)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d", w.Code)
+	}
+}
+
 func TestGETValidBase64URL(t *testing.T) {
 	payload := []byte(testDNSBody)
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("dns") != encoded {
-			t.Fatalf("backend got dns=%q, want %q", r.URL.Query().Get("dns"), encoded)
+			t.Errorf("backend got dns=%q, want %q", r.URL.Query().Get("dns"), encoded)
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write(payload)
@@ -849,13 +904,21 @@ func TestClientIPHeaderTrust(t *testing.T) {
 	}
 }
 
+func TestClientIPHeaderInvalidFallsBackToRealIP(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil) // RemoteAddr 192.0.2.1:1234
+	r.Header.Set("X-Forwarded-For", "not-an-ip")
+	r.Header.Set("X-Real-IP", "203.0.113.8")
+	if got := extractClientIP(r, "X-Forwarded-For"); got != "203.0.113.8" {
+		t.Fatalf("invalid preferred header did not fall back to X-Real-IP: got %q", got)
+	}
+}
+
 func TestReadyEndpointCachesResult(t *testing.T) {
 	var hits int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		idLo, idHi := probeReplyIDBytes(t, r)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{idLo, idHi, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
+		_, _ = w.Write(probeResponse(t, r, 0))
 	}))
 	defer backend.Close()
 
@@ -892,5 +955,105 @@ func TestMetricsCountGatewayGeneratedResponses(t *testing.T) {
 	}
 	if got := g.metrics.responses5xxTotal.Load(); got != 1 {
 		t.Fatalf("5xx count=%d, want 1", got)
+	}
+}
+
+func TestBackendRedirectIsNotFollowed(t *testing.T) {
+	var followed int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&followed, 1)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer target.Close()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("redirecting backend: got %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if w.Header().Get("Location") != "" {
+		t.Fatalf("Location header relayed to the client: %v", w.Header())
+	}
+	if atomic.LoadInt32(&followed) != 0 {
+		t.Fatal("gateway followed a backend redirect")
+	}
+	if got := g.metrics.backendErrorTotal.Load(); got != 1 {
+		t.Fatalf("backend errors=%d, want 1", got)
+	}
+}
+
+func TestTransportHeaderTimeoutMapsTo504(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	// The transport's response-header timeout fires well before the request
+	// context deadline; it must still be reported as a gateway timeout.
+	g.client = newHTTPClient(10, 50*time.Millisecond)
+	g.upstreamTimeout = 5 * time.Second
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("got %d, want %d", w.Code, http.StatusGatewayTimeout)
+	}
+}
+
+func TestClientDisconnectIsNotABackendError(t *testing.T) {
+	started := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody)).WithContext(ctx)
+	r.Header.Set("Content-Type", "application/dns-message")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	<-started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the client went away")
+	}
+	if got := g.metrics.backendErrorTotal.Load(); got != 0 {
+		t.Fatalf("client disconnect counted as %d backend errors, want 0", got)
+	}
+}
+
+func TestMetricsExposeSampleCounters(t *testing.T) {
+	g := testGateway("http://127.0.0.1:1", 100, 1)
+	g.metrics.queueWaitSamples.Add(3)
+	g.metrics.backendLatencySamples.Add(5)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := w.Body.String()
+	for _, want := range []string{
+		"doh_gateway_queue_wait_samples_total 3",
+		"doh_gateway_backend_latency_samples_total 5",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q in %s", want, body)
+		}
 	}
 }

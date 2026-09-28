@@ -73,6 +73,10 @@ def exact_bool(value, path: str) -> bool:
     return value
 
 
+def strip_comments(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
 def check_ip(value, path: str) -> None:
     try:
         ipaddress.ip_address(non_empty_string(value, path))
@@ -243,7 +247,8 @@ dockerfile = config_path.resolve().parent / "Dockerfile"
 if dockerfile.is_file() and protocol in {"http", "doh"}:
     import re
 
-    match = re.search(r"MOSDNS_DOH_URL=(\S+)", dockerfile.read_text(encoding="utf-8"))
+    # Comment lines are dropped first so a mention there is never mistaken for the setting.
+    match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", strip_comments(dockerfile.read_text(encoding="utf-8")))
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
     backend = urlsplit(match.group(1).rstrip("\\"))
@@ -252,6 +257,44 @@ if dockerfile.is_file() and protocol in {"http", "doh"}:
         fail(f"Dockerfile MOSDNS_DOH_URL port {backend.port} does not match listener port {listener_port}")
     if backend.path != listener["url_path"]:
         fail(f"Dockerfile MOSDNS_DOH_URL path {backend.path!r} does not match listener url_path {listener['url_path']!r}")
+
+# Timeout chain: fast_fallback < MosDNS server timeout < gateway UPSTREAM_TIMEOUT.
+# Otherwise the standby upstream is never tried, or the gateway gives up (504)
+# before MosDNS can answer (SERVFAIL).
+import re
+
+server_timeout_ms = server["timeout"] * 1000
+if fallback["fast_fallback"] >= server_timeout_ms:
+    fail(
+        f"fast_fallback ({fallback['fast_fallback']} ms) must be below servers[0].timeout ({server_timeout_ms} ms)"
+    )
+
+project_dir = config_path.resolve().parent
+gateway_timeout_ms = None
+dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
+env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s)\b", dockerfile_text)
+if env_match:
+    gateway_timeout_ms = float(env_match.group(1)) * (1 if env_match.group(2) == "ms" else 1000)
+else:
+    main_go = project_dir / "main.go"
+    if main_go.is_file():
+        go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+)\s*\*\s*time\.Second", main_go.read_text(encoding="utf-8"))
+        if go_match:
+            gateway_timeout_ms = int(go_match.group(1)) * 1000
+if gateway_timeout_ms is not None and server_timeout_ms >= gateway_timeout_ms:
+    fail(
+        f"servers[0].timeout ({server_timeout_ms} ms) must be below the gateway UPSTREAM_TIMEOUT ({gateway_timeout_ms:g} ms)"
+    )
+
+# VERSION file and the Dockerfile's default GATEWAY_VERSION must not drift apart.
+version_file = project_dir / "VERSION"
+if version_file.is_file() and dockerfile_text:
+    file_version = version_file.read_text(encoding="utf-8").strip()
+    arg_match = re.search(r"^ARG[ \t]+GATEWAY_VERSION=(\S+)", dockerfile_text, re.MULTILINE)
+    if arg_match is None:
+        fail("Dockerfile does not declare a default ARG GATEWAY_VERSION")
+    if arg_match.group(1) != file_version:
+        fail(f"Dockerfile GATEWAY_VERSION {arg_match.group(1)} does not match VERSION {file_version}")
 
 print("YAML parsed successfully; MosDNS v4.5.3 project schema checks: OK")
 PYTHON

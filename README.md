@@ -66,11 +66,12 @@ The gateway enforces:
 - DoH POST requires `Content-Type: application/dns-message`.
 - DoH GET requires a valid unpadded URL-safe base64 `dns` parameter.
 - `ReadHeaderTimeout=5s`, `ReadTimeout=5s`, `WriteTimeout=8s`, `IdleTimeout=20s`.
-- Graceful shutdown: on SIGTERM/SIGINT the gateway stops accepting connections and drains in-flight requests for up to 10s.
+- Graceful shutdown: on SIGTERM/SIGINT the gateway stops accepting connections and drains in-flight requests for up to 10s. `entrypoint.sh` stops the gateway first and only then MosDNS, so draining requests still have a working backend.
+- The gateway never follows redirects from the MosDNS backend; a 1xx/3xx backend reply is returned to the client as `502`. Upstream timeouts (including the transport's response-header timeout) are returned as `504`. `MOSDNS_DOH_URL` is validated at startup and the gateway exits if it is not an absolute `http(s)` URL.
 - The gateway's upstream request timeout is **3s** (`UPSTREAM_TIMEOUT`, default), and the HTTP response-header timeout follows it. It is deliberately above MosDNS's own 2s server timeout so a slow upstream surfaces as a MosDNS SERVFAIL instead of a gateway timeout. The HTTP client permits up to `MAX_CONCURRENT_REQUESTS` (default **20**) connections per MosDNS host.
 - Request logging is disabled by default.
 
-The client-IP source defaults to `X-Forwarded-For`, matching the Koyeb reverse-proxy deployment model. The gateway falls back to `X-Real-IP` and then the socket peer address. Because these headers are only trustworthy behind a proxy that sets them, set `CLIENT_IP_HEADER=none` when the gateway is exposed directly: both headers are then ignored and the socket peer address is used.
+The client-IP source defaults to the socket peer address, because `X-Forwarded-For` and `X-Real-IP` are trivially spoofable when the gateway is exposed directly. When the gateway sits behind a trusted reverse proxy that sets or overwrites one of these headers, opt in with `CLIENT_IP_HEADER=X-Forwarded-For` (or the header your platform sets); the gateway then uses that header (last hop), falls back to `X-Real-IP`, and only then to the socket peer address.
 
 ## Resource tuning
 
@@ -100,7 +101,7 @@ These are the effective defaults baked into the Docker image and `mosdns.yaml`:
 | `MAX_CONCURRENT_REQUESTS` | `20` | Go default |
 | `QUEUE_WAIT` | `200ms` | Go default |
 | `UPSTREAM_TIMEOUT` | `3s` | Go default |
-| `CLIENT_IP_HEADER` | `X-Forwarded-For` (`none` to disable) | Go default |
+| `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` when behind a trusted proxy) | Go default |
 | HTTP response-header timeout | `= UPSTREAM_TIMEOUT` | Go transport |
 | HTTP max connections per MosDNS host | `= MAX_CONCURRENT_REQUESTS` | Go transport |
 | HTTP max idle connections | `128` | Go transport |
@@ -132,13 +133,13 @@ Recommended health check:
 8080:http:/healthz
 ```
 
-`/healthz` is a lightweight gateway liveness check and is the better choice for the platform health check: `/readyz` depends on the HaGeZi upstreams, so using it would make Koyeb restart the instance during an upstream outage that a restart cannot fix. Use `/readyz` for external monitoring. It performs a DoH DNS probe through the internal MosDNS listener and returns ready only when that probe gets a valid non-SERVFAIL DNS response; results are cached for 5s (1s when failing) and probes are serialized, so the public endpoint cannot be used to flood the upstreams. `/metrics` exposes lightweight gateway counters (every `/dns-query` response is counted by status class, including ones the gateway generates itself), queue-wait telemetry, and gateway-to-MosDNS latency. It does not expose per-HaGeZi upstream latency; that remains inside MosDNS.
+`/healthz` is a lightweight gateway liveness check and is the better choice for the platform health check: `/readyz` depends on the HaGeZi upstreams, so using it would make Koyeb restart the instance during an upstream outage that a restart cannot fix. Use `/readyz` for external monitoring. It performs a DoH DNS probe through the internal MosDNS listener and returns ready only when that probe gets a valid non-SERVFAIL DNS response; results are cached for 5s (1s when failing) and probes are serialized, so the public endpoint cannot be used to flood the upstreams. `/metrics` exposes lightweight gateway counters (every response the gateway serves is counted by status class, including gateway-generated errors on `/dns-query`, `/readyz`, and unknown paths), queue-wait telemetry, and gateway-to-MosDNS latency (totals plus `*_samples_total` counters, so averages can be computed over any window with `rate(total)/rate(samples)`; the `*_avg` gauges are lifetime averages). Requests abandoned by the client are not counted as backend errors. It does not expose per-HaGeZi upstream latency; that remains inside MosDNS.
 
 The same service can be deployed from this repository using Koyeb's Docker builder.
 
 ## Build
 
-`make test` runs the repository's configuration validation script, `go vet`, and the Go test suite. The configuration check requires Python 3.8+ with PyYAML, and also verifies that the MosDNS listener is on loopback and matches the Dockerfile's `MOSDNS_DOH_URL`.
+`make test` runs the repository's configuration validation script, `go vet`, and the Go test suite. The configuration check requires Python 3.8+ with PyYAML, and also verifies that the MosDNS listener is on loopback and matches the Dockerfile's `MOSDNS_DOH_URL`, that `fast_fallback` < `servers[0].timeout` < the gateway's `UPSTREAM_TIMEOUT`, and that `VERSION` matches the Dockerfile's default `GATEWAY_VERSION`.
 
 ```sh
 python3 -m pip install pyyaml

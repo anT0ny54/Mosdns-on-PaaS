@@ -10,7 +10,7 @@ ARG MOSDNS_VERSION=v4.5.3
 # and the build fails if the tag ever resolves to a different commit.
 ARG MOSDNS_COMMIT=
 ARG ALPINE_VERSION=3.24.2
-ARG GATEWAY_VERSION=0.5.0
+ARG GATEWAY_VERSION=0.5.2
 
 FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION
@@ -63,8 +63,7 @@ ENV PORT=8080 \
     MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query \
     GOMAXPROCS=1 \
     GOGC=150 \
-    GOMEMLIMIT=160MiB \
-    TZ=UTC
+    GOMEMLIMIT=160MiB
 
 EXPOSE 8080
 USER app
