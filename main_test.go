@@ -286,7 +286,7 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 		t.Fatalf("default active-request capacity=%d, want 512", defaultMaxActiveRequests)
 	}
 	if defaultConcurrency != 20 {
-		t.Fatalf("default backend processing cap=%d, want 32", defaultConcurrency)
+		t.Fatalf("default backend processing cap=%d, want 20", defaultConcurrency)
 	}
 	transport := newHTTPClient().Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost != defaultConcurrency {
@@ -478,13 +478,27 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 	}
 }
 
+// probeReplyIDBytes extracts the transaction ID (the first two wire bytes)
+// from a readiness probe's base64url-encoded "dns" query parameter, so a
+// test backend can echo it back rather than guessing the gateway's
+// internal sequence counter.
+func probeReplyIDBytes(t *testing.T, r *http.Request) (byte, byte) {
+	dns := r.URL.Query().Get("dns")
+	if dns == "" {
+		t.Fatal("readiness probe did not send a dns parameter")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(dns)
+	if err != nil || len(decoded) < 2 {
+		t.Fatalf("readiness probe sent an unparseable dns parameter: %q", dns)
+	}
+	return decoded[0], decoded[1]
+}
+
 func TestReadyEndpointTracksBackend(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("dns") == "" {
-			t.Fatal("readiness probe did not send a dns parameter")
-		}
+		idLo, idHi := probeReplyIDBytes(t, r)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0, 1, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
+		_, _ = w.Write([]byte{idLo, idHi, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
 	}))
 	g := testGateway(backend.URL, 100, 10)
 	w := httptest.NewRecorder()
@@ -503,8 +517,9 @@ func TestReadyEndpointTracksBackend(t *testing.T) {
 
 func TestReadyEndpointRejectsServfail(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idLo, idHi := probeReplyIDBytes(t, r)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0, 1, 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0})
+		_, _ = w.Write([]byte{idLo, idHi, 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0})
 	}))
 	defer backend.Close()
 
@@ -513,6 +528,24 @@ func TestReadyEndpointRejectsServfail(t *testing.T) {
 	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("SERVFAIL backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestReadyEndpointRejectsMismatchedID(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeReplyIDBytes(t, r) // validate the probe shape, then ignore the real ID
+		w.Header().Set("Content-Type", "application/dns-message")
+		// Deliberately echo the wrong transaction ID; the gateway must
+		// treat this as not ready even though QR/RCODE look fine.
+		_, _ = w.Write([]byte{0xff, 0xff, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("mismatched-ID backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 }
 

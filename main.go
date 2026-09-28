@@ -154,6 +154,7 @@ type gatewayMetrics struct {
 	queueTimeoutTotal     atomic.Uint64
 	backendErrorTotal     atomic.Uint64
 	responses2xxTotal     atomic.Uint64
+	responses3xxTotal     atomic.Uint64
 	responses4xxTotal     atomic.Uint64
 	responses5xxTotal     atomic.Uint64
 	readyPassTotal        atomic.Uint64
@@ -381,6 +382,8 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		g.metrics.responses2xxTotal.Add(1)
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		g.metrics.responses3xxTotal.Add(1)
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		g.metrics.responses4xxTotal.Add(1)
 	case resp.StatusCode >= 500:
@@ -496,7 +499,7 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	ctx, cancel := context.WithTimeout(parent, defaultReadyProbeTimeout)
 	defer cancel()
 
-	query := buildReadinessDNSQuery(g.probeSeq.Add(1))
+	query, wantID := buildReadinessDNSQuery(g.probeSeq.Add(1))
 	encoded := base64.RawURLEncoding.EncodeToString(query)
 	probeURL := g.backendURL
 	if u, err := url.Parse(g.backendURL); err != nil || u.Hostname() == "" {
@@ -537,7 +540,7 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	}
 
 	buf, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageBytes+1))
-	if err != nil || len(buf) > maxDNSMessageBytes || !isUsableDNSProbeResponse(buf) {
+	if err != nil || len(buf) > maxDNSMessageBytes || !isUsableDNSProbeResponse(buf, wantID) {
 		g.metrics.readyFailTotal.Add(1)
 		return false
 	}
@@ -546,11 +549,12 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	return true
 }
 
-func buildReadinessDNSQuery(seq uint64) []byte {
+func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
 	label := "ready-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.FormatUint(seq, 36)
+	id := uint16(seq)
 	query := make([]byte, 12, 64)
-	query[0] = byte(seq)
-	query[1] = byte(seq >> 8)
+	query[0] = byte(id)
+	query[1] = byte(id >> 8)
 	query[2] = 0x01 // RD
 	query[5] = 0x01 // QDCOUNT = 1
 
@@ -561,11 +565,19 @@ func buildReadinessDNSQuery(seq uint64) []byte {
 	query = append(query, 0)
 	query = append(query, 0, 1) // QTYPE A
 	query = append(query, 0, 1) // QCLASS IN
-	return query
+	return query, id
 }
 
-func isUsableDNSProbeResponse(msg []byte) bool {
+// isUsableDNSProbeResponse reports whether msg is a usable reply to the
+// probe that embedded wantID: it must echo that transaction ID (so a
+// mismatched or stray response can't be mistaken for the live probe's
+// result), be marked as a response, and carry a non-failure RCODE.
+func isUsableDNSProbeResponse(msg []byte, wantID uint16) bool {
 	if len(msg) < 12 {
+		return false
+	}
+	gotID := uint16(msg[0]) | uint16(msg[1])<<8
+	if gotID != wantID {
 		return false
 	}
 	if msg[2]&0x80 == 0 {
@@ -599,6 +611,7 @@ func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	_, _ = io.WriteString(w, `# HELP doh_gateway_responses_total Responses grouped by status class.
 # TYPE doh_gateway_responses_total counter
 doh_gateway_responses_total{class="2xx"} `+strconv.FormatUint(g.metrics.responses2xxTotal.Load(), 10)+`
+doh_gateway_responses_total{class="3xx"} `+strconv.FormatUint(g.metrics.responses3xxTotal.Load(), 10)+`
 doh_gateway_responses_total{class="4xx"} `+strconv.FormatUint(g.metrics.responses4xxTotal.Load(), 10)+`
 doh_gateway_responses_total{class="5xx"} `+strconv.FormatUint(g.metrics.responses5xxTotal.Load(), 10)+"\n")
 	_, _ = io.WriteString(w, `# HELP doh_gateway_ready_probe_total Readiness probes by result.
