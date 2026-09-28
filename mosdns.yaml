@@ -1,6 +1,8 @@
 # MosDNS v4.5.3
 # Primary: race two HaGeZi DoH endpoints and use the first response.
-# Fallback: use the standby HaGeZi endpoint after 400 ms.
+# Fallback: if the primary has not produced a usable answer within 400 ms, also
+# query the standby HaGeZi endpoint and use whichever answers first.
+# servers[0].timeout must stay below the gateway UPSTREAM_TIMEOUT (default 3s).
 
 log:
   level: error
@@ -60,5 +62,4 @@ servers:
       - protocol: http
         addr: "127.0.0.1:8081"
         url_path: "/dns-query"
-        get_user_ip_from_header: "X-Forwarded-For"
         idle_timeout: 20

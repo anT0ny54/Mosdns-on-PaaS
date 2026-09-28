@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,7 +26,7 @@ func BenchmarkGateway5000RPS(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			i := atomic.AddUint64(&next, 1)
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", nil)
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", strings.NewReader(testDNSBody))
 			req.Header.Set("Content-Type", "application/dns-message")
 			req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(int(i%250)+1))
 			resp, err := client.Do(req)
@@ -68,7 +69,7 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", nil)
+					req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", strings.NewReader(testDNSBody))
 					req.Header.Set("Content-Type", "application/dns-message")
 					req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(i%250+1))
 					resp, err := client.Do(req)
@@ -113,12 +114,12 @@ func throughputHarness() (*gateway, *httptest.Server, *http.Client, func()) {
 	limiter.now = func() time.Time { return time.Unix(120, 0) }
 	g := &gateway{
 		backendURL:       backend.URL,
-		client:           newHTTPClient(),
+		client:           newHTTPClient(defaultConcurrency, defaultUpstreamTO),
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, defaultMaxActiveRequests),
 		processingSlots:  make(chan struct{}, defaultConcurrency),
 		queueWait:        defaultQueueWait,
-		upstreamTimeout:  2 * time.Second,
+		upstreamTimeout:  defaultUpstreamTO,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,
 		trustedIPHeader:  "X-Forwarded-For",

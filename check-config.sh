@@ -231,5 +231,27 @@ if protocol in {"http", "doh", "https"} and "get_user_ip_from_header" in listene
 if "idle_timeout" in listener and exact_int(listener.get("idle_timeout"), "servers[0].listeners[0].idle_timeout") < 0:
     fail("servers[0].listeners[0].idle_timeout must not be negative")
 
+# The gateway is the only public listener, so a plain-HTTP MosDNS listener must
+# stay on loopback.
+if protocol == "http":
+    listen_host = urlsplit("//" + listener["addr"]).hostname
+    if listen_host not in {"127.0.0.1", "localhost", "::1"}:
+        fail(f"servers[0].listeners[0].addr must bind to loopback, not {listen_host}")
+
+# Cross-check the listener against the gateway's backend URL in the Dockerfile.
+dockerfile = config_path.resolve().parent / "Dockerfile"
+if dockerfile.is_file() and protocol in {"http", "doh"}:
+    import re
+
+    match = re.search(r"MOSDNS_DOH_URL=(\S+)", dockerfile.read_text(encoding="utf-8"))
+    if match is None:
+        fail("Dockerfile does not set MOSDNS_DOH_URL")
+    backend = urlsplit(match.group(1).rstrip("\\"))
+    listener_port = urlsplit("//" + listener["addr"]).port
+    if backend.port != listener_port:
+        fail(f"Dockerfile MOSDNS_DOH_URL port {backend.port} does not match listener port {listener_port}")
+    if backend.path != listener["url_path"]:
+        fail(f"Dockerfile MOSDNS_DOH_URL path {backend.path!r} does not match listener url_path {listener['url_path']!r}")
+
 print("YAML parsed successfully; MosDNS v4.5.3 project schema checks: OK")
 PYTHON

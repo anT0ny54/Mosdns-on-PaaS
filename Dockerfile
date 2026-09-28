@@ -1,33 +1,48 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.19.13
+# MosDNS v4 pulls in old dependencies that only build with an old Go toolchain,
+# so it keeps its own pinned Go. The gateway is our own code and internet-facing,
+# so it builds with a currently supported Go release.
+ARG MOSDNS_GO_VERSION=1.19.13
+ARG GATEWAY_GO_VERSION=1.24
 ARG MOSDNS_VERSION=v4.5.3
+# Optional supply-chain pin: set to the full commit SHA of the MOSDNS_VERSION tag
+# and the build fails if the tag ever resolves to a different commit.
+ARG MOSDNS_COMMIT=
 ARG ALPINE_VERSION=3.24.2
+ARG GATEWAY_VERSION=0.5.0
 
-FROM golang:${GO_VERSION}-bookworm AS mosdns-builder
+FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION
+ARG MOSDNS_COMMIT
+ARG TARGETARCH
 WORKDIR /src
-RUN git clone --depth 1 --branch "${MOSDNS_VERSION}" https://github.com/IrineSistiana/mosdns.git .
+RUN git clone --depth 1 --branch "${MOSDNS_VERSION}" https://github.com/IrineSistiana/mosdns.git . \
+    && if [ -n "${MOSDNS_COMMIT}" ] && [ "$(git rev-parse HEAD)" != "${MOSDNS_COMMIT}" ]; then \
+         echo "MosDNS ${MOSDNS_VERSION} resolved to $(git rev-parse HEAD), expected ${MOSDNS_COMMIT}" >&2; \
+         exit 1; \
+       fi
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/mosdns .
 
-FROM golang:${GO_VERSION}-bookworm AS gateway-builder
+FROM golang:${GATEWAY_GO_VERSION}-bookworm AS gateway-builder
+ARG GATEWAY_VERSION
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod ./
 COPY main.go ./
-ARG GATEWAY_VERSION=0.4.0
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${GATEWAY_VERSION}" \
     -o /out/doh-gateway .
 
 FROM alpine:${ALPINE_VERSION}
 
 ARG BUILD_DATE=unknown
-ARG MOSDNS_VERSION=v4.5.3
-ARG GATEWAY_VERSION=0.4.0
+ARG MOSDNS_VERSION
+ARG GATEWAY_VERSION
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S app \
@@ -35,23 +50,17 @@ RUN apk add --no-cache ca-certificates \
     && mkdir -p /etc/mosdns \
     && chown -R app:app /etc/mosdns
 
-COPY --from=mosdns-builder /out/mosdns /usr/local/bin/mosdns
-COPY --from=gateway-builder /out/doh-gateway /usr/local/bin/doh-gateway
-COPY --chown=app:app mosdns.yaml /etc/mosdns/config.yaml
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/mosdns /usr/local/bin/doh-gateway /usr/local/bin/entrypoint.sh
+COPY --from=mosdns-builder --chmod=0755 /out/mosdns /usr/local/bin/mosdns
+COPY --from=gateway-builder --chmod=0755 /out/doh-gateway /usr/local/bin/doh-gateway
+COPY --chown=app:app --chmod=0644 mosdns.yaml /etc/mosdns/config.yaml
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# Only values that differ from the gateway's built-in defaults (see main.go) or
+# that couple the two processes are set here. MOSDNS_DOH_URL must match the
+# listener in mosdns.yaml; `make check-config` verifies that.
 ENV PORT=8080 \
     MOSDNS_CONFIG=/etc/mosdns/config.yaml \
     MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query \
-    RATE_LIMIT=240 \
-    RATE_WINDOW=60s \
-    RATE_LIMIT_CLIENTS=65536 \
-    MAX_ACTIVE_REQUESTS=512 \
-    MAX_CONCURRENT_REQUESTS=20 \
-    QUEUE_WAIT=200ms \
-    UPSTREAM_TIMEOUT=2s \
-    CLIENT_IP_HEADER=X-Forwarded-For \
     GOMAXPROCS=1 \
     GOGC=150 \
     GOMEMLIMIT=160MiB \
@@ -62,8 +71,8 @@ USER app
 
 STOPSIGNAL SIGTERM
 
-LABEL org.opencontainers.image.title="MosDNS 4.5.3 + DoH Gateway" \
-      org.opencontainers.image.description="Koyeb-optimized DoH gateway with MosDNS v4.5.3 and HaGeZi upstream failover" \
+LABEL org.opencontainers.image.title="MosDNS ${MOSDNS_VERSION} + DoH Gateway" \
+      org.opencontainers.image.description="Koyeb-optimized DoH gateway with MosDNS ${MOSDNS_VERSION} and HaGeZi upstream failover" \
       org.opencontainers.image.version="${GATEWAY_VERSION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.vendor="custom" \

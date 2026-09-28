@@ -8,16 +8,25 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// testDNSBody is a 12-byte body: the smallest payload the gateway accepts.
+const testDNSBody = "0123456789ab"
+
+// newFixedWindowLimiter is a test-only convenience wrapper.
+func newFixedWindowLimiter(limit int, window time.Duration) *fixedWindowLimiter {
+	return newFixedWindowLimiterWithMaxKeys(limit, window, defaultRateLimitClients)
+}
 
 func testGateway(backend string, limit int, concurrency int) *gateway {
 	limiter := newFixedWindowLimiter(limit, 60*time.Second)
 	limiter.now = func() time.Time { return time.Unix(120, 0) }
 	return &gateway{
 		backendURL:       backend,
-		client:           newHTTPClient(),
+		client:           newHTTPClient(concurrency, 2*time.Second),
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, 5000),
 		processingSlots:  make(chan struct{}, concurrency),
@@ -55,10 +64,10 @@ func TestRateLimitPerClient(t *testing.T) {
 
 	g := testGateway(backend.URL, 2, 10)
 	for i := 0; i < 2; i++ {
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 		r.Header.Set("Content-Type", "application/dns-message")
 		r.Header.Set("X-Forwarded-For", "192.0.2.10")
-		r.ContentLength = 1
+		r.ContentLength = int64(len(testDNSBody))
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, r)
 		if w.Code != http.StatusOK {
@@ -66,7 +75,7 @@ func TestRateLimitPerClient(t *testing.T) {
 		}
 	}
 
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 	r.Header.Set("Content-Type", "application/dns-message")
 	r.Header.Set("X-Forwarded-For", "192.0.2.10")
 	w := httptest.NewRecorder()
@@ -75,7 +84,7 @@ func TestRateLimitPerClient(t *testing.T) {
 		t.Fatalf("got %d, want %d", w.Code, http.StatusTooManyRequests)
 	}
 
-	r = httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+	r = httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 	r.Header.Set("Content-Type", "application/dns-message")
 	r.Header.Set("X-Forwarded-For", "192.0.2.11")
 	w = httptest.NewRecorder()
@@ -111,7 +120,7 @@ func TestDoHContentTypeAndSize(t *testing.T) {
 
 	g := testGateway(backend.URL, 100, 10)
 
-	badType := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+	badType := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 	badType.Header.Set("Content-Type", "text/plain")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, badType)
@@ -119,7 +128,7 @@ func TestDoHContentTypeAndSize(t *testing.T) {
 		t.Fatalf("bad content type: got %d", w.Code)
 	}
 
-	parameterizedType := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+	parameterizedType := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 	parameterizedType.Header.Set("Content-Type", "application/dns-message; charset=utf-8")
 	w = httptest.NewRecorder()
 	g.ServeHTTP(w, parameterizedType)
@@ -155,7 +164,7 @@ func TestGETBase64Validation(t *testing.T) {
 }
 
 func TestDoHGETParameterValidation(t *testing.T) {
-	valid := base64.RawURLEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0x03})
+	valid := base64.RawURLEncoding.EncodeToString([]byte(testDNSBody))
 	if !isValidDoHGetParameter(valid, maxDNSMessageBytes) {
 		t.Fatal("valid raw base64url parameter rejected")
 	}
@@ -168,13 +177,19 @@ func TestDoHGETParameterValidation(t *testing.T) {
 	if isValidDoHGetParameter("AAAA", 1) {
 		t.Fatal("decoded payload above max size accepted")
 	}
+	if isValidDoHGetParameter("AAAA", maxDNSMessageBytes) {
+		t.Fatal("3-byte payload below the 12-byte DNS header accepted")
+	}
+	if isValidDoHGetParameter(strings.Repeat("A", 15)+"=", maxDNSMessageBytes) || isValidDoHGetParameter("AAAAAAAAAAAAAAA!", maxDNSMessageBytes) {
+		t.Fatal("invalid alphabet accepted")
+	}
 	if isValidDoHGetParameter(valid, maxDNSMessageBytes+1) {
 		t.Fatal("validation accepted a configured size above the hard DoH limit")
 	}
 }
 
 func TestDoHGETParameterValidationAllocs(t *testing.T) {
-	valid := base64.RawURLEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07})
+	valid := base64.RawURLEncoding.EncodeToString([]byte(testDNSBody + testDNSBody))
 	if !isValidDoHGetParameter(valid, maxDNSMessageBytes) {
 		t.Fatal("valid raw base64url parameter rejected")
 	}
@@ -210,7 +225,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 		r.Header.Set("Content-Type", "application/dns-message")
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, r)
@@ -223,7 +238,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 		r.Header.Set("Content-Type", "application/dns-message")
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, r)
@@ -256,7 +271,7 @@ func TestActiveRequestCap(t *testing.T) {
 	limiter.now = func() time.Time { return time.Unix(120, 0) }
 	g := &gateway{
 		backendURL:       backend.URL,
-		client:           newHTTPClient(),
+		client:           newHTTPClient(1, 2*time.Second),
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, 1),
 		processingSlots:  make(chan struct{}, 1),
@@ -269,7 +284,7 @@ func TestActiveRequestCap(t *testing.T) {
 	g.activeSlots <- struct{}{}
 	defer func() { <-g.activeSlots }()
 
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 	r.Header.Set("Content-Type", "application/dns-message")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
@@ -288,12 +303,21 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 	if defaultConcurrency != 20 {
 		t.Fatalf("default backend processing cap=%d, want 20", defaultConcurrency)
 	}
-	transport := newHTTPClient().Transport.(*http.Transport)
+	transport := newHTTPClient(defaultConcurrency, defaultUpstreamTO).Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost != defaultConcurrency {
 		t.Fatalf("MaxIdleConnsPerHost=%d, want %d", transport.MaxIdleConnsPerHost, defaultConcurrency)
 	}
 	if transport.MaxConnsPerHost != defaultConcurrency {
 		t.Fatalf("MaxConnsPerHost=%d, want %d", transport.MaxConnsPerHost, defaultConcurrency)
+	}
+	if transport.ResponseHeaderTimeout != defaultUpstreamTO {
+		t.Fatalf("ResponseHeaderTimeout=%s, want %s", transport.ResponseHeaderTimeout, defaultUpstreamTO)
+	}
+
+	// The transport limit must follow the configured processing concurrency.
+	transport = newHTTPClient(50, time.Second).Transport.(*http.Transport)
+	if transport.MaxConnsPerHost != 50 || transport.MaxIdleConnsPerHost != 50 {
+		t.Fatalf("transport conns=%d/%d, want 50/50", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
 	}
 }
 
@@ -327,7 +351,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 	limiter.now = func() time.Time { return time.Unix(120, 0) }
 	g := &gateway{
 		backendURL:       backend.URL,
-		client:           newHTTPClient(),
+		client:           newHTTPClient(processingCap, 5*time.Second),
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, burst),
 		processingSlots:  make(chan struct{}, processingCap),
@@ -344,7 +368,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 	for i := 0; i < burst; i++ {
 		go func() {
 			defer wg.Done()
-			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 			r.Header.Set("Content-Type", "application/dns-message")
 			r.Header.Set("X-Forwarded-For", "198.18.0.1")
 			w := httptest.NewRecorder()
@@ -423,7 +447,7 @@ type failingReader struct {
 func (r failingReader) Read([]byte) (int, error) { return 0, r.readErr }
 func (r failingReader) Close() error             { return nil }
 
-func TestConnectionHeaderTokensAreStripped(t *testing.T) {
+func TestResponseConnectionHeaderTokensAreStripped(t *testing.T) {
 	src := make(http.Header)
 	src.Add("Connection", "X-Request-Token, X-Another")
 	src.Set("X-Request-Token", "secret")
@@ -431,18 +455,12 @@ func TestConnectionHeaderTokensAreStripped(t *testing.T) {
 	src.Set("X-Keep", "safe")
 
 	dst := make(http.Header)
-	copyRequestHeaders(dst, src)
-	if dst.Get("X-Request-Token") != "" || dst.Get("X-Another") != "" {
-		t.Fatalf("connection-token request headers leaked: %v", dst)
-	}
-	if dst.Get("X-Keep") != "safe" {
-		t.Fatalf("ordinary request header lost: %v", dst)
-	}
-
-	dst = make(http.Header)
 	copyResponseHeaders(dst, src)
 	if dst.Get("X-Request-Token") != "" || dst.Get("X-Another") != "" {
 		t.Fatalf("connection-token response headers leaked: %v", dst)
+	}
+	if dst.Get("X-Keep") != "safe" {
+		t.Fatalf("ordinary response header lost: %v", dst)
 	}
 }
 
@@ -597,7 +615,7 @@ func TestResponseBoundsAndContentType(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			g := testGateway(backend.URL, 100, 10)
 			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 			r.Header.Set("Content-Type", "application/dns-message")
 			r.Header.Set("X-Test-Mode", tc.mode)
 			g.ServeHTTP(w, r)
@@ -614,7 +632,7 @@ func TestResponseBoundsAndContentType(t *testing.T) {
 	defer boundaryBackend.Close()
 	g := testGateway(boundaryBackend.URL, 100, 10)
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader("x"))
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
 	r.Header.Set("Content-Type", "application/dns-message")
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -639,7 +657,7 @@ func TestGETRejectsPaddedBase64URL(t *testing.T) {
 }
 
 func TestGETValidBase64URL(t *testing.T) {
-	payload := []byte{0x00, 0x01, 0x02, 0x03}
+	payload := []byte(testDNSBody)
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("dns") != encoded {
@@ -691,5 +709,188 @@ func TestFixedWindowRetryAfter(t *testing.T) {
 	l.now = func() time.Time { return time.Unix(179, 0) }
 	if got := l.retryAfterSeconds(); got != 1 {
 		t.Fatalf("retry-after=%d, want 1", got)
+	}
+}
+
+func okBackend() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+}
+
+func TestSlowBodyDoesNotHoldProcessingSlot(t *testing.T) {
+	backend := okBackend()
+	defer backend.Close()
+	g := testGateway(backend.URL, 100, 1) // a single processing slot
+
+	pr, pw := io.Pipe()
+	slow := httptest.NewRequest(http.MethodPost, "/dns-query", pr)
+	slow.Header.Set("Content-Type", "application/dns-message")
+	slow.Header.Set("X-Forwarded-For", "192.0.2.50")
+	slowDone := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, slow)
+		slowDone <- w.Code
+	}()
+
+	fast := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	fast.Header.Set("Content-Type", "application/dns-message")
+	fast.Header.Set("X-Forwarded-For", "192.0.2.51")
+	fastDone := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, fast)
+		fastDone <- w.Code
+	}()
+
+	select {
+	case code := <-fastDone:
+		if code != http.StatusOK {
+			t.Fatalf("fast request got %d, want %d", code, http.StatusOK)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fast request blocked behind a client that is still sending its body")
+	}
+
+	if _, err := pw.Write([]byte(testDNSBody)); err != nil {
+		t.Fatal(err)
+	}
+	_ = pw.Close()
+	select {
+	case code := <-slowDone:
+		if code != http.StatusOK {
+			t.Fatalf("slow request got %d, want %d", code, http.StatusOK)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow request never completed")
+	}
+}
+
+func TestPOSTShortBodyRejected(t *testing.T) {
+	var hits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody[:11]))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Fatal("backend was called for a body shorter than a DNS header")
+	}
+}
+
+func TestClientHeadersAreNotForwarded(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	r.Header.Set("Cookie", "session=secret")
+	r.Header.Set("Authorization", "Bearer secret")
+	r.Header.Set("X-Forwarded-For", "203.0.113.5")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d", w.Code)
+	}
+	got := <-seen
+	if got.Get("Cookie") != "" || got.Get("Authorization") != "" {
+		t.Fatalf("client credentials leaked upstream: %v", got)
+	}
+	if got.Get("X-Forwarded-For") != "203.0.113.5" || got.Get("Accept") != "application/dns-message" {
+		t.Fatalf("unexpected upstream headers: %v", got)
+	}
+}
+
+func TestRateLimitKeyGroupsIPv6By64(t *testing.T) {
+	if a, b := rateLimitKey("2001:db8:1:2::1"), rateLimitKey("2001:db8:1:2:ffff::9"); a != b {
+		t.Fatalf("same /64 produced different keys: %q vs %q", a, b)
+	}
+	if rateLimitKey("2001:db8:1:2::1") == rateLimitKey("2001:db8:1:3::1") {
+		t.Fatal("different /64 networks share a key")
+	}
+	if got := rateLimitKey("198.51.100.7"); got != "198.51.100.7" {
+		t.Fatalf("IPv4 key changed: %q", got)
+	}
+	if got := rateLimitKey("unknown"); got != "unknown" {
+		t.Fatalf("fallback key changed: %q", got)
+	}
+}
+
+func TestClientIPHeaderTrust(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil) // RemoteAddr 192.0.2.1:1234
+	r.Header.Set("X-Forwarded-For", "203.0.113.9")
+	r.Header.Set("X-Real-IP", "203.0.113.8")
+	if got := extractClientIP(r, ""); got != "192.0.2.1" {
+		t.Fatalf("with header trust disabled got %q, want the socket peer", got)
+	}
+
+	r = httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
+	r.Header.Set("X-Real-IP", "203.0.113.8")
+	if got := extractClientIP(r, "X-Forwarded-For"); got != "203.0.113.8" {
+		t.Fatalf("X-Real-IP fallback got %q", got)
+	}
+}
+
+func TestReadyEndpointCachesResult(t *testing.T) {
+	var hits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		idLo, idHi := probeReplyIDBytes(t, r)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{idLo, idHi, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	g.readyCacheTTL = time.Minute
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("probe %d: got %d", i+1, w.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("backend probed %d times, want 1 (cached)", got)
+	}
+}
+
+func TestMetricsCountGatewayGeneratedResponses(t *testing.T) {
+	g := testGateway("http://127.0.0.1:1", 100, 1)
+
+	bad := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	bad.Header.Set("Content-Type", "text/plain")
+	g.ServeHTTP(httptest.NewRecorder(), bad)
+	if got := g.metrics.responses4xxTotal.Load(); got != 1 {
+		t.Fatalf("4xx count=%d, want 1", got)
+	}
+
+	dead := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	dead.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, dead)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("dead backend: got %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if got := g.metrics.responses5xxTotal.Load(); got != 1 {
+		t.Fatalf("5xx count=%d, want 1", got)
 	}
 }

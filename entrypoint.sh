@@ -27,6 +27,8 @@ on_signal() {
 trap on_signal TERM INT HUP
 
 # One process dying is a deployment failure; do not leave a partial service alive.
+# The poll sleeps in the background and is awaited with `wait`, so a signal
+# interrupts it immediately and the trap runs without waiting out the sleep.
 while :; do
   if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
     terminate_children
@@ -36,5 +38,6 @@ while :; do
     terminate_children
     exit 1
   fi
-  sleep 2
+  sleep 1 &
+  wait $!
 done
