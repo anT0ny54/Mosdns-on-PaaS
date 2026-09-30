@@ -49,10 +49,13 @@ var version = "dev"
 
 // dnsMessageBufferPool keeps the common <=4 KiB DoH request/response path
 // allocation-light. A one-byte guard is reserved so oversize payloads can be
-// detected without a second allocation.
+// detected without a second allocation. It stores *[]byte rather than []byte:
+// putting a bare slice into a sync.Pool boxes the slice header into a fresh
+// heap allocation on every Put.
 var dnsMessageBufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, maxDNSMessageBytes+1)
+		b := make([]byte, maxDNSMessageBytes+1)
+		return &b
 	},
 }
 
@@ -177,6 +180,11 @@ type gateway struct {
 	readyClient      *http.Client
 	metrics          gatewayMetrics
 	probeSeq         atomic.Uint64
+
+	// backendURL is parsed once, on first use (see backendRequestURL).
+	backendOnce  sync.Once
+	backendBase  *url.URL // nil when backendURL is malformed
+	backendPlain string   // backendBase.String(), used for POST
 
 	// /readyz result cache. readyCacheTTL <= 0 disables caching (used by tests).
 	readyCacheTTL time.Duration
@@ -334,16 +342,15 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
-		bodyBuf := dnsMessageBufferPool.Get().([]byte)
-		bodyBuf = bodyBuf[:0]
+		bodyBuf := dnsMessageBufferPool.Get().(*[]byte)
 		defer func() {
 			// If the transport failed mid-request it may still be reading the
 			// buffer, so it must not go back into the pool.
 			if releaseBody {
-				dnsMessageBufferPool.Put(bodyBuf[:cap(bodyBuf)])
+				dnsMessageBufferPool.Put(bodyBuf)
 			}
 		}()
-		body, err = readBoundedBody(r.Body, bodyBuf, int(g.maxRequestBytes))
+		body, err = readBoundedBody(r.Body, (*bodyBuf)[:0], int(g.maxRequestBytes))
 		if err != nil {
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
 			return
@@ -389,18 +396,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	// query string, so a duplicate "dns" parameter or arbitrary extra
 	// parameters can never reach the upstream unvalidated. A query string
 	// already present in MOSDNS_DOH_URL is preserved and merged with.
-	u, err := url.Parse(g.backendURL)
-	if err != nil || u.Host == "" {
+	outURL, ok := g.backendRequestURL(dnsParam)
+	if !ok {
 		g.metrics.backendErrorTotal.Add(1)
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
 		return
 	}
-	if r.Method == http.MethodGet {
-		values := u.Query()
-		values.Set("dns", dnsParam)
-		u.RawQuery = values.Encode()
-	}
-	outURL := u.String()
 
 	var reader io.Reader
 	if body != nil {
@@ -418,8 +419,10 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("X-Forwarded-For", clientIP)
 	if r.Method == http.MethodPost {
+		// ContentLength and GetBody were already derived from the
+		// *bytes.Reader by NewRequestWithContext; setting ContentLength
+		// again would only duplicate that value.
 		req.Header.Set("Content-Type", "application/dns-message")
-		req.ContentLength = int64(len(body))
 	}
 
 	backendStart := time.Now()
@@ -443,12 +446,9 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	respBuf := dnsMessageBufferPool.Get().([]byte)
-	respBuf = respBuf[:0]
-	defer func() {
-		dnsMessageBufferPool.Put(respBuf[:cap(respBuf)])
-	}()
-	respBody, err := readBoundedBody(resp.Body, respBuf, int(g.maxResponseBytes))
+	respBuf := dnsMessageBufferPool.Get().(*[]byte)
+	defer dnsMessageBufferPool.Put(respBuf)
+	respBody, err := readBoundedBody(resp.Body, (*respBuf)[:0], int(g.maxResponseBytes))
 	if err != nil {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
@@ -477,11 +477,33 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
-	if resp.Header.Get("Content-Type") == "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		w.Header().Set("Content-Type", "application/dns-message")
-	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
+}
+
+// backendRequestURL returns the MosDNS URL to call. For a GET, dns is the
+// already-validated "dns" value and is merged into any query string that
+// MOSDNS_DOH_URL already carries; for a POST dns is empty and the configured
+// URL is used as is. ok is false when MOSDNS_DOH_URL is not an absolute URL
+// with a host. The URL is parsed once rather than on every request.
+func (g *gateway) backendRequestURL(dns string) (string, bool) {
+	g.backendOnce.Do(func() {
+		if u, err := url.Parse(g.backendURL); err == nil && u.Host != "" {
+			g.backendBase = u
+			g.backendPlain = u.String()
+		}
+	})
+	if g.backendBase == nil {
+		return "", false
+	}
+	if dns == "" {
+		return g.backendPlain, true
+	}
+	u := *g.backendBase
+	values := u.Query()
+	values.Set("dns", dns)
+	u.RawQuery = values.Encode()
+	return u.String(), true
 }
 
 func readBoundedBody(r io.Reader, buf []byte, maxBytes int) ([]byte, error) {
@@ -555,16 +577,11 @@ func (g *gateway) backendReady(parent context.Context) bool {
 
 	query, wantID := buildReadinessDNSQuery(g.probeSeq.Add(1))
 	question := query[12:]
-	encoded := base64.RawURLEncoding.EncodeToString(query)
-	u, err := url.Parse(g.backendURL)
-	if err != nil || u.Hostname() == "" {
+	probeURL, ok := g.backendRequestURL(base64.RawURLEncoding.EncodeToString(query))
+	if !ok {
 		g.metrics.readyFailTotal.Add(1)
 		return false
 	}
-	values := u.Query()
-	values.Set("dns", encoded)
-	u.RawQuery = values.Encode()
-	probeURL := u.String()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
@@ -666,27 +683,35 @@ func (g *gateway) serveMetrics(w http.ResponseWriter) {
 		avgBackendSeconds = float64(backendNanos) / float64(backendSamples) / float64(time.Second)
 	}
 
-	_, _ = io.WriteString(w, "# HELP doh_gateway_requests_total Total DoH requests received.\n# TYPE doh_gateway_requests_total counter\ndoh_gateway_requests_total "+strconv.FormatUint(g.metrics.requestsTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_rate_limited_total Requests rejected by the per-client rate limiter.\n# TYPE doh_gateway_rate_limited_total counter\ndoh_gateway_rate_limited_total "+strconv.FormatUint(g.metrics.rateLimitedTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total "+strconv.FormatUint(g.metrics.activeRejectedTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_queue_timeout_total Requests that exhausted queue wait.\n# TYPE doh_gateway_queue_timeout_total counter\ndoh_gateway_queue_timeout_total "+strconv.FormatUint(g.metrics.queueTimeoutTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_backend_error_total Backend/protocol errors observed by the gateway.\n# TYPE doh_gateway_backend_error_total counter\ndoh_gateway_backend_error_total "+strconv.FormatUint(g.metrics.backendErrorTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, `# HELP doh_gateway_responses_total Responses grouped by status class.
+	// Render into one buffer and flush with a single write: /metrics is
+	// scraped on a timer, and each WriteString would otherwise become a
+	// separate response chunk on the wire.
+	var b strings.Builder
+	b.Grow(2048)
+
+	b.WriteString("# HELP doh_gateway_requests_total Total DoH requests received.\n# TYPE doh_gateway_requests_total counter\ndoh_gateway_requests_total " + strconv.FormatUint(g.metrics.requestsTotal.Load(), 10) + "\n")
+	b.WriteString("# HELP doh_gateway_rate_limited_total Requests rejected by the per-client rate limiter.\n# TYPE doh_gateway_rate_limited_total counter\ndoh_gateway_rate_limited_total " + strconv.FormatUint(g.metrics.rateLimitedTotal.Load(), 10) + "\n")
+	b.WriteString("# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total " + strconv.FormatUint(g.metrics.activeRejectedTotal.Load(), 10) + "\n")
+	b.WriteString("# HELP doh_gateway_queue_timeout_total Requests that exhausted queue wait.\n# TYPE doh_gateway_queue_timeout_total counter\ndoh_gateway_queue_timeout_total " + strconv.FormatUint(g.metrics.queueTimeoutTotal.Load(), 10) + "\n")
+	b.WriteString("# HELP doh_gateway_backend_error_total Backend/protocol errors observed by the gateway.\n# TYPE doh_gateway_backend_error_total counter\ndoh_gateway_backend_error_total " + strconv.FormatUint(g.metrics.backendErrorTotal.Load(), 10) + "\n")
+	b.WriteString(`# HELP doh_gateway_responses_total Responses grouped by status class.
 # TYPE doh_gateway_responses_total counter
-doh_gateway_responses_total{class="2xx"} `+strconv.FormatUint(g.metrics.responses2xxTotal.Load(), 10)+`
-doh_gateway_responses_total{class="3xx"} `+strconv.FormatUint(g.metrics.responses3xxTotal.Load(), 10)+`
-doh_gateway_responses_total{class="4xx"} `+strconv.FormatUint(g.metrics.responses4xxTotal.Load(), 10)+`
-doh_gateway_responses_total{class="5xx"} `+strconv.FormatUint(g.metrics.responses5xxTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, `# HELP doh_gateway_ready_probe_total Readiness probes by result.
+doh_gateway_responses_total{class="2xx"} ` + strconv.FormatUint(g.metrics.responses2xxTotal.Load(), 10) + `
+doh_gateway_responses_total{class="3xx"} ` + strconv.FormatUint(g.metrics.responses3xxTotal.Load(), 10) + `
+doh_gateway_responses_total{class="4xx"} ` + strconv.FormatUint(g.metrics.responses4xxTotal.Load(), 10) + `
+doh_gateway_responses_total{class="5xx"} ` + strconv.FormatUint(g.metrics.responses5xxTotal.Load(), 10) + "\n")
+	b.WriteString(`# HELP doh_gateway_ready_probe_total Readiness probes by result.
 # TYPE doh_gateway_ready_probe_total counter
-doh_gateway_ready_probe_total{result="ready"} `+strconv.FormatUint(g.metrics.readyPassTotal.Load(), 10)+`
-doh_gateway_ready_probe_total{result="not_ready"} `+strconv.FormatUint(g.metrics.readyFailTotal.Load(), 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total "+strconv.FormatFloat(float64(queueNanos)/float64(time.Second), 'f', 6, 64)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total "+strconv.FormatUint(queueSamples, 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_queue_wait_seconds_avg Average processing-slot wait time for admitted requests.\n# TYPE doh_gateway_queue_wait_seconds_avg gauge\ndoh_gateway_queue_wait_seconds_avg "+strconv.FormatFloat(avgQueueSeconds, 'f', 6, 64)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_backend_latency_seconds_total Total gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total "+strconv.FormatFloat(float64(backendNanos)/float64(time.Second), 'f', 6, 64)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_backend_latency_samples_total Requests sent to MosDNS.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total "+strconv.FormatUint(backendSamples, 10)+"\n")
-	_, _ = io.WriteString(w, "# HELP doh_gateway_backend_latency_seconds_avg Average gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg "+strconv.FormatFloat(avgBackendSeconds, 'f', 6, 64)+"\n")
+doh_gateway_ready_probe_total{result="ready"} ` + strconv.FormatUint(g.metrics.readyPassTotal.Load(), 10) + `
+doh_gateway_ready_probe_total{result="not_ready"} ` + strconv.FormatUint(g.metrics.readyFailTotal.Load(), 10) + "\n")
+	b.WriteString("# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total " + strconv.FormatFloat(float64(queueNanos)/float64(time.Second), 'f', 6, 64) + "\n")
+	b.WriteString("# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total " + strconv.FormatUint(queueSamples, 10) + "\n")
+	b.WriteString("# HELP doh_gateway_queue_wait_seconds_avg Average processing-slot wait time for admitted requests.\n# TYPE doh_gateway_queue_wait_seconds_avg gauge\ndoh_gateway_queue_wait_seconds_avg " + strconv.FormatFloat(avgQueueSeconds, 'f', 6, 64) + "\n")
+	b.WriteString("# HELP doh_gateway_backend_latency_seconds_total Total gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total " + strconv.FormatFloat(float64(backendNanos)/float64(time.Second), 'f', 6, 64) + "\n")
+	b.WriteString("# HELP doh_gateway_backend_latency_samples_total Requests sent to MosDNS.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total " + strconv.FormatUint(backendSamples, 10) + "\n")
+	b.WriteString("# HELP doh_gateway_backend_latency_seconds_avg Average gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg " + strconv.FormatFloat(avgBackendSeconds, 'f', 6, 64) + "\n")
+
+	_, _ = io.WriteString(w, b.String())
 }
 
 // extractClientIP returns the client address. When preferredHeader is set the
@@ -748,8 +773,15 @@ func copyResponseHeaders(dst, src http.Header) {
 }
 
 func connectionHeaderTokens(h http.Header) map[string]bool {
+	values := h.Values("Connection")
+	if len(values) == 0 {
+		// Fast path: skip the map allocation in the common case where the
+		// backend sent no Connection header. Reading a nil map is valid, so
+		// copyResponseHeaders needs no special casing.
+		return nil
+	}
 	tokens := make(map[string]bool)
-	for _, value := range h.Values("Connection") {
+	for _, value := range values {
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
 			if token != "" {

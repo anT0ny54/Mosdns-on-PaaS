@@ -78,7 +78,7 @@ The client-IP source defaults to the socket peer address, because `X-Forwarded-F
 The container is configured for the target limits:
 
 - Runtime: **Alpine Linux 3.24.2**.
-- Build toolchain: **Go 1.19.13** for MosDNS (required by its dependencies) and **Go 1.24** for the gateway.
+- Build toolchain: **Go 1.19.13** for MosDNS (required by its dependencies) and **Go 1.25** for the gateway.
 - MosDNS: **v4.5.3**.
 - `GOMAXPROCS=1` keeps the gateway and MosDNS from oversubscribing a 0.1 vCPU instance.
 - `GOGC=150` reduces garbage-collection frequency while `GOMEMLIMIT=160MiB` provides the configured soft runtime memory target per Go process in the shipped image.
@@ -154,7 +154,7 @@ Container build:
 docker build -t mosdns-koyeb-doh-gateway:local .
 ```
 
-The image builds MosDNS v4.5.3 from its tagged source with Go 1.19.13, builds the gateway with Go 1.24, and runs both in an Alpine 3.24 runtime image. Builds target the builder's architecture (`TARGETARCH`). To pin the MosDNS tag to a commit, pass `--build-arg MOSDNS_COMMIT=<full sha>`; the build fails if the tag resolves elsewhere.
+The image builds MosDNS v4.5.3 from its tagged source with Go 1.19.13, builds the gateway with Go 1.25, and runs both in an Alpine 3.24 runtime image. Builds target the builder's architecture (`TARGETARCH`). To pin the MosDNS tag to a commit, pass `--build-arg MOSDNS_COMMIT=<full sha>`; the build fails if the tag resolves elsewhere.
 
 ## Files
 

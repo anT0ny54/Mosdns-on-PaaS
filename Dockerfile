@@ -4,13 +4,13 @@
 # so it keeps its own pinned Go. The gateway is our own code and internet-facing,
 # so it builds with a currently supported Go release.
 ARG MOSDNS_GO_VERSION=1.19.13
-ARG GATEWAY_GO_VERSION=1.24
+ARG GATEWAY_GO_VERSION=1.25
 ARG MOSDNS_VERSION=v4.5.3
 # Optional supply-chain pin: set to the full commit SHA of the MOSDNS_VERSION tag
 # and the build fails if the tag ever resolves to a different commit.
 ARG MOSDNS_COMMIT=
 ARG ALPINE_VERSION=3.24.2
-ARG GATEWAY_VERSION=0.5.2
+ARG GATEWAY_VERSION=0.5.4
 
 FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION
@@ -40,10 +40,6 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM alpine:${ALPINE_VERSION}
 
-ARG BUILD_DATE=unknown
-ARG MOSDNS_VERSION
-ARG GATEWAY_VERSION
-
 RUN apk add --no-cache ca-certificates \
     && addgroup -S app \
     && adduser -S -D -H -s /sbin/nologin -G app app \
@@ -68,7 +64,14 @@ ENV PORT=8080 \
 EXPOSE 8080
 USER app
 
-STOPSIGNAL SIGTERM
+# Global ARGs (declared before the first FROM) are only visible inside a stage
+# once re-declared there, so ALPINE_VERSION has to be repeated here or the
+# base.name label below would silently expand to "alpine:". They are declared
+# after the RUN layers so a changing BUILD_DATE does not bust the layer cache.
+ARG ALPINE_VERSION
+ARG BUILD_DATE=unknown
+ARG MOSDNS_VERSION
+ARG GATEWAY_VERSION
 
 LABEL org.opencontainers.image.title="MosDNS ${MOSDNS_VERSION} + DoH Gateway" \
       org.opencontainers.image.description="Koyeb-optimized DoH gateway with MosDNS ${MOSDNS_VERSION} and HaGeZi upstream failover" \

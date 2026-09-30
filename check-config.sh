@@ -25,6 +25,7 @@ fi
 
 exec "$PYTHON" - "$CONFIG" <<'PYTHON'
 import ipaddress
+import re
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -242,13 +243,14 @@ if protocol == "http":
     if listen_host not in {"127.0.0.1", "localhost", "::1"}:
         fail(f"servers[0].listeners[0].addr must bind to loopback, not {listen_host}")
 
-# Cross-check the listener against the gateway's backend URL in the Dockerfile.
-dockerfile = config_path.resolve().parent / "Dockerfile"
-if dockerfile.is_file() and protocol in {"http", "doh"}:
-    import re
+project_dir = config_path.resolve().parent
+dockerfile = project_dir / "Dockerfile"
+# Comment lines are dropped first so a mention there is never mistaken for a setting.
+dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
 
-    # Comment lines are dropped first so a mention there is never mistaken for the setting.
-    match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", strip_comments(dockerfile.read_text(encoding="utf-8")))
+# Cross-check the listener against the gateway's backend URL in the Dockerfile.
+if dockerfile.is_file() and protocol in {"http", "doh"}:
+    match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", dockerfile_text)
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
     backend = urlsplit(match.group(1).rstrip("\\"))
@@ -261,7 +263,6 @@ if dockerfile.is_file() and protocol in {"http", "doh"}:
 # Timeout chain: fast_fallback < MosDNS server timeout < gateway UPSTREAM_TIMEOUT.
 # Otherwise the standby upstream is never tried, or the gateway gives up (504)
 # before MosDNS can answer (SERVFAIL).
-import re
 
 server_timeout_ms = server["timeout"] * 1000
 if fallback["fast_fallback"] >= server_timeout_ms:
@@ -269,9 +270,7 @@ if fallback["fast_fallback"] >= server_timeout_ms:
         f"fast_fallback ({fallback['fast_fallback']} ms) must be below servers[0].timeout ({server_timeout_ms} ms)"
     )
 
-project_dir = config_path.resolve().parent
 gateway_timeout_ms = None
-dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
 env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s)\b", dockerfile_text)
 if env_match:
     gateway_timeout_ms = float(env_match.group(1)) * (1 if env_match.group(2) == "ms" else 1000)

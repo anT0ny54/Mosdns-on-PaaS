@@ -514,10 +514,10 @@ func probeResponse(t *testing.T, r *http.Request, rcode byte) []byte {
 		return nil
 	}
 	resp := make([]byte, 12, len(decoded))
-	copy(resp, decoded[:2]) // transaction ID
-	resp[2] = 0x81          // QR + RD
-	resp[3] = 0x80 | rcode  // RA + RCODE
-	resp[5] = 0x01          // QDCOUNT = 1
+	copy(resp, decoded[:2])              // transaction ID
+	resp[2] = 0x81                       // QR + RD
+	resp[3] = 0x80 | rcode               // RA + RCODE
+	resp[5] = 0x01                       // QDCOUNT = 1
 	resp = append(resp, decoded[12:]...) // echo the question section
 	return resp
 }
@@ -1014,9 +1014,13 @@ func TestTransportHeaderTimeoutMapsTo504(t *testing.T) {
 
 func TestClientDisconnectIsNotABackendError(t *testing.T) {
 	started := make(chan struct{})
+	backendRelease := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-backendRelease:
+		}
 	}))
 	defer backend.Close()
 
@@ -1024,10 +1028,11 @@ func TestClientDisconnectIsNotABackendError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody)).WithContext(ctx)
 	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.ServeHTTP(httptest.NewRecorder(), r)
+		g.ServeHTTP(w, r)
 	}()
 	<-started
 	cancel()
@@ -1036,6 +1041,7 @@ func TestClientDisconnectIsNotABackendError(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("handler did not return after the client went away")
 	}
+	close(backendRelease)
 	if got := g.metrics.backendErrorTotal.Load(); got != 0 {
 		t.Fatalf("client disconnect counted as %d backend errors, want 0", got)
 	}
