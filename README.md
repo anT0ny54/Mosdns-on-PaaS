@@ -1,194 +1,80 @@
-# MosDNS v4.5.3 + DoH Gateway for Koyeb
+# Mosdns-on-PaaS
 
-A small, hardened DNS-over-HTTPS gateway built around **MosDNS v4.5.3**, tuned for a **512 MiB / 0.1 vCPU Koyeb web service**.
+MosDNS v4.5.3 + a custom Go DoH gateway, packaged as a single container for
+PaaS platforms (Koyeb and similar). The gateway is the only public listener;
+MosDNS serves DNS-over-HTTPS on loopback behind it.
 
 ## Architecture
 
-```text
-                             ┌─ HaGeZiDNS1
-DoH client → Koyeb → Gateway ┤
-                             └─ HaGeZiDNS2
-                                  ↓
-                               primary
-                                  │
-                              fallback
-                                  ↓
-                             HaGeZiDNS3
-```
+- **doh-gateway** (this repo, `main.go`): an HTTP front door that validates,
+  rate-limits, queues, and forwards DoH requests to MosDNS. Runs as an
+  unprivileged user, drains gracefully on SIGTERM (10 s).
+- **MosDNS v4.5.3** (built from upstream in the Dockerfile): listens on
+  `127.0.0.1:8081`, answers with a cache plus a two-HaGeZi-upstream race and
+  a 400 ms fast fallback to a standby HaGeZi endpoint.
 
-The gateway is the only publicly exposed HTTP listener. MosDNS handles DNS resolution internally on loopback.
+`entrypoint.sh` starts both, stops the gateway first on shutdown (so it can
+drain while MosDNS still answers), and treats either process exiting as a
+deployment failure.
 
-### Ports
+## HTTP endpoints
 
-| Listener | Purpose | Exposure |
+| Path | Behavior |
+|---|---|
+| `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message`; GET requires a raw (unpadded) base64url `dns` query parameter. Bodies must be 12-4096 bytes. |
+| `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
+| `GET/HEAD /readyz` | Readiness. Sends a real DNS query through MosDNS and validates the response (transaction ID, QR bit, RCODE 0/3, echoed question). Result cached 5 s on success, 1 s on failure. |
+| `GET/HEAD /metrics` | Plain-text Prometheus-style counters: request totals, rate-limit/queue/backend-error totals, 2xx-5xx counts, queue/backend latency averages. |
+
+## Configuration (environment variables)
+
+Gateway:
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `${PORT}` (default `8080`) | DoH gateway | Public Koyeb HTTP |
-| `127.0.0.1:8081` | MosDNS DoH backend | Internal only |
+| `PORT` | `8080` | Listen address (plain number or Go address). |
+| `MOSDNS_DOH_URL` | `http://127.0.0.1:8081/dns-query` | Backend; must be absolute http(s). Fatal at startup if malformed. |
+| `RATE_LIMIT` | `240` | Requests per client per window. |
+| `RATE_WINDOW` | `60s` | Rate-limit window. |
+| `RATE_LIMIT_CLIENTS` | `65536` | Max distinct client keys per window; new clients are denied beyond this. IPv6 clients are grouped by /64. |
+| `MAX_ACTIVE_REQUESTS` | `512` | Hard ceiling on concurrently admitted requests (extra get `503` + `Retry-After: 1`). |
+| `MAX_CONCURRENT_REQUESTS` | `20` | Requests actually executing against MosDNS at once; the rest queue up to `QUEUE_WAIT`. |
+| `QUEUE_WAIT` | `200ms` | Max wait for a processing slot, then `503`. |
+| `UPSTREAM_TIMEOUT` | `3s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). |
+| `CLIENT_IP_HEADER` | `none` | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header (with `X-Real-IP` fallback). Default keys rate limits on the socket peer only. |
 
-Public endpoint after deployment:
+Runtime tuning (set in the Dockerfile): `GOMAXPROCS=1`, `GOGC=150`,
+`GOMEMLIMIT=160MiB`.
 
-```text
-https://<your-koyeb-domain>/dns-query
-```
+Client headers (Cookie, Authorization, ...) are never forwarded upstream; only
+`Accept`, `Content-Type`, and `X-Forwarded-For` are sent. Backend redirects
+are never followed.
 
-Health endpoints:
+## MosDNS configuration
 
-```text
-https://<your-koyeb-domain>/healthz
-https://<your-koyeb-domain>/readyz
-https://<your-koyeb-domain>/metrics
-```
+`mosdns.yaml` is validated by `check-config.sh` (requires Python 3.8+ with
+PyYAML) - run via `make check-config`. It pins the expected plugin layout
+(cache, then primary_fast race, then fallback_hagezi with 400 ms
+`fast_fallback`) and enforces that the plain-HTTP listener stays on loopback.
 
-## Upstream policy
-
-`fast_forward` uses the following two primary DoH endpoints and returns the first usable response:
-
-- `https://root.hagezi.org/dns-query` → `188.34.161.210`
-- `https://wurzn.hagezi.org/dns-query` → `159.69.155.94`
-
-If the primary path has not produced a usable result within the configured `fast_fallback: 400 ms` window, the secondary path is activated:
-
-- `https://juuri.hagezi.org/dns-query` → `95.217.163.17`
-
-The HTTPS hostname remains the TLS identity while `dial_addr` pins the connection to the supplied IPv4 address.
-
-## Request protection
-
-The gateway enforces:
-
-- **240 requests / 60 seconds / client IP** using a fixed-window limiter. IPv6 clients are grouped by **/64**.
-- At most **65536 distinct client keys per rate-limit window in the shipped Docker image**; new clients are rejected with HTTP 429 once the memory guard is full. The Go source default is also 65536 when `RATE_LIMIT_CLIENTS` is not set.
-- Up to **512 active requests per service instance** can be admitted; requests beyond that receive an immediate HTTP 503.
-- The shipped Docker image limits backend processing to **20 requests at once** (`MAX_CONCURRENT_REQUESTS=20`). A queued request waits at most **200ms** (`QUEUE_WAIT=200ms`) for a processing slot; if no slot opens, it receives HTTP 503 immediately instead of accumulating long tail latency. This separates burst absorption from CPU/upstream concurrency.
-- DoH DNS messages must be between **12 bytes** (a bare DNS header) and **4096 bytes**; the 4096-byte cap applies to both request and response.
-- Request bodies are read and validated **before** a backend processing slot is taken, so a slow-sending client cannot occupy one.
-- Only `Accept`, `Content-Type` and `X-Forwarded-For` are forwarded to MosDNS; cookies and other client headers are dropped.
-- DoH POST requires `Content-Type: application/dns-message`.
-- DoH GET requires a valid unpadded URL-safe base64 `dns` parameter.
-- `ReadHeaderTimeout=5s`, `ReadTimeout=5s`, `WriteTimeout=8s`, `IdleTimeout=20s`.
-- Graceful shutdown: on SIGTERM/SIGINT the gateway stops accepting connections and drains in-flight requests for up to 10s. `entrypoint.sh` stops the gateway first and only then MosDNS, so draining requests still have a working backend.
-- The gateway never follows redirects from the MosDNS backend; a 1xx/3xx backend reply is returned to the client as `502`. Upstream timeouts (including the transport's response-header timeout) are returned as `504`. `MOSDNS_DOH_URL` is validated at startup and the gateway exits if it is not an absolute `http(s)` URL.
-- The gateway's upstream request timeout is **3s** (`UPSTREAM_TIMEOUT`, default), and the HTTP response-header timeout follows it. It is deliberately above MosDNS's own 2s server timeout so a slow upstream surfaces as a MosDNS SERVFAIL instead of a gateway timeout. The HTTP client permits up to `MAX_CONCURRENT_REQUESTS` (default **20**) connections per MosDNS host.
-- Request logging is disabled by default.
-
-The client-IP source defaults to the socket peer address, because `X-Forwarded-For` and `X-Real-IP` are trivially spoofable when the gateway is exposed directly. When the gateway sits behind a trusted reverse proxy that sets or overwrites one of these headers, opt in with `CLIENT_IP_HEADER=X-Forwarded-For` (or the header your platform sets); the gateway then uses that header (last hop), falls back to `X-Real-IP`, and only then to the socket peer address.
-
-## Resource tuning
-
-The container is configured for the target limits:
-
-- Runtime: **Alpine Linux 3.24.2**.
-- Build toolchain: **Go 1.19.13** for MosDNS (required by its dependencies) and **Go 1.25** for the gateway.
-- MosDNS: **v4.5.3**.
-- `GOMAXPROCS=1` keeps the gateway and MosDNS from oversubscribing a 0.1 vCPU instance.
-- `GOGC=150` reduces garbage-collection frequency while `GOMEMLIMIT=160MiB` provides the configured soft runtime memory target per Go process in the shipped image.
-- The gateway admits up to **512 active requests**, but the shipped image limits backend processing to **20** at once and fast-rejects requests that wait more than **200ms** for a processing slot. This keeps burst memory and upstream work bounded for a 0.1 vCPU instance.
-- The HTTP client allows up to **20 connections per MosDNS host** and **128 idle connections globally**. A separate one-connection client is reserved for `/readyz`.
-- MosDNS uses a **32768-entry cache** and a **30-second lazy-cache reply TTL**, with `lazy_cache_ttl=3600s` and `cache_everything=false`, to reduce repeated upstream traffic without caching every response indiscriminately.
-- DoH upstream HTTP/3 is not enabled; the configured upstream entries enable MosDNS upstream connection pipelining, use `idle_timeout=20s`, and allow `max_conns=2` per upstream.
-- The unused loopback UDP/TCP MosDNS listeners are omitted; the gateway is the sole consumer of the MosDNS HTTP endpoint.
-
-### Shipped container defaults
-
-These are the effective defaults baked into the Docker image and `mosdns.yaml`:
-
-| Setting | Value | Source |
-|---|---:|---|
-| `PORT` | `8080` | Dockerfile |
-| `RATE_LIMIT` | `240` requests / `60s` | Go default |
-| `RATE_LIMIT_CLIENTS` | `65536` | Go default |
-| `MAX_ACTIVE_REQUESTS` | `512` | Go default |
-| `MAX_CONCURRENT_REQUESTS` | `20` | Go default |
-| `QUEUE_WAIT` | `200ms` | Go default |
-| `UPSTREAM_TIMEOUT` | `3s` | Go default |
-| `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` when behind a trusted proxy) | Go default |
-| HTTP response-header timeout | `= UPSTREAM_TIMEOUT` | Go transport |
-| HTTP max connections per MosDNS host | `= MAX_CONCURRENT_REQUESTS` | Go transport |
-| HTTP max idle connections | `128` | Go transport |
-| `GOMAXPROCS` | `1` | Dockerfile |
-| `GOGC` | `150` | Dockerfile |
-| `GOMEMLIMIT` | `160MiB` | Dockerfile |
-| MosDNS cache size | `32768` | `mosdns.yaml` |
-| MosDNS lazy-cache reply TTL | `30s` | `mosdns.yaml` |
-| MosDNS lazy-cache TTL | `3600s` | `mosdns.yaml` |
-| MosDNS `cache_everything` | `false` | `mosdns.yaml` |
-
-The Dockerfile only sets values that are not already the Go source defaults (`PORT`, the MosDNS paths/URL, and the Go runtime limits), so every gateway tunable above can be overridden with an environment variable and otherwise follows `main.go`.
-
-## Koyeb deployment
-
-Koyeb provides the service `PORT` environment variable for Web Services. Koyeb supplies it as a numeric value such as `8080`; the gateway normalizes that form to the Go listen address `:8080` automatically.
-
-Recommended exposed port configuration:
-
-```text
-Port: 8080
-Protocol: HTTP
-Route: /
-```
-
-Recommended health check:
-
-```text
-8080:http:/healthz
-```
-
-`/healthz` is a lightweight gateway liveness check and is the better choice for the platform health check: `/readyz` depends on the HaGeZi upstreams, so using it would make Koyeb restart the instance during an upstream outage that a restart cannot fix. Use `/readyz` for external monitoring. It performs a DoH DNS probe through the internal MosDNS listener and returns ready only when that probe gets a valid non-SERVFAIL DNS response; results are cached for 5s (1s when failing) and probes are serialized, so the public endpoint cannot be used to flood the upstreams. `/metrics` exposes lightweight gateway counters (every response the gateway serves is counted by status class, including gateway-generated errors on `/dns-query`, `/readyz`, and unknown paths), queue-wait telemetry, and gateway-to-MosDNS latency (totals plus `*_samples_total` counters, so averages can be computed over any window with `rate(total)/rate(samples)`; the `*_avg` gauges are lifetime averages). Requests abandoned by the client are not counted as backend errors. It does not expose per-HaGeZi upstream latency; that remains inside MosDNS.
-
-The same service can be deployed from this repository using Koyeb's Docker builder.
-
-## Build
-
-`make test` runs the repository's configuration validation script, `go vet`, and the Go test suite. The configuration check requires Python 3.8+ with PyYAML, and also verifies that the MosDNS listener is on loopback and matches the Dockerfile's `MOSDNS_DOH_URL`, that `fast_fallback` < `servers[0].timeout` < the gateway's `UPSTREAM_TIMEOUT`, and that `VERSION` matches the Dockerfile's default `GATEWAY_VERSION`.
+## Build and test
 
 ```sh
-python3 -m pip install pyyaml
-make test
-make build
-sh ./check-config.sh mosdns.yaml
+make test            # config check + go vet + go test (needs Python 3.8+/PyYAML)
+make build           # local binary ./doh-gateway
+make docker-build    # multi-stage image (MosDNS + gateway)
+make run             # local gateway on :8080 (needs a backend on :8081)
 ```
 
-Container build:
+Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousandRPSTarget`.
+Sustained-load benchmark: `go test -bench BenchmarkGateway5000RPS -benchmem`.
 
-```sh
-docker build -t mosdns-koyeb-doh-gateway:local .
-```
+## Version
 
-The image builds MosDNS v4.5.3 from its tagged source with Go 1.19.13, builds the gateway with Go 1.25, and runs both in an Alpine 3.24 runtime image. Builds target the builder's architecture (`TARGETARCH`). To pin the MosDNS tag to a commit, pass `--build-arg MOSDNS_COMMIT=<full sha>`; the build fails if the tag resolves elsewhere.
-
-## Files
-
-```text
-.
-├── .dockerignore
-├── .gitattributes
-├── .gitignore
-├── .github/
-│   └── workflows/
-│       └── Keep-Alive.yml
-├── Dockerfile
-├── LICENSE
-├── Makefile
-├── README.md
-├── VERSION
-├── CHANGELOG.md
-├── check-config.sh
-├── entrypoint.sh
-├── go.mod
-├── keep-alive.txt
-├── main.go
-├── main_test.go
-├── mosdns.yaml
-└── throughput_test.go
-```
-
-## Upstream references
-
-- MosDNS: https://github.com/IrineSistiana/mosdns
-- MosDNS v4.5.3: https://github.com/IrineSistiana/mosdns/tree/v4.5.3
-- HaGeZi DNS: https://github.com/hagezi/dns-servers
-- Koyeb service exposure: https://www.koyeb.com/docs/build-and-deploy/exposing-your-service
-
+Gateway version is tracked in `VERSION` (0.5.4) and injected at build time
+via `-ldflags -X main.version=...`; the MosDNS version is pinned in the
+Dockerfile (`ARG MOSDNS_VERSION=v4.5.3`, with an optional `MOSDNS_COMMIT`
+supply-chain pin).
 
 ## 🌐 Free DNS Services
 
