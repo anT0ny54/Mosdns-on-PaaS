@@ -100,6 +100,16 @@ def check_listen_addr(value, path: str) -> None:
         fail(f"{path} must be a host:port address")
 
 
+def check_loopback(value: str, path: str) -> None:
+    # The gateway is the only public listener, so every MosDNS listener must
+    # stay on loopback. An empty host (":8081") binds every interface.
+    host = urlsplit("//" + value).hostname
+    if host is None:
+        fail(f"{path} must bind to loopback explicitly (an empty host listens on every interface)")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        fail(f"{path} must bind to loopback, not {host}")
+
+
 def check_upstream_addr(value, path: str) -> None:
     value = non_empty_string(value, path)
     parsed = urlsplit(value)
@@ -136,6 +146,7 @@ api = root.get("api")
 if api is not None:
     api = expect_mapping(api, "api")
     check_listen_addr(api.get("http"), "api.http")
+    check_loopback(api["http"], "api.http")
 
 plugins = expect_list(root.get("plugins"), "plugins")
 plugin_by_tag = {}
@@ -224,24 +235,19 @@ if len(listeners) != 1:
     fail("servers[0].listeners must contain exactly one listener")
 listener = expect_mapping(listeners[0], "servers[0].listeners[0]")
 protocol = non_empty_string(listener.get("protocol"), "servers[0].listeners[0].protocol")
-if protocol not in {"udp", "tcp", "dot", "tls", "doh", "https", "http"}:
-    fail(f"servers[0].listeners[0].protocol is unsupported: {protocol}")
+# The gateway talks to MosDNS over plain HTTP (MOSDNS_DOH_URL is http://), so
+# any other listener type would pass validation yet be unreachable.
+if protocol != "http":
+    fail(f"servers[0].listeners[0].protocol must be http (the gateway reaches MosDNS over plain HTTP), not {protocol}")
 check_listen_addr(listener.get("addr"), "servers[0].listeners[0].addr")
-if protocol in {"http", "doh", "https"}:
-    path = non_empty_string(listener.get("url_path"), "servers[0].listeners[0].url_path")
-    if not path.startswith("/"):
-        fail("servers[0].listeners[0].url_path must start with /")
-if protocol in {"http", "doh", "https"} and "get_user_ip_from_header" in listener:
+path = non_empty_string(listener.get("url_path"), "servers[0].listeners[0].url_path")
+if not path.startswith("/"):
+    fail("servers[0].listeners[0].url_path must start with /")
+if "get_user_ip_from_header" in listener:
     non_empty_string(listener.get("get_user_ip_from_header"), "servers[0].listeners[0].get_user_ip_from_header")
 if "idle_timeout" in listener and exact_int(listener.get("idle_timeout"), "servers[0].listeners[0].idle_timeout") < 0:
     fail("servers[0].listeners[0].idle_timeout must not be negative")
-
-# The gateway is the only public listener, so a plain-HTTP MosDNS listener must
-# stay on loopback.
-if protocol == "http":
-    listen_host = urlsplit("//" + listener["addr"]).hostname
-    if listen_host not in {"127.0.0.1", "localhost", "::1"}:
-        fail(f"servers[0].listeners[0].addr must bind to loopback, not {listen_host}")
+check_loopback(listener["addr"], "servers[0].listeners[0].addr")
 
 project_dir = config_path.resolve().parent
 dockerfile = project_dir / "Dockerfile"
@@ -249,7 +255,7 @@ dockerfile = project_dir / "Dockerfile"
 dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
 
 # Cross-check the listener against the gateway's backend URL in the Dockerfile.
-if dockerfile.is_file() and protocol in {"http", "doh"}:
+if dockerfile.is_file():
     match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", dockerfile_text)
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
@@ -271,16 +277,20 @@ if fallback["fast_fallback"] >= server_timeout_ms:
     )
 
 gateway_timeout_ms = None
-env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s)\b", dockerfile_text)
-if env_match:
+if re.search(r"\bUPSTREAM_TIMEOUT=", dockerfile_text):
+    env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s)\b", dockerfile_text)
+    if env_match is None:
+        fail("Dockerfile sets UPSTREAM_TIMEOUT in a format this check cannot read; use <number>ms or <number>s")
     gateway_timeout_ms = float(env_match.group(1)) * (1 if env_match.group(2) == "ms" else 1000)
 else:
     main_go = project_dir / "main.go"
-    if main_go.is_file():
-        go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+)\s*\*\s*time\.Second", main_go.read_text(encoding="utf-8"))
-        if go_match:
-            gateway_timeout_ms = int(go_match.group(1)) * 1000
-if gateway_timeout_ms is not None and server_timeout_ms >= gateway_timeout_ms:
+    if not main_go.is_file():
+        fail("main.go not found next to the config; cannot verify the gateway UPSTREAM_TIMEOUT default")
+    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+)\s*\*\s*time\.Second", main_go.read_text(encoding="utf-8"))
+    if go_match is None:
+        fail("could not read defaultUpstreamTO from main.go (expected '<n> * time.Second'); the timeout-chain check would be skipped")
+    gateway_timeout_ms = int(go_match.group(1)) * 1000
+if server_timeout_ms >= gateway_timeout_ms:
     fail(
         f"servers[0].timeout ({server_timeout_ms} ms) must be below the gateway UPSTREAM_TIMEOUT ({gateway_timeout_ms:g} ms)"
     )

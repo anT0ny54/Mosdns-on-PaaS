@@ -1063,3 +1063,123 @@ func TestMetricsExposeSampleCounters(t *testing.T) {
 		}
 	}
 }
+
+// TestQueueTimeoutReturns503 covers the path where every processing slot is
+// busy and a request exhausts QUEUE_WAIT: 503, Retry-After: 1, and the
+// queue-timeout counter incremented.
+func TestQueueTimeoutReturns503(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+			<-release
+		default:
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 1) // a single processing slot
+	g.queueWait = 50 * time.Millisecond
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+		r.Header.Set("Content-Type", "application/dns-message")
+		g.ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	<-entered // the first request now holds the only slot
+
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After=%q, want %q", got, "1")
+	}
+	if got := g.metrics.queueTimeoutTotal.Load(); got != 1 {
+		t.Errorf("queue timeouts=%d, want 1", got)
+	}
+
+	close(release)
+	<-firstDone
+}
+
+func TestWrongMethodAdvertisesAllowedMethods(t *testing.T) {
+	g := testGateway("http://127.0.0.1:1", 100, 1)
+	for _, tc := range []struct {
+		path  string
+		allow string
+	}{
+		{"/healthz", "GET, HEAD"},
+		{"/readyz", "GET, HEAD"},
+		{"/metrics", "GET, HEAD"},
+		{"/dns-query", "GET, POST"},
+	} {
+		method := http.MethodPost
+		if tc.path == "/dns-query" {
+			method = http.MethodPut
+		}
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest(method, tc.path, nil))
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s: got %d, want %d", tc.path, w.Code, http.StatusMethodNotAllowed)
+		}
+		if got := w.Header().Get("Allow"); got != tc.allow {
+			t.Fatalf("%s: Allow=%q, want %q", tc.path, got, tc.allow)
+		}
+	}
+}
+
+func TestRateLimitedResponseIsPlainText(t *testing.T) {
+	backend := okBackend()
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 1, 10)
+	var w *httptest.ResponseRecorder
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+		r.Header.Set("Content-Type", "application/dns-message")
+		w = httptest.NewRecorder()
+		g.ServeHTTP(w, r)
+	}
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request: got %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+	if got := w.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type=%q, want text/plain", got)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("429 without Retry-After")
+	}
+}
+
+// A single large write would otherwise make Go fall back to chunked encoding.
+func TestRelayedResponseSetsContentLength(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(make([]byte, 3000))
+	}))
+	defer backend.Close()
+
+	g := testGateway(backend.URL, 100, 10)
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("Content-Length"); got != "3000" {
+		t.Fatalf("Content-Length=%q, want 3000", got)
+	}
+	if w.Body.Len() != 3000 {
+		t.Fatalf("body length=%d, want 3000", w.Body.Len())
+	}
+}

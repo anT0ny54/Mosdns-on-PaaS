@@ -15,7 +15,7 @@ import (
 // the 5,000 RPS target. It uses a local in-process backend so the result
 // measures gateway/admission/HTTP overhead rather than public DNS latency.
 func BenchmarkGateway5000RPS(b *testing.B) {
-	_, srv, client, cleanup := throughputHarness()
+	srv, client, cleanup := throughputHarness()
 	defer srv.Close()
 	defer client.CloseIdleConnections()
 	defer cleanup()
@@ -46,7 +46,7 @@ func BenchmarkGateway5000RPS(b *testing.B) {
 // environment explicitly requests a hard throughput gate. Keeping the gate
 // opt-in avoids making ordinary unit-test environments depend on CPU speed.
 func TestFiveThousandRPSTarget(t *testing.T) {
-	if testing.Short() || getenvBool("REQUIRE_5000_RPS") == false {
+	if testing.Short() || !getenvBool("REQUIRE_5000_RPS") {
 		t.Skip("set REQUIRE_5000_RPS=1 to enforce the 5,000 RPS throughput gate")
 	}
 
@@ -54,7 +54,7 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 	const requests = 10000
 	const target = 5000.0
 
-	_, srv, client, cleanup := throughputHarness()
+	srv, client, cleanup := throughputHarness()
 	defer srv.Close()
 	defer client.CloseIdleConnections()
 	defer cleanup()
@@ -105,7 +105,7 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 	}
 }
 
-func throughputHarness() (*gateway, *httptest.Server, *http.Client, func()) {
+func throughputHarness() (*httptest.Server, *http.Client, func()) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write([]byte{0x01})
@@ -131,7 +131,7 @@ func throughputHarness() (*gateway, *httptest.Server, *http.Client, func()) {
 		MaxConnsPerHost:     64,
 		DisableCompression:  true,
 	}, Timeout: 5 * time.Second}
-	return g, server, client, backend.Close
+	return server, client, backend.Close
 }
 
 func getenvBool(key string) bool {

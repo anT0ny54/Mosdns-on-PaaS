@@ -264,7 +264,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/healthz":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			methodNotAllowed(w, "GET, HEAD")
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -272,7 +272,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	case "/readyz":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			methodNotAllowed(w, "GET, HEAD")
 			return
 		}
 		if !g.ready(r.Context()) {
@@ -284,7 +284,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	case "/metrics":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			methodNotAllowed(w, "GET, HEAD")
 			return
 		}
 		g.serveMetrics(w)
@@ -298,8 +298,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	g.metrics.requestsTotal.Add(1)
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		methodNotAllowed(w, "GET, POST")
 		return
 	}
 
@@ -307,8 +306,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	if !g.limiter.allow(rateLimitKey(clientIP)) {
 		g.metrics.rateLimitedTotal.Add(1)
 		w.Header().Set("Retry-After", strconv.Itoa(g.limiter.retryAfterSeconds()))
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, "rate limit exceeded\n")
+		writeText(w, http.StatusTooManyRequests, "rate limit exceeded\n")
 		return
 	}
 
@@ -321,8 +319,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	default:
 		g.metrics.activeRejectedTotal.Add(1)
 		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, "active request limit reached\n")
+		writeText(w, http.StatusServiceUnavailable, "active request limit reached\n")
 		return
 	}
 
@@ -371,23 +368,29 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Fast path: take a free slot without allocating a timer. Only when every
+	// slot is busy does the request queue, bounded by QUEUE_WAIT.
 	queueStart := time.Now()
-	queueTimer := time.NewTimer(g.queueWait)
-	defer queueTimer.Stop()
 	select {
 	case g.processingSlots <- struct{}{}:
-		wait := time.Since(queueStart)
-		g.metrics.queueWaitSamples.Add(1)
-		g.metrics.queueWaitNanos.Add(uint64(wait))
-		defer func() { <-g.processingSlots }()
-	case <-queueTimer.C:
-		g.metrics.queueTimeoutTotal.Add(1)
-		w.Header().Set("Retry-After", "1")
-		writeText(w, http.StatusServiceUnavailable, "server busy\n")
-		return
-	case <-r.Context().Done():
-		return
+	default:
+		queueTimer := time.NewTimer(g.queueWait)
+		select {
+		case g.processingSlots <- struct{}{}:
+			queueTimer.Stop()
+		case <-queueTimer.C:
+			g.metrics.queueTimeoutTotal.Add(1)
+			w.Header().Set("Retry-After", "1")
+			writeText(w, http.StatusServiceUnavailable, "server busy\n")
+			return
+		case <-r.Context().Done():
+			queueTimer.Stop()
+			return
+		}
 	}
+	g.metrics.queueWaitSamples.Add(1)
+	g.metrics.queueWaitNanos.Add(uint64(time.Since(queueStart)))
+	defer func() { <-g.processingSlots }()
 
 	ctx, cancel := context.WithTimeout(r.Context(), g.upstreamTimeout)
 	defer cancel()
@@ -431,27 +434,23 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
 	if err != nil {
 		releaseBody = false
-		if r.Context().Err() != nil {
-			// The client went away; that is not a backend fault and nobody
-			// is left to read a response.
-			return
-		}
-		g.metrics.backendErrorTotal.Add(1)
-		status := http.StatusBadGateway
-		if isTimeoutError(err) {
-			status = http.StatusGatewayTimeout
-		}
-		w.WriteHeader(status)
+		g.failBackend(w, r, err)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// A backend that answers with an error may do so before it has read the
+		// whole request, and the transport can still be reading our body
+		// buffer; leave it to the GC instead of handing it to another request.
+		releaseBody = false
+	}
 
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
 	respBody, err := readBoundedBody(resp.Body, (*respBuf)[:0], int(g.maxResponseBytes))
 	if err != nil {
-		g.metrics.backendErrorTotal.Add(1)
-		w.WriteHeader(http.StatusBadGateway)
+		releaseBody = false
+		g.failBackend(w, r, err)
 		return
 	}
 	if int64(len(respBody)) > g.maxResponseBytes {
@@ -477,8 +476,27 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
+	// copyResponseHeaders drops the backend's Content-Length; set it from the
+	// body actually read so large answers are not sent chunked.
+	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
+}
+
+// failBackend answers a failed gateway-to-MosDNS exchange, whether it failed
+// before the response headers or while the body was being read. A client that
+// has already gone away gets nothing and is not counted as a backend fault;
+// otherwise the failure is counted and reported as 504 (timeout) or 502.
+func (g *gateway) failBackend(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	g.metrics.backendErrorTotal.Add(1)
+	status := http.StatusBadGateway
+	if isTimeoutError(err) {
+		status = http.StatusGatewayTimeout
+	}
+	w.WriteHeader(status)
 }
 
 // backendRequestURL returns the MosDNS URL to call. For a GET, dns is the
@@ -754,6 +772,12 @@ func rateLimitKey(ip string) string {
 	return parsed.Mask(net.CIDRMask(64, 128)).String()
 }
 
+// methodNotAllowed writes a 405 with the mandatory Allow header.
+func methodNotAllowed(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
+	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
 func writeText(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
@@ -850,6 +874,7 @@ func envInt(key string, fallback int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 {
+		log.Printf("ignoring invalid %s=%q (want an integer >= 1); using default %d", key, v, fallback)
 		return fallback
 	}
 	return n
@@ -862,6 +887,7 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
+		log.Printf("ignoring invalid %s=%q (want a positive duration such as 200ms or 3s); using default %s", key, v, fallback)
 		return fallback
 	}
 	return d
