@@ -11,15 +11,11 @@ import (
 	"time"
 )
 
-// BenchmarkGateway5000RPS is a sustained-throughput regression benchmark for
-// the 5,000 RPS target. It uses a local in-process backend so the result
-// measures gateway/admission/HTTP overhead rather than public DNS latency.
 func BenchmarkGateway5000RPS(b *testing.B) {
 	srv, client, cleanup := throughputHarness()
 	defer srv.Close()
 	defer client.CloseIdleConnections()
 	defer cleanup()
-
 	b.ReportAllocs()
 	b.ResetTimer()
 	var next uint64
@@ -31,34 +27,29 @@ func BenchmarkGateway5000RPS(b *testing.B) {
 			req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(int(i%250)+1))
 			resp, err := client.Do(req)
 			if err != nil {
-				b.Fatal(err)
+				b.Error(err)
+				return
 			}
 			if resp.StatusCode != http.StatusOK {
 				resp.Body.Close()
-				b.Fatalf("status=%d", resp.StatusCode)
+				b.Errorf("status=%d", resp.StatusCode)
+				return
 			}
 			resp.Body.Close()
 		}
 	})
 }
-
-// TestFiveThousandRPSTarget performs a short, warm sustained run when the
-// environment explicitly requests a hard throughput gate. Keeping the gate
-// opt-in avoids making ordinary unit-test environments depend on CPU speed.
 func TestFiveThousandRPSTarget(t *testing.T) {
 	if testing.Short() || !getenvBool("REQUIRE_5000_RPS") {
 		t.Skip("set REQUIRE_5000_RPS=1 to enforce the 5,000 RPS throughput gate")
 	}
-
 	const warmup = 1000
 	const requests = 10000
 	const target = 5000.0
-
 	srv, client, cleanup := throughputHarness()
 	defer srv.Close()
 	defer client.CloseIdleConnections()
 	defer cleanup()
-
 	send := func(n int) int64 {
 		var failures int64
 		workers := 64
@@ -89,7 +80,6 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 		wg.Wait()
 		return failures
 	}
-
 	if failures := send(warmup); failures != 0 {
 		t.Fatalf("warmup failures=%d", failures)
 	}
@@ -104,7 +94,6 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 		t.Fatalf("throughput %.0f RPS is below target %.0f RPS", rps, target)
 	}
 }
-
 func throughputHarness() (*httptest.Server, *http.Client, func()) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
@@ -133,7 +122,6 @@ func throughputHarness() (*httptest.Server, *http.Client, func()) {
 	}, Timeout: 5 * time.Second}
 	return server, client, backend.Close
 }
-
 func getenvBool(key string) bool {
 	return envString(key, "") == "1" || envString(key, "") == "true"
 }
