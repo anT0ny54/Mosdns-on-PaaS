@@ -1,3 +1,3 @@
 module github.com/anT0ny54/Mosdns-on-PaaS
 
-go 1.25
+go 1.27

@@ -155,7 +155,7 @@ make run             # local gateway on :8080 (needs a backend on :8081)
 make clean           # remove ./doh-gateway
 ```
 
-`go test ./...` on its own does not need Python, but it does need Go 1.25 or
+`go test ./...` on its own does not need Python, but it does need Go 1.27 or
 newer (see `go.mod`).
 
 Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousandRPSTarget`.
@@ -164,7 +164,7 @@ Sustained-load benchmark: `go test -bench BenchmarkGateway5000RPS -benchmem`.
 Docker build arguments (all have defaults in the Dockerfile): `MOSDNS_VERSION`
 (`v4.5.3`), `MOSDNS_COMMIT` (optional full commit SHA; the build fails if the
 tag resolves elsewhere), `MOSDNS_GO_VERSION` (`1.19.13`, MosDNS v4 needs an old
-toolchain), `GATEWAY_GO_VERSION` (`1.26`; a currently supported Go release, while `go.mod` only requires 1.25), `ALPINE_VERSION`, `GATEWAY_VERSION`
+toolchain), `GATEWAY_GO_VERSION` (`1.27`; a currently supported Go release, while `go.mod` only requires 1.27), `ALPINE_VERSION`, `GATEWAY_VERSION`
 and `BUILD_DATE`. `make docker-build` passes `GATEWAY_VERSION` (from `VERSION`)
 and `BUILD_DATE`.
 

@@ -4,7 +4,7 @@
 # so it keeps its own pinned Go. The gateway is our own code and internet-facing,
 # so it builds with a currently supported Go release.
 ARG MOSDNS_GO_VERSION=1.19.13
-ARG GATEWAY_GO_VERSION=1.26
+ARG GATEWAY_GO_VERSION=1.27
 ARG MOSDNS_VERSION=v4.5.3
 # Optional supply-chain pin: set to the full commit SHA of the MOSDNS_VERSION tag
 # and the build fails if the tag ever resolves to a different commit.
