@@ -282,7 +282,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var err error
 	var dnsParam string
-	releaseBody := true
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -293,11 +292,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		bodyBuf := dnsMessageBufferPool.Get().(*[]byte)
-		defer func() {
-			if releaseBody {
-				dnsMessageBufferPool.Put(bodyBuf)
-			}
-		}()
+		defer dnsMessageBufferPool.Put(bodyBuf)
 		body, err = readBoundedBody(r.Body, (*bodyBuf)[:0], int(g.maxRequestBytes))
 		if err != nil {
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
@@ -349,7 +344,10 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	var reader io.Reader
 	if body != nil {
-		reader = bytes.NewReader(body)
+		// The transport can still be reading the request body after Do returns
+		// (early response, cancellation), so it must not alias the pooled buffer,
+		// which is handed to another request as soon as this handler returns.
+		reader = bytes.NewReader(append([]byte(nil), body...))
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, outURL, reader)
 	if err != nil {
@@ -367,19 +365,14 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	g.metrics.backendLatencySamples.Add(1)
 	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
 	if err != nil {
-		releaseBody = false
 		g.failBackend(w, r, err)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		releaseBody = false
-	}
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
 	respBody, err := readBoundedBody(resp.Body, (*respBuf)[:0], int(g.maxResponseBytes))
 	if err != nil {
-		releaseBody = false
 		g.failBackend(w, r, err)
 		return
 	}
@@ -593,7 +586,7 @@ func (g *gateway) serveMetrics(w http.ResponseWriter) {
 		avgBackendSeconds = float64(backendNanos) / float64(backendSamples) / float64(time.Second)
 	}
 	var b strings.Builder
-	b.Grow(2048)
+	b.Grow(4096)
 	b.WriteString("# HELP doh_gateway_requests_total Total DoH requests received.\n# TYPE doh_gateway_requests_total counter\ndoh_gateway_requests_total " + strconv.FormatUint(g.metrics.requestsTotal.Load(), 10) + "\n")
 	b.WriteString("# HELP doh_gateway_rate_limited_total Requests rejected by the per-client rate limiter.\n# TYPE doh_gateway_rate_limited_total counter\ndoh_gateway_rate_limited_total " + strconv.FormatUint(g.metrics.rateLimitedTotal.Load(), 10) + "\n")
 	b.WriteString("# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total " + strconv.FormatUint(g.metrics.activeRejectedTotal.Load(), 10) + "\n")
@@ -762,6 +755,17 @@ func newHTTPClient(maxConns int, responseHeaderTimeout time.Duration) *http.Clie
 	}
 	return &http.Client{Transport: transport, CheckRedirect: noRedirect}
 }
+
+// serverWriteTimeout keeps the server's write deadline above the longest time a
+// request may legitimately spend waiting for a slot and for MosDNS. Without it a
+// larger QUEUE_WAIT or UPSTREAM_TIMEOUT would be cut off by the connection
+// deadline, and the client would see a dropped connection instead of 503/504.
+func serverWriteTimeout(queueWait, upstreamTimeout time.Duration) time.Duration {
+	if need := queueWait + upstreamTimeout + 2*time.Second; need > defaultWriteTimeout {
+		return need
+	}
+	return defaultWriteTimeout
+}
 func newReadinessClient() *http.Client {
 	transport := &http.Transport{
 		Proxy:                 nil,
@@ -812,7 +816,7 @@ func main() {
 		Handler:           g,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      defaultWriteTimeout,
+		WriteTimeout:      serverWriteTimeout(queueWait, upstreamTimeout),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}

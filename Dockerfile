@@ -4,7 +4,7 @@
 # so it keeps its own pinned Go. The gateway is our own code and internet-facing,
 # so it builds with a currently supported Go release.
 ARG MOSDNS_GO_VERSION=1.19.13
-ARG GATEWAY_GO_VERSION=1.25
+ARG GATEWAY_GO_VERSION=1.26
 ARG MOSDNS_VERSION=v4.5.3
 # Optional supply-chain pin: set to the full commit SHA of the MOSDNS_VERSION tag
 # and the build fails if the tag ever resolves to a different commit.
@@ -54,8 +54,7 @@ COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 # Only values that differ from the gateway's built-in defaults (see main.go) or
 # that couple the two processes are set here. MOSDNS_DOH_URL must match the
 # listener in mosdns.yaml; `make check-config` verifies that.
-ENV PORT=8080 \
-    MOSDNS_CONFIG=/etc/mosdns/config.yaml \
+ENV MOSDNS_CONFIG=/etc/mosdns/config.yaml \
     MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query \
     GOMAXPROCS=1 \
     GOGC=150 \
