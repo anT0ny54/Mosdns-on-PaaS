@@ -10,7 +10,7 @@ ARG MOSDNS_VERSION=v4.5.3
 # and the build fails if the tag ever resolves to a different commit.
 ARG MOSDNS_COMMIT=
 ARG ALPINE_VERSION=3.24.2
-ARG GATEWAY_VERSION=0.5.4
+ARG GATEWAY_VERSION=0.5.5
 
 FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION

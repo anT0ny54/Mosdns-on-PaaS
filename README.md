@@ -84,16 +84,16 @@ Gateway:
 | `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. |
 | `QUEUE_WAIT` | `100ms` | Max wait for a processing slot, then `503`. |
 | `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it (see Architecture). |
-| `CLIENT_IP_HEADER` | `none` | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used, then `X-Real-IP` as a fallback; if neither holds a valid IP the socket peer is used. Default keys rate limits on the socket peer only (see the note below). |
+| `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` in the shipped Dockerfile) | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used, then `X-Real-IP` as a fallback; if neither holds a valid IP the socket peer is used. Default keys rate limits on the socket peer only (see the note below). |
 
 **Behind a PaaS proxy, set `CLIENT_IP_HEADER`.** With the default (`none`) the
 rate limiter sees only the socket peer, which on Koyeb and similar platforms is
 typically the platform's own proxy, so every client arriving through the same proxy
 address shares one `RATE_LIMIT` bucket (100 requests per minute by default).
-Set `CLIENT_IP_HEADER=X-Forwarded-For` in the service environment so each real
-client gets its own bucket. Only do this when the container is reachable
-solely through that trusted proxy, because the header is otherwise spoofable.
-The Dockerfile does not set it.
+The shipped Dockerfile already sets `CLIENT_IP_HEADER=X-Forwarded-For` so each
+real client gets its own bucket; set it back to `none` (or remove it) if the
+container is not reachable solely through your trusted proxy, because the
+header is otherwise spoofable.
 
 Integer variables must be >= 1 and duration variables must be positive Go
 durations (`100ms`, `2.5s`). An invalid value is ignored: the default is used
@@ -170,7 +170,7 @@ and `BUILD_DATE`.
 
 ## Version
 
-Gateway version is tracked in `VERSION` (0.5.4) and injected at build time
+Gateway version is tracked in `VERSION` (0.5.5) and injected at build time
 via `-ldflags -X main.version=...`; the MosDNS version is pinned in the
 Dockerfile (`ARG MOSDNS_VERSION=v4.5.3`, with an optional `MOSDNS_COMMIT`
 supply-chain pin). When bumping, change `VERSION` and the Dockerfile's
@@ -185,10 +185,11 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns.mydoh.workers.dev/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
 ## ⚡ Bandwidth Hero Server
 

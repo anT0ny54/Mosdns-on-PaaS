@@ -362,12 +362,14 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	backendStart := time.Now()
 	resp, err := g.client.Do(req)
-	g.metrics.backendLatencySamples.Add(1)
-	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
 	if err != nil {
 		g.failBackend(w, r, err)
 		return
 	}
+	// Count latency only for completed upstream calls: recording timeout and
+	// connection failures here would inflate the average-latency gauge.
+	g.metrics.backendLatencySamples.Add(1)
+	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
 	defer resp.Body.Close()
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
