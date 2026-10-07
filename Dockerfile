@@ -53,17 +53,13 @@ COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Only values that differ from the gateway's built-in defaults (see main.go) or
 # that couple the two processes are set here. MOSDNS_DOH_URL must match the
-# listener in mosdns.yaml; `make check-config` verifies that.
+# listener in mosdns.yaml, and UPSTREAM_TIMEOUT must stay above the MosDNS server
+# timeout; `make check-config` verifies both. Every other gateway setting
+# (RATE_LIMIT, RATE_WINDOW, MAX_*, QUEUE_WAIT, ...) uses the built-in default.
 ENV MOSDNS_CONFIG=/etc/mosdns/config.yaml \
     MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query \
     GOMAXPROCS=1 \
-    GOGC=100 \
     GOMEMLIMIT=160MiB \
-    RATE_LIMIT=100 \
-    RATE_WINDOW=60s \
-    MAX_CONCURRENT_REQUESTS=8 \
-    MAX_ACTIVE_REQUESTS=16 \
-    QUEUE_WAIT=100ms \
     UPSTREAM_TIMEOUT=2.5s \
     CLIENT_IP_HEADER=X-Forwarded-For
 

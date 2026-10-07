@@ -1111,3 +1111,50 @@ func TestServerWriteTimeoutCoversUpstreamTimeout(t *testing.T) {
 		t.Fatalf("write timeout %s does not exceed queue wait plus upstream timeout", got)
 	}
 }
+
+// blockingWriter simulates a client that is not reading: the first body Write
+// blocks until release is closed.
+type blockingWriter struct {
+	h       http.Header
+	inWrite chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingWriter) Header() http.Header { return b.h }
+func (b *blockingWriter) WriteHeader(int)     {}
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	b.once.Do(func() { close(b.inWrite) })
+	<-b.release
+	return len(p), nil
+}
+func TestSlowReadingClientDoesNotHoldProcessingSlot(t *testing.T) {
+	backend := okBackend()
+	defer backend.Close()
+	g := testGateway(backend.URL, 100, 1)
+	bw := &blockingWriter{h: make(http.Header), inWrite: make(chan struct{}), release: make(chan struct{})}
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+		r.Header.Set("Content-Type", "application/dns-message")
+		g.ServeHTTP(bw, r)
+	}()
+	select {
+	case <-bw.inWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow client's response was never written")
+	}
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("request behind a slow-reading client got %d, want %d", w.Code, http.StatusOK)
+	}
+	close(bw.release)
+	<-slowDone
+	if got := len(g.processingSlots); got != 0 {
+		t.Fatalf("processing slots held after completion=%d, want 0", got)
+	}
+}

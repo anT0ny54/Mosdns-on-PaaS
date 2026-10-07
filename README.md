@@ -81,7 +81,7 @@ Gateway:
 | `RATE_WINDOW` | `60s` | Rate-limit window (fixed, clock-aligned windows). |
 | `RATE_LIMIT_CLIENTS` | `65536` | Max distinct client keys per window; new clients are denied beyond this until the window rolls over. IPv6 clients are grouped by /64. |
 | `MAX_ACTIVE_REQUESTS` | `16` | Hard ceiling on concurrently admitted requests (extra get `503` + `Retry-After: 1`). |
-| `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. |
+| `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. A slot is released as soon as MosDNS's answer has been read, before it is written to the client, so a slow-reading client does not hold one. |
 | `QUEUE_WAIT` | `100ms` | Max wait for a processing slot, then `503`. |
 | `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it (see Architecture). |
 | `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` in the shipped Dockerfile) | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used, then `X-Real-IP` as a fallback; if neither holds a valid IP the socket peer is used. Default keys rate limits on the socket peer only (see the note below). |
@@ -99,12 +99,14 @@ Integer variables must be >= 1 and duration variables must be positive Go
 durations (`100ms`, `2.5s`). An invalid value is ignored: the default is used
 and a warning is logged at startup.
 
-The Dockerfile sets only `MOSDNS_CONFIG`, `MOSDNS_DOH_URL` and the runtime
-tuning values `GOMAXPROCS=1`, `GOGC=100`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=100`, `MAX_CONCURRENT_REQUESTS=8`, `MAX_ACTIVE_REQUESTS=16`, `QUEUE_WAIT=100ms`, `UPSTREAM_TIMEOUT=2.5s`, `CLIENT_IP_HEADER=X-Forwarded-For`; everything else,
-including `PORT`, relies on the built-in defaults above (the image still
-`EXPOSE`s 8080). The tuning values are ordinary environment variables, so both
-the gateway and MosDNS inherit them; the memory limit applies to each process
-separately, not to the container as a whole.
+The Dockerfile sets only `MOSDNS_CONFIG`, `MOSDNS_DOH_URL`, `UPSTREAM_TIMEOUT=2.5s`
+(pinned because `check-config.sh` ties it to the MosDNS timeout), `CLIENT_IP_HEADER=X-Forwarded-For`
+and the runtime tuning values `GOMAXPROCS=1` and `GOMEMLIMIT=160MiB`; everything
+else, including `PORT`, `RATE_LIMIT`, `RATE_WINDOW`, `MAX_CONCURRENT_REQUESTS`,
+`MAX_ACTIVE_REQUESTS` and `QUEUE_WAIT`, relies on the built-in defaults above
+(the image still `EXPOSE`s 8080). The Go runtime values are ordinary environment
+variables, so both the gateway and MosDNS inherit them; the memory limit applies
+to each process separately, not to the container as a whole.
 
 Client headers (Cookie, Authorization, ...) are never forwarded upstream; only
 `Accept`, `X-Forwarded-For` (the client address the gateway determined, not the
@@ -122,7 +124,9 @@ does not set `get_user_ip_from_header`, so MosDNS currently ignores
 (ms). `primary_fast` races `root.hagezi.org` and `wurzn.hagezi.org`;
 `fallback_hagezi` is `juuri.hagezi.org`. Upstreams use pinned `dial_addr` IPs,
 so no bootstrap DNS lookup is needed, but those IPs must be updated by hand if
-HaGeZi renumbers its endpoints. The server timeout is 2 s.
+HaGeZi renumbers its endpoints. The server timeout is 2 s. `enable_pipeline` has no effect on DoH upstreams in
+MosDNS v4.5.3 (it only applies to TCP/DoT); it stays in the file because
+`check-config.sh` requires the key.
 
 `check-config.sh` (requires Python 3.8+ with PyYAML; run via
 `make check-config`) validates it:
@@ -134,9 +138,10 @@ HaGeZi renumbers its endpoints. The server timeout is 2 s.
   be loopback);
 - the Dockerfile's `MOSDNS_DOH_URL` port and path match that listener;
 - the timeout chain `fast_fallback < servers[0].timeout < UPSTREAM_TIMEOUT`,
-  using `UPSTREAM_TIMEOUT` from the Dockerfile or, if unset there, `defaultUpstreamTO`
-  from `main.go`. The check fails (rather than silently skipping) if neither
-  can be read;
+  using `UPSTREAM_TIMEOUT` from the Dockerfile (`<number>ms` or `<number>s`) or, if
+  unset there, `defaultUpstreamTO` from `main.go` (`<number> * time.Millisecond`
+  or `<number> * time.Second`). The check fails (rather than silently skipping)
+  if neither can be read;
 - `VERSION` matches the Dockerfile's default `ARG GATEWAY_VERSION`.
 
 The checks are written for the pinned, MosDNS v4.5.3-compatible layout. If
@@ -158,7 +163,10 @@ make clean           # remove ./doh-gateway
 `go test ./...` on its own does not need Python, but it does need Go 1.27 or
 newer (see `go.mod`).
 
-Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousandRPSTarget`.
+Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousandRPSTarget`
+(it drives the gateway with as many concurrent workers as the default
+`MAX_ACTIVE_REQUESTS`, because more in-flight requests than that are rejected
+with `503` by design).
 Sustained-load benchmark: `go test -bench BenchmarkGateway5000RPS -benchmem`.
 
 Docker build arguments (all have defaults in the Dockerfile): `MOSDNS_VERSION`

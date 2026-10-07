@@ -52,7 +52,9 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 	defer cleanup()
 	send := func(n int) int64 {
 		var failures int64
-		workers := 64
+		// Stay within the active-request ceiling: more in-flight requests than
+		// defaultMaxActiveRequests are rejected with 503 by design.
+		workers := defaultMaxActiveRequests
 		jobs := make(chan int)
 		var wg sync.WaitGroup
 		wg.Add(workers)

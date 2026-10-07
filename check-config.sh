@@ -227,10 +227,10 @@ else:
     main_go = project_dir / "main.go"
     if not main_go.is_file():
         fail("main.go not found next to the config; cannot verify the gateway UPSTREAM_TIMEOUT default")
-    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+)\s*\*\s*time\.Second", main_go.read_text(encoding="utf-8"))
+    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second)\b", main_go.read_text(encoding="utf-8"))
     if go_match is None:
-        fail("could not read defaultUpstreamTO from main.go (expected '<n> * time.Second'); the timeout-chain check would be skipped")
-    gateway_timeout_ms = int(go_match.group(1)) * 1000
+        fail("could not read defaultUpstreamTO from main.go (expected '<n> * time.Millisecond' or '<n> * time.Second'); the timeout-chain check would be skipped")
+    gateway_timeout_ms = float(go_match.group(1)) * (1 if go_match.group(2) == "Millisecond" else 1000)
 if server_timeout_ms >= gateway_timeout_ms:
     fail(
         f"servers[0].timeout ({server_timeout_ms} ms) must be below the gateway UPSTREAM_TIMEOUT ({gateway_timeout_ms:g} ms)"

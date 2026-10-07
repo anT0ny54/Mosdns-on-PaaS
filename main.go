@@ -333,7 +333,17 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	g.metrics.queueWaitSamples.Add(1)
 	g.metrics.queueWaitNanos.Add(uint64(time.Since(queueStart)))
-	defer func() { <-g.processingSlots }()
+	// The slot bounds work against MosDNS, not the client's download speed, so it
+	// is released as soon as the answer has been read (before writing it to the
+	// client); a client that reads slowly then cannot starve other requests.
+	slotHeld := true
+	releaseSlot := func() {
+		if slotHeld {
+			slotHeld = false
+			<-g.processingSlots
+		}
+	}
+	defer releaseSlot()
 	ctx, cancel := context.WithTimeout(r.Context(), g.upstreamTimeout)
 	defer cancel()
 	outURL, ok := g.backendRequestURL(dnsParam)
@@ -396,6 +406,8 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	_ = resp.Body.Close()
+	releaseSlot()
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
