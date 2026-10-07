@@ -26,17 +26,17 @@ const (
 	maxHeaderBytes           = 8 * 1024
 	defaultListen            = ":8080"
 	defaultBackend           = "http://127.0.0.1:8081/dns-query"
-	defaultRateLimit         = 240
+	defaultRateLimit         = 100
 	defaultRateWindow        = 60 * time.Second
 	defaultRateLimitClients  = 65536
-	defaultConcurrency       = 20
-	defaultMaxActiveRequests = 512
-	defaultUpstreamTO        = 3 * time.Second
+	defaultConcurrency       = 8
+	defaultMaxActiveRequests = 16
+	defaultUpstreamTO        = 2500 * time.Millisecond
 	defaultReadyProbeTimeout = 1 * time.Second
 	defaultReadyCacheTTL     = 5 * time.Second
 	readyFailCacheTTL        = 1 * time.Second
 	defaultReadHeaderTimeout = 5 * time.Second
-	defaultQueueWait         = 200 * time.Millisecond
+	defaultQueueWait         = 100 * time.Millisecond
 	defaultReadTimeout       = 5 * time.Second
 	defaultWriteTimeout      = 8 * time.Second
 	defaultIdleTimeout       = 20 * time.Second
@@ -733,7 +733,7 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
-		log.Printf("ignoring invalid %s=%q (want a positive duration such as 200ms or 3s); using default %s", key, v, fallback)
+		log.Printf("ignoring invalid %s=%q (want a positive duration such as 100ms or 2.5s); using default %s", key, v, fallback)
 		return fallback
 	}
 	return d

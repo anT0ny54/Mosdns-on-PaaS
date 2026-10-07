@@ -268,11 +268,11 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 	if defaultRateLimitClients != 65536 {
 		t.Fatalf("default rate-limit client guard=%d, want 65536", defaultRateLimitClients)
 	}
-	if defaultMaxActiveRequests != 512 {
-		t.Fatalf("default active-request capacity=%d, want 512", defaultMaxActiveRequests)
+	if defaultMaxActiveRequests != 16 {
+		t.Fatalf("default active-request capacity=%d, want 16", defaultMaxActiveRequests)
 	}
-	if defaultConcurrency != 20 {
-		t.Fatalf("default backend processing cap=%d, want 20", defaultConcurrency)
+	if defaultConcurrency != 8 {
+		t.Fatalf("default backend processing cap=%d, want 8", defaultConcurrency)
 	}
 	transport := newHTTPClient(defaultConcurrency, defaultUpstreamTO).Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost != defaultConcurrency {
@@ -291,7 +291,7 @@ func TestDefaultCapacityConfiguration(t *testing.T) {
 }
 func TestActiveRequestBurstCapacity(t *testing.T) {
 	const burst = 128
-	const processingCap = 20
+	const processingCap = 8
 	backendRelease := make(chan struct{})
 	backendEntered := make(chan struct{}, burst)
 	var backendMu sync.Mutex

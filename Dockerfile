@@ -57,8 +57,15 @@ COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 ENV MOSDNS_CONFIG=/etc/mosdns/config.yaml \
     MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query \
     GOMAXPROCS=1 \
-    GOGC=150 \
-    GOMEMLIMIT=160MiB
+    GOGC=100 \
+    GOMEMLIMIT=160MiB \
+    RATE_LIMIT=100 \
+    RATE_WINDOW=60s \
+    MAX_CONCURRENT_REQUESTS=8 \
+    MAX_ACTIVE_REQUESTS=16 \
+    QUEUE_WAIT=100ms \
+    UPSTREAM_TIMEOUT=2.5s \
+    CLIENT_IP_HEADER=X-Forwarded-For
 
 EXPOSE 8080
 USER app

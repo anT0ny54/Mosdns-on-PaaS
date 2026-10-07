@@ -2,7 +2,7 @@
 # Primary: race two HaGeZi DoH endpoints and use the first response.
 # Fallback: if the primary has not produced a usable answer within 400 ms, also
 # query the standby HaGeZi endpoint and use whichever answers first.
-# servers[0].timeout must stay below the gateway UPSTREAM_TIMEOUT (default 3s).
+# servers[0].timeout must stay below the gateway UPSTREAM_TIMEOUT (default 2.5s).
 
 log:
   level: error

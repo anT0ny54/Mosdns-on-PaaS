@@ -77,30 +77,30 @@ Gateway:
 |---|---|---|
 | `PORT` | `8080` | Listen address (plain number 1-65535, or a Go address such as `127.0.0.1:8080`). An out-of-range number falls back to `8080`; any other value is passed to the listener as-is and is fatal at startup if it is not a valid address. |
 | `MOSDNS_DOH_URL` | `http://127.0.0.1:8081/dns-query` | Backend; must be absolute http(s). Fatal at startup if malformed. Keep it in sync with the listener in `mosdns.yaml`. |
-| `RATE_LIMIT` | `240` | `/dns-query` requests per client per window. Every GET/POST counts, including ones later rejected with `400`/`413`/`415`. |
+| `RATE_LIMIT` | `100` | `/dns-query` requests per client per window. Every GET/POST counts, including ones later rejected with `400`/`413`/`415`. |
 | `RATE_WINDOW` | `60s` | Rate-limit window (fixed, clock-aligned windows). |
 | `RATE_LIMIT_CLIENTS` | `65536` | Max distinct client keys per window; new clients are denied beyond this until the window rolls over. IPv6 clients are grouped by /64. |
-| `MAX_ACTIVE_REQUESTS` | `512` | Hard ceiling on concurrently admitted requests (extra get `503` + `Retry-After: 1`). |
-| `MAX_CONCURRENT_REQUESTS` | `20` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. |
-| `QUEUE_WAIT` | `200ms` | Max wait for a processing slot, then `503`. |
-| `UPSTREAM_TIMEOUT` | `3s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it (see Architecture). |
+| `MAX_ACTIVE_REQUESTS` | `16` | Hard ceiling on concurrently admitted requests (extra get `503` + `Retry-After: 1`). |
+| `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. |
+| `QUEUE_WAIT` | `100ms` | Max wait for a processing slot, then `503`. |
+| `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it (see Architecture). |
 | `CLIENT_IP_HEADER` | `none` | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used, then `X-Real-IP` as a fallback; if neither holds a valid IP the socket peer is used. Default keys rate limits on the socket peer only (see the note below). |
 
 **Behind a PaaS proxy, set `CLIENT_IP_HEADER`.** With the default (`none`) the
 rate limiter sees only the socket peer, which on Koyeb and similar platforms is
 typically the platform's own proxy, so every client arriving through the same proxy
-address shares one `RATE_LIMIT` bucket (240 requests per minute by default).
+address shares one `RATE_LIMIT` bucket (100 requests per minute by default).
 Set `CLIENT_IP_HEADER=X-Forwarded-For` in the service environment so each real
 client gets its own bucket. Only do this when the container is reachable
 solely through that trusted proxy, because the header is otherwise spoofable.
 The Dockerfile does not set it.
 
 Integer variables must be >= 1 and duration variables must be positive Go
-durations (`200ms`, `3s`). An invalid value is ignored: the default is used
+durations (`100ms`, `2.5s`). An invalid value is ignored: the default is used
 and a warning is logged at startup.
 
 The Dockerfile sets only `MOSDNS_CONFIG`, `MOSDNS_DOH_URL` and the runtime
-tuning values `GOMAXPROCS=1`, `GOGC=150`, `GOMEMLIMIT=160MiB`; everything else,
+tuning values `GOMAXPROCS=1`, `GOGC=100`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=100`, `MAX_CONCURRENT_REQUESTS=8`, `MAX_ACTIVE_REQUESTS=16`, `QUEUE_WAIT=100ms`, `UPSTREAM_TIMEOUT=2.5s`, `CLIENT_IP_HEADER=X-Forwarded-For`; everything else,
 including `PORT`, relies on the built-in defaults above (the image still
 `EXPOSE`s 8080). The tuning values are ordinary environment variables, so both
 the gateway and MosDNS inherit them; the memory limit applies to each process
