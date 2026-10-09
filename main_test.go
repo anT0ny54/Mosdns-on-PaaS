@@ -54,7 +54,7 @@ func TestNormalizeListenAddr(t *testing.T) {
 func TestRateLimitPerClient(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 2, 10)
@@ -105,7 +105,7 @@ func TestRateLimiterClientCap(t *testing.T) {
 func TestDoHContentTypeAndSize(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01, 0x02})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -135,7 +135,7 @@ func TestDoHContentTypeAndSize(t *testing.T) {
 func TestGETBase64Validation(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -194,7 +194,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 		default:
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 1)
@@ -238,7 +238,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 func TestActiveRequestCap(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	limiter := newFixedWindowLimiterWithMaxKeys(100000, time.Minute, 16)
@@ -310,7 +310,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 		backendActive--
 		backendMu.Unlock()
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	limiter := newFixedWindowLimiterWithMaxKeys(100000, time.Minute, burst)
@@ -431,7 +431,7 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called.Store(true)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -561,7 +561,7 @@ func TestResponseBoundsAndContentType(t *testing.T) {
 			_, _ = w.Write(make([]byte, maxDNSMessageBytes+1))
 		default:
 			w.Header().Set("Content-Type", "text/plain")
-			_, _ = w.Write([]byte{0x01})
+			_, _ = w.Write([]byte(testDNSBody))
 		}
 	}))
 	defer backend.Close()
@@ -602,7 +602,7 @@ func TestResponseBoundsAndContentType(t *testing.T) {
 func TestGETRejectsPaddedBase64URL(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -689,7 +689,7 @@ func TestFixedWindowRetryAfter(t *testing.T) {
 func okBackend() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 }
 func TestSlowBodyDoesNotHoldProcessingSlot(t *testing.T) {
@@ -741,7 +741,7 @@ func TestPOSTShortBodyRejected(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -761,7 +761,7 @@ func TestClientHeadersAreNotForwarded(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen <- r.Header.Clone()
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -863,7 +863,7 @@ func TestBackendRedirectIsNotFollowed(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&followed, 1)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer target.Close()
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -892,7 +892,7 @@ func TestTransportHeaderTimeoutMapsTo504(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
@@ -965,7 +965,7 @@ func TestQueueTimeoutReturns503(t *testing.T) {
 		default:
 		}
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 1)
@@ -1156,5 +1156,51 @@ func TestSlowReadingClientDoesNotHoldProcessingSlot(t *testing.T) {
 	<-slowDone
 	if got := len(g.processingSlots); got != 0 {
 		t.Fatalf("processing slots held after completion=%d, want 0", got)
+	}
+}
+
+func TestShortBackendResponseRejected(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte{0x01})
+	}))
+	defer backend.Close()
+	g := testGateway(backend.URL, 100, 10)
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	r.Header.Set("Content-Type", "application/dns-message")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("short 2xx backend body: got %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if got := g.metrics.backendErrorTotal.Load(); got != 1 {
+		t.Fatalf("backend errors=%d, want 1", got)
+	}
+}
+func TestReadyEndpointHonorsRequestContext(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(probeResponse(t, r, 0))
+	}))
+	defer backend.Close()
+	g := testGateway(backend.URL, 100, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(ctx))
+	}()
+	time.Sleep(200 * time.Millisecond) // let the probe reach the backend
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readyz did not return after the client went away")
+	}
+	close(release)
+	if !g.readyAt.IsZero() {
+		t.Fatal("canceled probe poisoned the readiness cache")
 	}
 }

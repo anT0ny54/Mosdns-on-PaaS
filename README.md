@@ -34,9 +34,9 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`) and
 
 | Path | Behavior |
 |---|---|
-| `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes. |
+| `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes; a backend 2xx answer shorter than 12 bytes is rejected with `502`. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
-| `GET/HEAD /readyz` | Readiness. Sends a real DNS query (`A ready-<unix-nanoseconds-base36>-<seq-base36>.example.com`) through MosDNS and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then transaction ID, QR bit, RCODE 0/3, QDCOUNT 1, echoed question). The name is unique per probe, so every probe is a cache miss that reaches an upstream. Each probe has a 1 s budget and uses its own single-connection client. Result cached 5 s on success, 1 s on failure; probes are serialized. |
+| `GET/HEAD /readyz` | Readiness. Sends a real DNS query (`A ready-<unix-nanoseconds-base36>-<seq-base36>.example.com`) through MosDNS and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then transaction ID, QR bit, RCODE 0/3, QDCOUNT 1, echoed question). The name is unique per probe, so every probe is a cache miss that reaches an upstream. Each probe has a 1 s budget and uses its own single-connection client. Result cached 5 s on success, 1 s on failure; probes are serialized. The probe runs under the readiness request's context, so a disconnecting client cancels it, and a canceled probe is never cached. |
 | `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`-`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the `3xx` series is always 0 because the gateway never redirects and turns a backend 1xx/3xx into `502`; a client that disconnects mid-request is not counted, since no response is written); readiness probe results; queue-wait and backend-latency totals, sample counts and averages. |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one upstream query per 5 s on success, per 1 s on failure). Block or restrict `/metrics` at the platform edge if you do not want it public.
@@ -52,7 +52,7 @@ Anything else returns `404`; a wrong method returns `405` with an `Allow` header
 | `413` | POST body larger than 4096 bytes. |
 | `415` | POST without exactly `application/dns-message`. |
 | `429` | Per-client rate limit exceeded (`Retry-After` = seconds to the end of the window). |
-| `502` | Backend unreachable, truncated/oversize/non-DoH response, or 1xx/3xx from the backend. |
+| `502` | Backend unreachable, truncated/oversize/non-DoH response, a 2xx body shorter than the 12-byte DNS header, or 1xx/3xx from the backend. |
 | `503` | Active-request ceiling reached, or no processing slot within `QUEUE_WAIT` (both with `Retry-After: 1`). |
 | `504` | Backend did not answer (response headers or body) within `UPSTREAM_TIMEOUT`. |
 
@@ -178,7 +178,7 @@ and `BUILD_DATE`.
 
 ## Version
 
-Gateway version is tracked in `VERSION` (0.5.5) and injected at build time
+Gateway version is tracked in `VERSION` (0.5.6) and injected at build time
 via `-ldflags -X main.version=...`; the MosDNS version is pinned in the
 Dockerfile (`ARG MOSDNS_VERSION=v4.5.3`, with an optional `MOSDNS_COMMIT`
 supply-chain pin). When bumping, change `VERSION` and the Dockerfile's

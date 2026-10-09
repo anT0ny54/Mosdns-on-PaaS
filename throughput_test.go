@@ -99,7 +99,7 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 func throughputHarness() (*httptest.Server, *http.Client, func()) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte{0x01})
+		_, _ = w.Write([]byte(testDNSBody))
 	}))
 	limiter := newFixedWindowLimiterWithMaxKeys(100000, time.Minute, defaultRateLimitClients)
 	limiter.now = func() time.Time { return time.Unix(120, 0) }

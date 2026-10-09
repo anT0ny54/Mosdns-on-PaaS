@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -100,7 +101,7 @@ func (l *fixedWindowLimiter) allow(key string) bool {
 	windowID := l.now().UnixNano() / l.window.Nanoseconds()
 	if windowID != l.windowID {
 		l.windowID = windowID
-		l.counts = make(map[string]int)
+		clear(l.counts)
 	}
 	count, exists := l.counts[key]
 	if !exists && len(l.counts) >= l.maxKeys {
@@ -214,9 +215,13 @@ func (g *gateway) ready(ctx context.Context) bool {
 			return g.readyOK
 		}
 	}
-	ok := g.backendReady(context.Background())
-	g.readyAt = time.Now()
-	g.readyOK = ok
+	ok := g.backendReady(ctx)
+	// Only cache the outcome when the caller is still there: a probe aborted
+	// by client cancellation says nothing about backend health.
+	if ctx.Err() == nil {
+		g.readyAt = time.Now()
+		g.readyOK = ok
+	}
 	return ok
 }
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -394,7 +399,9 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
+		// A 2xx answer must be a plausible DNS message: enforce the same
+		// 12-byte minimum as on the request side, not just the content type.
+		if !isStrictDoHContentType(resp.Header.Get("Content-Type")) || len(respBody) < minDNSMessageBytes {
 			g.metrics.backendErrorTotal.Add(1)
 			w.WriteHeader(http.StatusBadGateway)
 			return
@@ -587,10 +594,11 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	queueSamples := g.metrics.queueWaitSamples.Load()
-	queueNanos := g.metrics.queueWaitNanos.Load()
-	backendSamples := g.metrics.backendLatencySamples.Load()
-	backendNanos := g.metrics.backendLatencyNanos.Load()
+	m := &g.metrics
+	queueSamples := m.queueWaitSamples.Load()
+	queueNanos := m.queueWaitNanos.Load()
+	backendSamples := m.backendLatencySamples.Load()
+	backendNanos := m.backendLatencyNanos.Load()
 	avgQueueSeconds := 0.0
 	if queueSamples != 0 {
 		avgQueueSeconds = float64(queueNanos) / float64(queueSamples) / float64(time.Second)
@@ -601,27 +609,29 @@ func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	}
 	var b strings.Builder
 	b.Grow(4096)
-	b.WriteString("# HELP doh_gateway_requests_total Total DoH requests received.\n# TYPE doh_gateway_requests_total counter\ndoh_gateway_requests_total " + strconv.FormatUint(g.metrics.requestsTotal.Load(), 10) + "\n")
-	b.WriteString("# HELP doh_gateway_rate_limited_total Requests rejected by the per-client rate limiter.\n# TYPE doh_gateway_rate_limited_total counter\ndoh_gateway_rate_limited_total " + strconv.FormatUint(g.metrics.rateLimitedTotal.Load(), 10) + "\n")
-	b.WriteString("# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total " + strconv.FormatUint(g.metrics.activeRejectedTotal.Load(), 10) + "\n")
-	b.WriteString("# HELP doh_gateway_queue_timeout_total Requests that exhausted queue wait.\n# TYPE doh_gateway_queue_timeout_total counter\ndoh_gateway_queue_timeout_total " + strconv.FormatUint(g.metrics.queueTimeoutTotal.Load(), 10) + "\n")
-	b.WriteString("# HELP doh_gateway_backend_error_total Backend/protocol errors observed by the gateway.\n# TYPE doh_gateway_backend_error_total counter\ndoh_gateway_backend_error_total " + strconv.FormatUint(g.metrics.backendErrorTotal.Load(), 10) + "\n")
-	b.WriteString(`# HELP doh_gateway_responses_total Responses grouped by status class.
+	fmt.Fprintf(&b, "# HELP doh_gateway_requests_total Total DoH requests received.\n# TYPE doh_gateway_requests_total counter\ndoh_gateway_requests_total %d\n", m.requestsTotal.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_rate_limited_total Requests rejected by the per-client rate limiter.\n# TYPE doh_gateway_rate_limited_total counter\ndoh_gateway_rate_limited_total %d\n", m.rateLimitedTotal.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total %d\n", m.activeRejectedTotal.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_queue_timeout_total Requests that exhausted queue wait.\n# TYPE doh_gateway_queue_timeout_total counter\ndoh_gateway_queue_timeout_total %d\n", m.queueTimeoutTotal.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_error_total Backend/protocol errors observed by the gateway.\n# TYPE doh_gateway_backend_error_total counter\ndoh_gateway_backend_error_total %d\n", m.backendErrorTotal.Load())
+	fmt.Fprintf(&b, `# HELP doh_gateway_responses_total Responses grouped by status class.
 # TYPE doh_gateway_responses_total counter
-doh_gateway_responses_total{class="2xx"} ` + strconv.FormatUint(g.metrics.responses2xxTotal.Load(), 10) + `
-doh_gateway_responses_total{class="3xx"} ` + strconv.FormatUint(g.metrics.responses3xxTotal.Load(), 10) + `
-doh_gateway_responses_total{class="4xx"} ` + strconv.FormatUint(g.metrics.responses4xxTotal.Load(), 10) + `
-doh_gateway_responses_total{class="5xx"} ` + strconv.FormatUint(g.metrics.responses5xxTotal.Load(), 10) + "\n")
-	b.WriteString(`# HELP doh_gateway_ready_probe_total Readiness probes by result.
+doh_gateway_responses_total{class="2xx"} %d
+doh_gateway_responses_total{class="3xx"} %d
+doh_gateway_responses_total{class="4xx"} %d
+doh_gateway_responses_total{class="5xx"} %d
+`, m.responses2xxTotal.Load(), m.responses3xxTotal.Load(), m.responses4xxTotal.Load(), m.responses5xxTotal.Load())
+	fmt.Fprintf(&b, `# HELP doh_gateway_ready_probe_total Readiness probes by result.
 # TYPE doh_gateway_ready_probe_total counter
-doh_gateway_ready_probe_total{result="ready"} ` + strconv.FormatUint(g.metrics.readyPassTotal.Load(), 10) + `
-doh_gateway_ready_probe_total{result="not_ready"} ` + strconv.FormatUint(g.metrics.readyFailTotal.Load(), 10) + "\n")
-	b.WriteString("# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total " + strconv.FormatFloat(float64(queueNanos)/float64(time.Second), 'f', 6, 64) + "\n")
-	b.WriteString("# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total " + strconv.FormatUint(queueSamples, 10) + "\n")
-	b.WriteString("# HELP doh_gateway_queue_wait_seconds_avg Average processing-slot wait time for admitted requests.\n# TYPE doh_gateway_queue_wait_seconds_avg gauge\ndoh_gateway_queue_wait_seconds_avg " + strconv.FormatFloat(avgQueueSeconds, 'f', 6, 64) + "\n")
-	b.WriteString("# HELP doh_gateway_backend_latency_seconds_total Total gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total " + strconv.FormatFloat(float64(backendNanos)/float64(time.Second), 'f', 6, 64) + "\n")
-	b.WriteString("# HELP doh_gateway_backend_latency_samples_total Requests sent to MosDNS.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total " + strconv.FormatUint(backendSamples, 10) + "\n")
-	b.WriteString("# HELP doh_gateway_backend_latency_seconds_avg Average gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg " + strconv.FormatFloat(avgBackendSeconds, 'f', 6, 64) + "\n")
+doh_gateway_ready_probe_total{result="ready"} %d
+doh_gateway_ready_probe_total{result="not_ready"} %d
+`, m.readyPassTotal.Load(), m.readyFailTotal.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total %.6f\n", float64(queueNanos)/float64(time.Second))
+	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total %d\n", queueSamples)
+	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_avg Average processing-slot wait time for admitted requests.\n# TYPE doh_gateway_queue_wait_seconds_avg gauge\ndoh_gateway_queue_wait_seconds_avg %.6f\n", avgQueueSeconds)
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(backendNanos)/float64(time.Second))
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total Requests sent to MosDNS.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", backendSamples)
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_avg Average gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg %.6f\n", avgBackendSeconds)
 	_, _ = io.WriteString(w, b.String())
 }
 func extractClientIP(r *http.Request, preferredHeader string) string {
