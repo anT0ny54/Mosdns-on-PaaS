@@ -1,50 +1,37 @@
 # Changelog
 
-## 0.5.6 — 2026-10-10
+## 0.5.7 — 2026-10-10
 
-Full-project audit (dead/redundant code, cross-file conflicts, bugs,
-optimizations) with all findings corrected.
+Follow-up audit fixes (container supervision + test correctness).
 
 ### Fixed
-- Backend 2xx responses are now rejected with `502` when the body is smaller
-  than the 12-byte DNS header. The request side always enforced the 12-byte
-  minimum; the response side checked only the 4096-byte maximum and the
-  `application/dns-message` content type, so a 0-11 byte 2xx body was relayed
-  as-is with status 200.
-- `/readyz` ignored the caller's request context: `ready()` always probed
-  with `context.Background()`, so a disconnecting client could not cancel an
-  in-flight probe. The probe now runs under the request context, and a result
-  is only cached while that context is still live, so a client-triggered
-  cancellation can no longer mark the backend unhealthy for the failure TTL.
-  Probes remain serialized on the readiness mutex by design.
+- `entrypoint.sh`: the supervision loop polled `kill -0` on a 1s sleep, but
+  `kill -0` succeeds on a zombie, so an exited mosdns/doh-gateway was never
+  detected and never reaped — the container hung until the platform health
+  check killed it and graceful shutdown never ran. The loop now blocks in
+  `wait -n`, which reaps the exited child immediately (so `kill -0` on it
+  correctly fails afterwards) and reacts to a child death instantly instead
+  of up to 1s late. `tini` is now PID 1 as well: it forwards signals to the
+  entrypoint and reaps processes reparented to PID 1.
+- `main_test.go`: `TestReadyEndpointHonorsRequestContext` left
+  `readyCacheTTL` at its zero value, so `ready()` took the non-caching
+  early-return path and the `readyAt.IsZero()` assertion passed without the
+  cache-poisoning guard (`ctx.Err() == nil`) ever executing. The test now
+  sets `readyCacheTTL = defaultReadyCacheTTL` so the code path under test is
+  actually exercised.
 
 ### Changed
-- `fixedWindowLimiter` reuses its count map across window rollovers via
-  `clear()` instead of allocating a new map per window.
-- `serveMetrics` emits the exposition with `fmt.Fprintf` into the existing
-  `strings.Builder` instead of repeated string concatenation; output is
-  byte-identical.
-- `.gitattributes`: dropped the Python/TypeScript/JavaScript rules; the repo
-  contains none of those file types.
-- Version bumped to 0.5.6 (`VERSION` and Dockerfile `ARG GATEWAY_VERSION`
-  changed together, as `check-config.sh` requires).
+- Dockerfile: `apk add tini` + `ENTRYPOINT ["/sbin/tini", "--", ...]`;
+  version bumped to 0.5.7 (`VERSION` and `ARG GATEWAY_VERSION` changed
+  together, as `check-config.sh` requires).
 
-### Evaluated and rejected
-- Reusing a pooled buffer for the upstream POST body instead of
-  `append([]byte(nil), body...)` would let the HTTP transport keep reading a
-  buffer that another request already recycled — the transport can outlive
-  the handler. The fresh copy stays.
-
-### Tests
-- `main_test.go`: stub backends that answered success with 1-2 byte bodies
-  now answer with the 12-byte `testDNSBody`; added
-  `TestShortBackendResponseRejected` (short 2xx -> 502) and
-  `TestReadyEndpointHonorsRequestContext` (cancellation aborts the probe and
-  never poisons the cache).
-- `throughput_test.go`: the benchmark harness backend answers with a 12-byte
-  body so the 200 path it measures still passes the new validation.
-
-## 0.5.5 and earlier
-
-No changelog was kept before 0.5.6; see the git history and `README.md` for
-the state of earlier releases.
+### Evaluated and rejected (unchanged from 0.5.6 audit)
+- `responses3xxTotal` stays exposed in `/metrics` for Prometheus schema
+  completeness even though the gateway never emits 3xx.
+- `enable_pipeline: true` in `mosdns.yaml` stays: MosDNS v4.5.3 only applies
+  it to TCP/DoT upstreams, and `check-config.sh` requires the key.
+- The double `resp.Body.Close()` in `serveDNS` stays: the explicit close
+  returns the connection to the pool before the slow client write, the defer
+  is a safety net, and double-close is documented as safe.
+- `connectionHeaderTokens`, `extractClientIP`, and `rateLimitKey`
+  micro-allocations were measured as negligible; left as is.

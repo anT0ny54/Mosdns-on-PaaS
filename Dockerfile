@@ -10,7 +10,7 @@ ARG MOSDNS_VERSION=v4.5.3
 # and the build fails if the tag ever resolves to a different commit.
 ARG MOSDNS_COMMIT=
 ARG ALPINE_VERSION=3.24.2
-ARG GATEWAY_VERSION=0.5.6
+ARG GATEWAY_VERSION=0.5.7
 
 FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION
@@ -40,12 +40,15 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM alpine:${ALPINE_VERSION}
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates tini \
     && addgroup -S app \
     && adduser -S -D -H -s /sbin/nologin -G app app \
     && mkdir -p /etc/mosdns \
     && chown -R app:app /etc/mosdns
 
+# tini runs as PID 1: it forwards signals to the entrypoint and reaps any
+# process reparented to PID 1. Zombie children of the entrypoint itself are
+# reaped by the entrypoint's own `wait -n` supervision loop.
 COPY --from=mosdns-builder --chmod=0755 /out/mosdns /usr/local/bin/mosdns
 COPY --from=gateway-builder --chmod=0755 /out/doh-gateway /usr/local/bin/doh-gateway
 COPY --chown=app:app --chmod=0644 mosdns.yaml /etc/mosdns/config.yaml
@@ -83,4 +86,4 @@ LABEL org.opencontainers.image.title="MosDNS ${MOSDNS_VERSION} + DoH Gateway" \
       org.opencontainers.image.base.name="alpine:${ALPINE_VERSION}" \
       org.opencontainers.image.mosdns.version="${MOSDNS_VERSION}"
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]

@@ -1186,6 +1186,10 @@ func TestReadyEndpointHonorsRequestContext(t *testing.T) {
 	}))
 	defer backend.Close()
 	g := testGateway(backend.URL, 100, 10)
+	// Force ready() through the caching path: with the zero-value TTL the
+	// early return skips the cache logic entirely and the IsZero assertion
+	// below would pass even if a canceled probe DID poison the cache.
+	g.readyCacheTTL = defaultReadyCacheTTL
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
