@@ -15,3 +15,9 @@
 *.gif binary
 *.ico binary
 *.zip binary
+
+# Files read by make/Docker/sh must keep LF on Windows checkouts
+Dockerfile text eol=lf
+Makefile text eol=lf
+VERSION text eol=lf
+.dockerignore text eol=lf
