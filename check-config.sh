@@ -254,5 +254,23 @@ if version_file.is_file() and dockerfile_text:
         fail("Dockerfile does not declare a default ARG GATEWAY_VERSION")
     if arg_match.group(1) != file_version:
         fail(f"Dockerfile GATEWAY_VERSION {arg_match.group(1)} does not match VERSION {file_version}")
+go_versions = {}
+go_mod = project_dir / "go.mod"
+if go_mod.is_file():
+    m = re.search(r"^go[ \t]+(\d+(?:\.\d+)*)\s*$", go_mod.read_text(encoding="utf-8"), re.MULTILINE)
+    if m is None:
+        fail("go.mod has no 'go <version>' directive")
+    go_versions["go.mod"] = m.group(1)
+    if dockerfile_text:
+        m = re.search(r"^ARG[ \t]+GATEWAY_GO_VERSION=(\S+)", dockerfile_text, re.MULTILINE)
+        if m is None:
+            fail("Dockerfile does not declare ARG GATEWAY_GO_VERSION")
+        go_versions["Dockerfile GATEWAY_GO_VERSION"] = m.group(1)
+    ci_file = project_dir / ".github" / "workflows" / "ci.yml"
+    if ci_file.is_file():
+        for n, m in enumerate(re.finditer(r"^\s*go-version:\s*[\"']?([^\s\"'#]+)", ci_file.read_text(encoding="utf-8"), re.MULTILINE), 1):
+            go_versions[f"ci.yml go-version #{n}"] = m.group(1)
+    if len(set(go_versions.values())) > 1:
+        fail("Go versions disagree (keep them in sync): " + ", ".join(f"{k}={v}" for k, v in go_versions.items()))
 print("YAML parsed successfully; MosDNS project schema checks: OK")
 PYTHON

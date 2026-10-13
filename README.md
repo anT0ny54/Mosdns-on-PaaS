@@ -11,34 +11,38 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
   rate-limits, queues, and forwards DoH requests to MosDNS. Runs as an
   unprivileged user (`app`), drains gracefully on SIGTERM/SIGINT (10 s). HTTP
   server limits: 5 s to read request headers, 5 s to read the whole request,
-  20 s keep-alive idle timeout, 8 KiB of request headers, and an 8 s write
-  deadline that is raised automatically to the full request budget — 5 s body
-  read + `QUEUE_WAIT` + `UPSTREAM_TIMEOUT` + a 2 s margin — when that sum is
-  larger. The body read is included because the write deadline starts when
-  the request headers arrive, so an enlarged timeout or a slow POST upload
-  still ends in a `503`/`504` instead of a dropped connection.
+  20 s keep-alive idle timeout, 8 KiB of request headers, and a write
+  deadline of the full request budget — 5 s body read + `QUEUE_WAIT` +
+  `UPSTREAM_TIMEOUT` + a 2 s margin — but never less than 8 s. With the default
+  settings that budget is 5 + 0.1 + 2.5 + 2 = 9.6 s, so the 8 s floor only
+  applies if the timeouts are lowered. The body read is included because the
+  write deadline starts when the request headers arrive, so an enlarged
+  timeout or a slow POST upload still ends in a `503`/`504` instead of a
+  dropped connection.
 - **MosDNS v4.5.3** (built from upstream in the Dockerfile): listens on
   `127.0.0.1:8081` (`/dns-query`), answers from a cache (32768 entries, lazy
   cache 3600 s served with a 30 s reply TTL) and otherwise races two HaGeZi
   DoH upstreams, falling back to a third HaGeZi endpoint if no answer arrives
   within 400 ms.
 
-`entrypoint.sh` starts both processes and then blocks in `wait -n` until one of
-them exits. `wait` reaps the exited child immediately -- a `kill -0` poll could
-never detect the death, because `kill -0` still succeeds on an unreaped zombie
-(the pre-0.5.7 loop polled `kill -0` once per second and never fired). Death
-detection is now instantaneous. It traps `TERM`, `INT`, and `HUP`, which
-interrupt `wait` so shutdown stays prompt; on shutdown it stops the gateway
-first (TERM plus a 15 s bounded wait, with `kill -KILL` escalation, so the
-gateway can drain while MosDNS is still available and a wedged gateway cannot
-hang the container), then stops MosDNS the same way (5 s grace). If either
-supervised process exits, the entrypoint terminates the remaining process and
-exits with status 1. Supervision is process-level only (no HTTP health checks
-from the entrypoint): it detects *exit*, not wedges -- if MosDNS deadlocks
-without exiting, configure the platform to probe the gateway's `/readyz` (HTTP,
-not just TCP), which catches a wedged backend. The entrypoint honours two optional
-variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`) and
-`MOSDNS_DIR` (default `/etc/mosdns`).
+`entrypoint.sh` starts both processes and then polls them once per second. A
+child counts as gone when it has exited, was killed by a signal (OOM kill,
+SIGSEGV, SIGKILL) or is a zombie (state read from `/proc`; without `/proc` it
+falls back to `kill -0`). If either is gone, it stops the other and exits with
+status 1. The loop does not use `wait -n`: BusyBox ash does not return from it
+when a child is killed by a signal, so the container would keep running with
+only one process. On `TERM`, `INT` or `HUP` it stops the gateway first (`TERM`,
+then `KILL` if it is still alive after a 15 s grace period) so the gateway can
+drain while MosDNS is still available, then stops MosDNS the same way (5 s
+grace). Exit is polled every 0.2 s, so a child that stops quickly costs no
+extra wait (this needs a `sleep` that accepts fractions; BusyBox in Alpine
+does). Supervision is process-level only: it detects an *exit*, not a wedge. If
+MosDNS hangs without exiting, point the platform health check at the gateway's
+`/readyz` (HTTP, not just TCP). The entrypoint honours these optional
+variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
+(default `/etc/mosdns`), and `MOSDNS_BIN` / `GATEWAY_BIN` (default
+`/usr/local/bin/mosdns` and `/usr/local/bin/doh-gateway`; they exist so
+`test-entrypoint.sh` can substitute fake children).
 
 ## HTTP endpoints
 
@@ -46,8 +50,8 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`) and
 |---|---|
 | `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes; a backend 2xx answer shorter than 12 bytes is rejected with `502`. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
-| `GET/HEAD /readyz` | Readiness. Sends a real DNS query (`A ready-<unix-nanoseconds-base36>-<seq-base36>.example.com`) through MosDNS and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then transaction ID, QR bit, RCODE 0/3, QDCOUNT 1, echoed question). The name is unique per probe, so every probe is a cache miss that reaches an upstream. Each probe has a 1 s budget and uses its own single-connection client. Result cached 5 s on success, 1 s on failure; probes are serialized. The probe runs under the readiness request's context, so a disconnecting client cancels it, and a canceled probe is never cached. |
-| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`-`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the `3xx` series is always 0 because the gateway never redirects and turns a backend 1xx/3xx into `502`; a client that disconnects mid-request is not counted, since no response is written); readiness probe results; queue-wait and backend-latency totals, sample counts and averages (backend latency is measured until the response body has been fully read, so a backend that returns headers quickly but stalls or truncates the body shows up as an error, not as a fast response). |
+| `GET/HEAD /readyz` | Readiness. Sends a real DNS query (`A ready-<unix-nanoseconds-base36>-<seq-base36>.example.com`) through MosDNS and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then transaction ID, QR bit, RCODE 0/3, QDCOUNT 1, echoed question). The name is unique per probe, so every probe is a cache miss that reaches an upstream. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection, created once at startup and reused for every probe that is not answered from the result cache). The result is cached 5 s on success and 1 s on failure; probes are serialized. The probe runs under the readiness request's context, so a disconnecting client cancels it. A canceled probe is never cached, is not counted in `doh_gateway_ready_probe_total{result="not_ready"}`, and no response is written or counted for that client. |
+| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`-`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the `3xx` series is always 0 because the gateway never redirects and turns a backend 1xx/3xx into `502`; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; queue-wait and backend-latency totals, sample counts and averages (backend latency covers only valid answers: a sample is recorded after a 2xx `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and non-2xx answers add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one upstream query per 5 s on success, per 1 s on failure). Block or restrict `/metrics` at the platform edge if you do not want it public.
 
@@ -91,7 +95,7 @@ Gateway:
 | `RATE_WINDOW` | `60s` | Rate-limit window (fixed, clock-aligned windows). |
 | `RATE_LIMIT_CLIENTS` | `65536` | Max distinct client keys per window; new clients are denied beyond this until the window rolls over. IPv6 clients are grouped by /64. |
 | `MAX_ACTIVE_REQUESTS` | `16` | Hard ceiling on concurrently admitted requests (extra get `503` + `Retry-After: 1`). |
-| `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. A slot is released as soon as MosDNS's answer has been read, before it is written to the client, so a slow-reading client does not hold one. |
+| `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. A slot is released as soon as MosDNS's answer has been read, before it is written to the client, so a slow-reading client does not hold one. If it is set higher than `MAX_ACTIVE_REQUESTS`, a warning is logged at startup: requests are then rejected before they can queue, so `QUEUE_WAIT` never applies. |
 | `QUEUE_WAIT` | `100ms` | Max wait for a processing slot, then `503`. |
 | `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it — it always covers the body-read + queue + upstream budget plus a 2 s margin, so even a slow POST upload followed by a full queue wait and an upstream timeout still ends in the intended `503`/`504` (see Architecture). |
 | `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` in the shipped Dockerfile) | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used, then `X-Real-IP` as a fallback; if neither holds a valid IP the socket peer is used. Default keys rate limits on the socket peer only (see the note below). |
@@ -153,7 +157,8 @@ MosDNS v4.5.3 (it only applies to TCP/DoT), so the file does not set it;
   `main.go` (`<n> * time.Millisecond`, `<n> * time.Second`, `<n> * time.Minute`
   or `<n> * time.Hour`). The check fails (rather than silently skipping) if
   neither can be read;
-- `VERSION` matches the Dockerfile's default `ARG GATEWAY_VERSION`.
+- `VERSION` matches the Dockerfile's default `ARG GATEWAY_VERSION`;
+- the Go version agrees across `go.mod`, the Dockerfile's `GATEWAY_GO_VERSION` and every `go-version` in `.github/workflows/ci.yml` (skipped for files that are absent).
 
 The checks are written for the pinned, MosDNS v4.5.3-compatible layout. If
 `MOSDNS_VERSION` is overridden at image-build time, review this script for
@@ -162,8 +167,9 @@ compatibility with the selected MosDNS release.
 ## Build and test
 
 ```sh
-make test            # check-config + go vet + go test (needs Python 3.8+/PyYAML)
+make test            # check-config + entrypoint-test + go vet + go test (needs Python 3.8+/PyYAML)
 make check-config    # validate mosdns.yaml and cross-file consistency only
+make entrypoint-test # run test-entrypoint.sh (supervision test with fake children)
 make vet             # go vet only
 make build           # local binary ./doh-gateway
 make docker-build    # multi-stage image (MosDNS + gateway)
@@ -171,15 +177,24 @@ make run             # local gateway on :8080 (needs a backend on :8081)
 make clean           # remove ./doh-gateway
 ```
 
+`test-entrypoint.sh` runs the real `entrypoint.sh` against fake MosDNS and
+gateway processes and checks, for each scenario, both the exit code and that
+neither fake child is still running afterwards: TERM shutdown exits 0; a
+SIGKILLed MosDNS or gateway and a child that exits on its own are detected
+(exit 1, the other child stopped); a child that ignores TERM is KILLed after its
+grace period (about 5 s, so the test takes roughly 10 s). It runs under `sh`;
+set `TEST_SHELL` (for example `TEST_SHELL="busybox sh"`) to run it under another
+shell.
+
 `go test ./...` on its own does not need Python, but it does need Go 1.27 or
 newer (see `go.mod`).
 
-`go test -race ./...` is the recommended extra gate for the concurrency-
-sensitive paths (POST buffer pool, per-client limiter, processing queue);
-it runs as a separate CI job on every push to `main` and every pull request,
-alongside `make test` and a full `docker build` (see
-`.github/workflows/ci.yml`). Once these checks pass consistently they should
-be required (branch protection) before merging into `main`.
+`go test -race ./...` covers the concurrency-sensitive paths (POST buffer
+pool, per-client limiter, processing queue). CI
+(`.github/workflows/ci.yml`) runs `make test` (which includes the entrypoint
+test), `go test -race ./...` and a full `docker build` on every push to `main`
+and every pull request; it has read-only repository permissions and cancels a
+run that a newer push to the same ref supersedes.
 
 Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousandRPSTarget`
 (it drives the gateway with as many concurrent workers as the default
@@ -187,23 +202,51 @@ Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousand
 with `503` by design).
 Sustained-load benchmark: `go test -bench BenchmarkGateway5000RPS -benchmem`.
 
-Docker build arguments (all have defaults in the Dockerfile): `MOSDNS_VERSION`
-(`v4.5.3`), `MOSDNS_COMMIT` (mandatory full commit SHA, defaulted to the v4.5.3
-  tag's commit; the build fails if unset or if the tag resolves elsewhere), `MOSDNS_GO_VERSION` (`1.19.13`, MosDNS v4 needs an old
-toolchain), `GATEWAY_GO_VERSION` (`1.27`; a currently supported Go release, while `go.mod` only requires 1.27), `ALPINE_VERSION`, `GATEWAY_VERSION`
-and `BUILD_DATE`. `make docker-build` passes `GATEWAY_VERSION` (from `VERSION`)
-and `BUILD_DATE`.
+Docker build arguments (all have defaults in the Dockerfile):
+
+| Argument | Default | Notes |
+|---|---|---|
+| `MOSDNS_VERSION` | `v4.5.3` | MosDNS tag to build. |
+| `MOSDNS_COMMIT` | commit of `v4.5.3` | Mandatory full SHA; the build fails if it is empty or the tag resolves to a different commit. |
+| `MOSDNS_GO_VERSION` | `1.19.13` | MosDNS v4 only builds with an old Go toolchain. |
+| `GATEWAY_GO_VERSION` | `1.27` | Toolchain for the gateway; matches `go.mod`. |
+| `ALPINE_VERSION` | `3.24.2` | Final image base. |
+| `GATEWAY_VERSION` | contents of `VERSION` | Injected as `main.version`. |
+| `BUILD_DATE` | `unknown` | Image `created` label. |
+
+`make docker-build` passes `GATEWAY_VERSION` (from `VERSION`) and `BUILD_DATE`.
+
+## Deployment
+
+- The image exposes port `8080`; the gateway listens on `PORT` (default
+  `8080`). Run it behind a TLS-terminating platform proxy; the image itself
+  serves plain HTTP.
+- Use `GET /readyz` as the HTTP health check (it exercises MosDNS and its
+  upstreams); `/healthz` only shows that the gateway process is up.
+- Keep `CLIENT_IP_HEADER=X-Forwarded-For` (the image default) only when the
+  container is reachable solely through your trusted proxy; otherwise set it to
+  `none`.
+- Restrict `/metrics` at the platform edge if it should not be public.
+- The container runs as the unprivileged user `app`.
+
+## Repository automation
+
+- `.github/workflows/ci.yml` — described under *Build and test* above. It does
+  not cache Go modules (the project has no dependencies and no `go.sum`).
+- `.github/workflows/Keep-Alive.yml` — on the 1st and 15th of each month (03:17
+  UTC), and on manual dispatch, rewrites `keep-alive.txt` with the current UTC
+  timestamp and pushes a `[skip ci]` commit, so scheduled workflows on a fork
+  are not disabled for inactivity. It needs `contents: write`. `keep-alive.txt`
+  is not part of the image (it is listed in `.dockerignore`).
 
 ## Version
 
-Gateway version is tracked in `VERSION` (0.5.9) and injected at build time
-via `-ldflags -X main.version=...`; the MosDNS version is pinned in the
-Dockerfile (`ARG MOSDNS_VERSION=v4.5.3`, with a mandatory `MOSDNS_COMMIT`
-supply-chain pin set to the tag's commit — the build fails if the tag ever
-moves). When bumping, change `VERSION` and the Dockerfile's
-`ARG GATEWAY_VERSION` together; `make check-config` fails if they differ. See
-[`CHANGELOG.md`](CHANGELOG.md) for release notes, including changes not yet
-assigned a version.
+The gateway version lives in `VERSION` (currently 0.5.11) and is injected at
+build time with `-ldflags -X main.version=...`. The MosDNS version and its
+commit pin are set in the Dockerfile (`ARG MOSDNS_VERSION`, `ARG
+MOSDNS_COMMIT`). When bumping the gateway version, change `VERSION` and the
+Dockerfile's `ARG GATEWAY_VERSION` together; `make check-config` fails if they
+differ. Release notes are in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🌐 Free DNS Services
 
@@ -234,4 +277,6 @@ If you find this project useful, donations are appreciated:
 
 ## License
 
-See [`LICENSE`](LICENSE).
+See [`LICENSE`](LICENSE). The container image includes this license at
+`/usr/share/licenses/doh-gateway/LICENSE` and the license of the bundled MosDNS
+source at `/usr/share/licenses/mosdns/LICENSE`.

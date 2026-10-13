@@ -3,13 +3,16 @@ IMAGE ?= $(PROJECT):local
 VERSION := $(shell cat VERSION)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: test check-config vet build docker-build run clean
+.PHONY: test check-config entrypoint-test vet build docker-build run clean
 
-test: check-config vet
+test: check-config entrypoint-test vet
 	go test ./...
 
 check-config:
 	sh ./check-config.sh mosdns.yaml
+
+entrypoint-test:
+	sh ./test-entrypoint.sh
 
 vet:
 	go vet ./...

@@ -14,7 +14,7 @@ ARG MOSDNS_VERSION=v4.5.3
 # different binary.
 ARG MOSDNS_COMMIT=760a660192fdf996463b024d1d0e19bd66b6ed31
 ARG ALPINE_VERSION=3.24.2
-ARG GATEWAY_VERSION=0.5.9
+ARG GATEWAY_VERSION=0.5.11
 
 FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION
@@ -54,13 +54,14 @@ RUN apk add --no-cache ca-certificates tini \
     && mkdir -p /etc/mosdns \
     && chown -R app:app /etc/mosdns
 
-# tini runs as PID 1: it forwards signals to the entrypoint and reaps any
-# process reparented to PID 1. Zombie children of the entrypoint itself are
-# reaped by the entrypoint's own `wait -n` supervision loop.
 COPY --from=mosdns-builder --chmod=0755 /out/mosdns /usr/local/bin/mosdns
 COPY --from=gateway-builder --chmod=0755 /out/doh-gateway /usr/local/bin/doh-gateway
 COPY --chown=app:app --chmod=0644 mosdns.yaml /etc/mosdns/config.yaml
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
+# Licenses shipped in the final image: this repository's LICENSE and the license
+# of the MosDNS source the bundled binary is built from.
+COPY --chmod=0644 LICENSE /usr/share/licenses/doh-gateway/LICENSE
+COPY --from=mosdns-builder --chmod=0644 /src/LICENSE /usr/share/licenses/mosdns/LICENSE
 
 # Only values that differ from the gateway's built-in defaults (see main.go) or
 # that couple the two processes are set here. MOSDNS_DOH_URL must match the
@@ -94,4 +95,7 @@ LABEL org.opencontainers.image.title="MosDNS ${MOSDNS_VERSION} + DoH Gateway" \
       org.opencontainers.image.base.name="alpine:${ALPINE_VERSION}" \
       org.opencontainers.image.mosdns.version="${MOSDNS_VERSION}"
 
+# tini runs as PID 1: it forwards signals to the entrypoint and reaps any
+# process reparented to PID 1. The entrypoint polls its two children and
+# reaps them itself.
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]

@@ -3,36 +3,55 @@ set -eu
 
 MOSDNS_CONFIG="${MOSDNS_CONFIG:-/etc/mosdns/config.yaml}"
 MOSDNS_DIR="${MOSDNS_DIR:-/etc/mosdns}"
+MOSDNS_BIN="${MOSDNS_BIN:-/usr/local/bin/mosdns}"
+GATEWAY_BIN="${GATEWAY_BIN:-/usr/local/bin/doh-gateway}"
 MOSDNS_PID=""
 GATEWAY_PID=""
 # Shutdown grace periods in seconds. The gateway drains in-flight requests for
 # up to its own shutdown timeout (10s by default), so it gets the larger
-# budget; MosDNS stops fast, so it gets a short one. A watchdog escalates to
-# KILL after the grace period so a wedged child cannot hang the container.
+# budget; MosDNS stops fast, so it gets a short one. A child still alive after
+# its grace period is KILLed so a wedged child cannot hang the container.
 GATEWAY_SHUTDOWN_GRACE=15
 MOSDNS_SHUTDOWN_GRACE=5
 
-# TERM a child and wait for it to exit -- `wait` is what reaps it, so this
-# returns promptly on a clean exit even though `kill -0` would still succeed
-# on the zombie. A watchdog KILLs the child once the grace period elapses;
-# it is cancelled as soon as the child is reaped.
-wait_pid() {
+# True while the process exists and is not a zombie. `kill -0` alone is not
+# enough: an exited child stays a zombie (and `kill -0` keeps succeeding) until
+# its parent reaps it, so the state is read from /proc as well. Without /proc
+# the check degrades to `kill -0`.
+is_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  [ -r "/proc/$1/stat" ] || return 0
+  # The state field follows the ")" that closes the command name.
+  state=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null) || return 0
+  case "$state" in
+    Z*|X*) return 1 ;;
+  esac
+  return 0
+}
+
+# TERM a child, wait up to $2 seconds for it to exit, then KILL it. Polling
+# (instead of a watchdog subshell) means an already-dead child costs no wait.
+stop_child() {
   pid=$1
-  grace=$2
+  ticks=$(($2 * 5))
   kill -TERM "$pid" 2>/dev/null || true
-  ( sleep "$grace"; kill -KILL "$pid" 2>/dev/null || true ) &
-  watchdog=$!
+  while [ "$ticks" -gt 0 ] && is_alive "$pid"; do
+    sleep 0.2
+    ticks=$((ticks - 1))
+  done
+  if is_alive "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  # Reap it so no zombie is left behind.
   wait "$pid" 2>/dev/null || true
-  kill "$watchdog" 2>/dev/null || true
-  wait "$watchdog" 2>/dev/null || true
 }
 
 terminate_children() {
   if [ -n "$GATEWAY_PID" ]; then
-    wait_pid "$GATEWAY_PID" "$GATEWAY_SHUTDOWN_GRACE"
+    stop_child "$GATEWAY_PID" "$GATEWAY_SHUTDOWN_GRACE"
   fi
   if [ -n "$MOSDNS_PID" ]; then
-    wait_pid "$MOSDNS_PID" "$MOSDNS_SHUTDOWN_GRACE"
+    stop_child "$MOSDNS_PID" "$MOSDNS_SHUTDOWN_GRACE"
   fi
 }
 
@@ -46,38 +65,22 @@ trap on_signal TERM INT HUP
 
 mkdir -p "$MOSDNS_DIR"
 
-/usr/local/bin/mosdns start -c "$MOSDNS_CONFIG" -d "$MOSDNS_DIR" &
+"$MOSDNS_BIN" start -c "$MOSDNS_CONFIG" -d "$MOSDNS_DIR" &
 MOSDNS_PID=$!
 
-/usr/local/bin/doh-gateway &
+"$GATEWAY_BIN" &
 GATEWAY_PID=$!
 
-# Block in `wait -n` until EITHER child exits, instead of polling `kill -0`
-# once per second. This fixes two failure modes of the old poll loop:
-#  - An exited child becomes a zombie, and `kill -0` SUCCEEDS on a zombie,
-#    so the old loop could never detect the death: the container hung until
-#    the platform's health check killed it, and the graceful-shutdown path
-#    never ran. `wait` reaps the child, after which `kill -0` correctly fails.
-#  - The 1s poll also delayed death detection by up to a second; `wait -n`
-#    reacts immediately.
-# tini (the PID 1 here) reaps anything reparented to it, but a zombie whose
-# parent is this script is only reaped when this script waits on it -- so the
-# supervision loop itself must do the reaping regardless of tini.
-# A trapped signal interrupts `wait` and runs on_signal, so shutdown stays
-# prompt. Requires busybox ash >= 1.30 (Alpine 3.24 ships 1.37).
-# The `kill -0` checks deliberately run only AFTER `wait -n` returns. The
-# pre-wait checks the old loop had here could never fire: at that point an
-# exited child is still an unreaped zombie and `kill -0` succeeds on zombies.
-# `wait -n` is the reaper; the post-reap `kill -0` on the next iteration is
-# the detector.
+# Supervision: poll once per second until either child is gone. `wait -n` is
+# not used because BusyBox ash does not return from it when a child is killed
+# by a signal (OOM kill, SIGSEGV, SIGKILL), which left the container running
+# with a single process. The sleep runs in the background and is waited on so
+# a trapped TERM/INT/HUP interrupts it immediately.
 while :; do
-  wait -n 2>/dev/null || true
-  if ! kill -0 "$MOSDNS_PID" 2>/dev/null; then
+  if ! is_alive "$MOSDNS_PID" || ! is_alive "$GATEWAY_PID"; then
     terminate_children
     exit 1
   fi
-  if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    terminate_children
-    exit 1
-  fi
+  sleep 1 &
+  wait $! 2>/dev/null || true
 done

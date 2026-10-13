@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -217,5 +219,133 @@ func TestWriteTimeoutCoversSlowBodyAndRaisedTimeouts(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusGatewayTimeout)
+	}
+}
+
+// Only a complete, valid 2xx DNS answer may feed the backend-latency gauge.
+// Every rejected or relayed-error response must leave the sample count at 0
+// while still being counted as a backend error.
+func TestBackendLatencyNotRecordedForRejectedResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		contentType string
+		size        int
+		wantStatus  int
+	}{
+		{"oversize body", http.StatusOK, "application/dns-message", maxDNSMessageBytes + 1, http.StatusBadGateway},
+		{"wrong content type", http.StatusOK, "text/plain", 32, http.StatusBadGateway},
+		{"body shorter than DNS header", http.StatusOK, "application/dns-message", 4, http.StatusBadGateway},
+		{"backend 5xx", http.StatusServiceUnavailable, "application/dns-message", 32, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write(make([]byte, tc.size))
+			}))
+			defer backend.Close()
+
+			g := newRegTestGateway(backend.URL+"/dns-query", backend.Client())
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, newRegDoHPostRequest(t, make([]byte, 32)))
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if got := g.metrics.backendLatencySamples.Load(); got != 0 {
+				t.Fatalf("backendLatencySamples = %d, want 0", got)
+			}
+			if got := g.metrics.backendLatencyNanos.Load(); got != 0 {
+				t.Fatalf("backendLatencyNanos = %d, want 0", got)
+			}
+			if got := g.metrics.backendErrorTotal.Load(); got != 1 {
+				t.Fatalf("backendErrorTotal = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// getBodyTransport checks the retry body the transport can request through
+// GetBody: it must carry the same bytes as the original POST body and be
+// obtainable more than once.
+type getBodyTransport struct {
+	t    *testing.T
+	want []byte
+}
+
+func (tr *getBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.GetBody == nil {
+		tr.t.Error("POST request has no GetBody; stale-connection retries would be lost")
+	} else {
+		for i := 0; i < 2; i++ {
+			rc, err := req.GetBody()
+			if err != nil {
+				tr.t.Errorf("GetBody #%d: %v", i+1, err)
+				continue
+			}
+			got, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			if !bytes.Equal(got, tr.want) {
+				tr.t.Errorf("GetBody #%d returned %x, want %x", i+1, got, tr.want)
+			}
+		}
+	}
+	_, _ = io.Copy(io.Discard, req.Body)
+	_ = req.Body.Close()
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/dns-message"}},
+		Body:       io.NopCloser(bytes.NewReader(make([]byte, 32))),
+		Request:    req,
+	}, nil
+}
+
+func TestPOSTRetryBodyMatchesOriginal(t *testing.T) {
+	msg := []byte("0123456789abcdef")
+	g := newRegTestGateway("http://127.0.0.1:9/dns-query", &http.Client{Transport: &getBodyTransport{t: t, want: msg}})
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, newRegDoHPostRequest(t, msg))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+// A /readyz probe aborted because the client disconnected says nothing about
+// backend health: it must not count as not_ready and no response is written.
+func TestReadyProbeCanceledByClientIsNotCounted(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer backend.Close()
+	defer close(release)
+	g := newRegTestGateway(backend.URL, &http.Client{})
+	g.readyCacheTTL = defaultReadyCacheTTL
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(ctx))
+	}()
+	<-started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readyz did not return after the client went away")
+	}
+	if got := g.metrics.readyFailTotal.Load(); got != 0 {
+		t.Fatalf("canceled probe counted as %d not_ready probes, want 0", got)
+	}
+	if got := g.metrics.responses5xxTotal.Load(); got != 0 {
+		t.Fatalf("canceled probe counted %d 5xx responses, want 0", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("response written for a disconnected client: %q", rec.Body.String())
 	}
 }

@@ -261,6 +261,10 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !g.ready(r.Context()) {
+			if r.Context().Err() != nil {
+				// The client is gone: nobody to answer, nothing to count.
+				return
+			}
 			writeText(w, http.StatusServiceUnavailable, "not ready\n")
 			return
 		}
@@ -393,16 +397,14 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	outURL, ok := g.backendRequestURL(dnsParam)
 	if !ok {
-		g.metrics.backendErrorTotal.Add(1)
-		http.Error(w, "bad upstream request", http.StatusBadGateway)
+		g.badUpstreamRequest(w)
 		return
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, outURL, nil)
 	if err != nil {
 		// The request never reached the transport, so the buffer is free;
 		// the deferred put handles it.
-		g.metrics.backendErrorTotal.Add(1)
-		http.Error(w, "bad upstream request", http.StatusBadGateway)
+		g.badUpstreamRequest(w)
 		return
 	}
 	if body != nil {
@@ -413,8 +415,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		bodyClosed = pb.done
 		req.Body = pb
 		req.ContentLength = int64(len(body))
+		// The transport calls GetBody to retry on a stale idle connection.
+		// The retry body is a copy: once the original body is closed the
+		// pooled buffer may be recycled, and a retry body that still
+		// aliased it could be read after another request reused it.
 		req.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(body)), nil
+			return io.NopCloser(bytes.NewReader(bytes.Clone(body))), nil
 		}
 	}
 	req.Header.Set("Accept", "application/dns-message")
@@ -436,13 +442,11 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		g.failBackend(w, r, err)
 		return
 	}
-	// Count latency only for fully completed upstream calls (response
-	// headers AND body): recording header time would let a backend that
-	// answers headers quickly but stalls or truncates the body look healthy
-	// in the average-latency gauge, and recording timeout/connection
-	// failures would inflate it.
-	g.metrics.backendLatencySamples.Add(1)
-	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
+	// Take the elapsed time as soon as the body has been read, but only
+	// record it once the response has passed every check below: a header-only
+	// time, a timeout, an oversize body or an invalid/non-2xx answer must not
+	// feed the backend-latency gauge.
+	backendElapsed := time.Since(backendStart)
 	if int64(len(respBody)) > g.maxResponseBytes {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
@@ -456,6 +460,8 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
+		g.metrics.backendLatencySamples.Add(1)
+		g.metrics.backendLatencyNanos.Add(uint64(backendElapsed))
 	} else {
 		g.metrics.backendErrorTotal.Add(1)
 		if resp.StatusCode < 400 {
@@ -474,6 +480,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
+}
+// badUpstreamRequest answers a request the gateway could not turn into a valid
+// backend request: a backend error and a 502 with a short text body.
+func (g *gateway) badUpstreamRequest(w http.ResponseWriter) {
+	g.metrics.backendErrorTotal.Add(1)
+	http.Error(w, "bad upstream request", http.StatusBadGateway)
 }
 func (g *gateway) failBackend(w http.ResponseWriter, r *http.Request, err error) {
 	if r.Context().Err() != nil {
@@ -567,6 +579,15 @@ func isValidDoHGetParameter(value string, maxBytes int64) bool {
 func isStrictDoHContentType(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(value), "application/dns-message")
 }
+// probeFailed records a failed readiness probe and returns false. A probe
+// aborted because the caller went away (parent canceled) says nothing about
+// backend health, so it is not counted.
+func (g *gateway) probeFailed(parent context.Context) bool {
+	if parent.Err() == nil {
+		g.metrics.readyFailTotal.Add(1)
+	}
+	return false
+}
 func (g *gateway) backendReady(parent context.Context) bool {
 	ctx, cancel := context.WithTimeout(parent, defaultReadyProbeTimeout)
 	defer cancel()
@@ -574,13 +595,11 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	question := query[12:]
 	probeURL, ok := g.backendRequestURL(base64.RawURLEncoding.EncodeToString(query))
 	if !ok {
-		g.metrics.readyFailTotal.Add(1)
-		return false
+		return g.probeFailed(parent)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		g.metrics.readyFailTotal.Add(1)
-		return false
+		return g.probeFailed(parent)
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	client := g.readyClient
@@ -588,23 +607,19 @@ func (g *gateway) backendReady(parent context.Context) bool {
 		client = g.client
 	}
 	if client == nil {
-		g.metrics.readyFailTotal.Add(1)
-		return false
+		return g.probeFailed(parent)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		g.metrics.readyFailTotal.Add(1)
-		return false
+		return g.probeFailed(parent)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
-		g.metrics.readyFailTotal.Add(1)
-		return false
+		return g.probeFailed(parent)
 	}
 	buf, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageBytes+1))
 	if err != nil || len(buf) > maxDNSMessageBytes || !isUsableDNSProbeResponse(buf, wantID, question) {
-		g.metrics.readyFailTotal.Add(1)
-		return false
+		return g.probeFailed(parent)
 	}
 	g.metrics.readyPassTotal.Add(1)
 	return true
@@ -684,9 +699,9 @@ doh_gateway_ready_probe_total{result="not_ready"} %d
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total %.6f\n", float64(queueNanos)/float64(time.Second))
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total %d\n", queueSamples)
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_avg Average processing-slot wait time for admitted requests.\n# TYPE doh_gateway_queue_wait_seconds_avg gauge\ndoh_gateway_queue_wait_seconds_avg %.6f\n", avgQueueSeconds)
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(backendNanos)/float64(time.Second))
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total Requests sent to MosDNS.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", backendSamples)
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_avg Average gateway-to-MosDNS request time.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg %.6f\n", avgBackendSeconds)
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total time of valid MosDNS answers (request sent until the 2xx DNS body was fully read and validated).\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(backendNanos)/float64(time.Second))
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total Valid MosDNS answers included in the latency total.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", backendSamples)
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_avg Average time of valid MosDNS answers.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg %.6f\n", avgBackendSeconds)
 	_, _ = io.WriteString(w, b.String())
 }
 func extractClientIP(r *http.Request, preferredHeader string) string {
@@ -879,6 +894,9 @@ func main() {
 	trustedIPHeader := envString("CLIENT_IP_HEADER", "none")
 	if strings.EqualFold(trustedIPHeader, "none") {
 		trustedIPHeader = ""
+	}
+	if processingConcurrency > maxActiveRequests {
+		log.Printf("warning: MAX_CONCURRENT_REQUESTS (%d) exceeds MAX_ACTIVE_REQUESTS (%d); requests are rejected before they can queue, so QUEUE_WAIT never applies", processingConcurrency, maxActiveRequests)
 	}
 	g := &gateway{
 		backendURL:       backend,
