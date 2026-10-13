@@ -1,79 +1,65 @@
 # Changelog
 
-## 0.5.8 — 2026-10-14
+## 0.5.9 — 2026-10-14
 
-Audit follow-up: docs synced with the 0.5.7 code, dead supervision code removed,
-shutdown bounded, validator robustness, one hot-path allocation eliminated.
+Audit follow-up: buffer-pool race on upstream errors fixed properly, write
+deadline now covers the body-read budget, backend latency measured end-to-end,
+MosDNS source commit pinned, CI added.
 
 ### Fixed
-- README.md version reference still said 0.5.6 while `VERSION` and the
-  Dockerfile's `ARG GATEWAY_VERSION` carried 0.5.7, and the Architecture section
-  still described the pre-0.5.7 `kill -0` 1-second polling loop instead of the
-  current `wait -n` supervision. Both corrected (now 0.5.8), and the liveness
-  tradeoff is now stated: entrypoint supervision detects exit, not wedges, so
-  platforms must probe `/readyz` (HTTP) to catch a wedged backend.
-- `check-config.sh` error message said the timeout-chain check "would be
-  skipped" when `defaultUpstreamTO` could not be read; the check in fact fails
-  (exit 1). Message corrected.
-- `check-config.sh` IPv6 edge case: `[fe80::1%eth0]:8081` kept the zone id in
-  the hostname and failed the loopback check with a confusing message; the zone
-  id is now stripped before matching.
-- `check-config.sh` `UPSTREAM_TIMEOUT` parsing now also accepts `m` and `h`
-  (in addition to `ms`/`s`), and the `main.go` fallback regex accepts
-  `time.Minute`/`time.Hour`, matching every duration form the gateway itself
-  would accept.
-
-### Removed
-- `entrypoint.sh`: the two `kill -0` pre-checks before `wait -n` in the
-  supervision loop. They could never fire -- an exited child is an unreaped
-  zombie at that point and `kill -0` succeeds on zombies, so the checks only
-  passed in the normal case. `wait -n` is the reaper; the post-reap `kill -0`
-  is the detector. Behavior unchanged.
-- `check-config.sh`: the duplicate `Dockerfile.is_file()` call; the result is
-  cached.
-- `mosdns.yaml`: the `enable_pipeline: true` keys. They are a no-op for DoH
-  upstreams in MosDNS v4.5.3 (TCP/DoT only), and `check-config.sh` now treats
-  the key as optional (validated when present) instead of forcing a dead key
-  into the config.
-
-### Hardened
-- `entrypoint.sh` shutdown: `terminate_children` waited unboundedly on MosDNS
-  (which has no drain timeout), so a hung MosDNS hung the container with no
-  escalation (no `timeout` command in the image). Each child now gets TERM
-  plus a bounded grace period -- 15 s for the gateway (its drain timeout is
-  10 s), 5 s for MosDNS -- enforced by a watchdog that escalates to
-  `kill -KILL`, cancelled as soon as the child is reaped so a clean exit is
-  not delayed.
+- **P1: the POST buffer pool could be reused too early after an upstream
+  error.** The error path assumed the RoundTripper contract guarantees the
+  transport is done with the request body when `Client.Do` returns; Go
+  documents the body may be closed asynchronously. The outgoing POST body is
+  now wrapped in a close-signaling `pooledRequestBody`, and the pooled buffer
+  is only returned to `dnsMessageBufferPool` after the transport's close has
+  been observed. Every exit path funnels through `returnBodyBuffer`, which
+  waits on the close signal; the wait is deadlock-free because the transport
+  always closes the request body eventually, on success and on error. The
+  zero-copy optimization is retained. Regression test:
+  `TestPooledBodyHeldUntilTransportCloses` (a RoundTripper that delays closing
+  the request body must delay the handler); the whole suite also runs under
+  `-race` in CI.
+- **P1: custom timeouts could drop the connection instead of the promised
+  503/504.** `serverWriteTimeout` computed `max(8s, QUEUE_WAIT +
+  UPSTREAM_TIMEOUT + 2s)`, but the write deadline starts when the request
+  headers are read, so a slow POST body consumed part of the budget already.
+  It now computes `max(8s, READ_TIMEOUT + QUEUE_WAIT + UPSTREAM_TIMEOUT + 2s)`.
+  Covered by `TestServerWriteTimeoutIncludesReadBudget` and
+  `TestWriteTimeoutCoversSlowBodyAndRaisedTimeouts` (a 2.5s slow upload plus a
+  2s upstream timeout must still end in `504`, not a dropped connection).
+- **P2: backend latency recorded response-header time, not full response
+  time.** A backend returning headers quickly but stalling or truncating the
+  body looked healthy in the average-latency gauge. `backendLatencySamples` /
+  `backendLatencyNanos` are now updated only after the response body has been
+  fully read; timeouts, header failures and body failures no longer
+  contribute. Covered by `TestBackendLatencyRecordedAfterBodyRead`.
 
 ### Changed
-- Unknown gateway paths now return a plain-text `404 not found` via `writeText`
-  instead of Go's HTML `http.NotFound` page, consistent with every other
-  gateway-generated error and the `nosniff` header.
-- `VERSION` / `ARG GATEWAY_VERSION` bumped to 0.5.8 (together, as
+- Dockerfile: `MOSDNS_COMMIT` is now mandatory and defaults to
+  `760a660192fdf996463b024d1d0e19bd66b6ed31`, the exact commit behind the
+  `v4.5.3` tag. The build fails when the pin is unset and when the tag
+  resolves to a different commit, so an unexpected tag change can no longer
+  silently produce a different binary.
+- Added `.github/workflows/ci.yml`: `make test` (Go + Python/PyYAML), a
+  separate `go test -race ./...` job for the concurrency-sensitive paths
+  (buffer pool, limiter, queue), and a `docker build` job, on every push to
+  `main` and every pull request.
+
+### Docs
+- README: the Architecture write-deadline formula now includes the 5 s
+  body-read budget; the `/metrics` table documents end-to-end backend latency;
+  the `UPSTREAM_TIMEOUT` row, the Build and test section (race gate + CI), and
+  the Version section (mandatory commit pin, 0.5.9) reflect the new reality.
+- `VERSION` / `ARG GATEWAY_VERSION` bumped to 0.5.9 (together, as
   `check-config.sh` requires).
 
-### Optimized
-- `serveDNS` no longer copies POST bodies (`append([]byte(nil), body...)`).
-  The pooled request buffer is held out of the pool for the duration of the
-  upstream exchange and returned after `resp.Body.Close()` (or on any error
-  path), which is safe because closing the response body ends the transport's
-  use of the request body. Removes the last hot-path allocation the buffer
-  pool existed to avoid.
-- `getenvBool` in `throughput_test.go` reads the environment variable once
-  instead of twice.
-- `TestActiveRequestCap` in `main_test.go` now sets `queueWait` explicitly, so
-  a future handler-ordering change fails loudly instead of racing on
-  `time.NewTimer(0)`.
-
 ### Evaluated and left as-is
-- Double `resp.Body.Close()` in `serveDNS`: the explicit close returns the
-  connection to the pool before the slow client write; the defer is a safety
-  net and double-close is documented safe.
-- `responses3xxTotal` stays exposed in `/metrics` for Prometheus schema
-  stability even though the gateway never emits 3xx.
-- `connectionHeaderTokens` allocates a map per relayed response, but only when
-  a `Connection` header is present (nil fast-path otherwise); measured as
-  negligible under GOMAXPROCS=1.
-- The single-mutex `fixedWindowLimiter` is irrelevant with GOMAXPROCS=1 (one
-  OS thread); not sharded, deliberately.
+- Separate counters for response-header vs response-body failures were
+  considered and not added: moving the latency sample to after the body read
+  removes the misleading signal those counters would have diagnosed.
+- All 0.5.8 "evaluated and left as-is" items remain unchanged (double
+  `resp.Body.Close()` as early-reuse + safety net, `responses3xxTotal` for
+  schema stability, `connectionHeaderTokens` nil fast-path, single-mutex
+  limiter under GOMAXPROCS=1, entrypoint `wait -n` supervision).
 

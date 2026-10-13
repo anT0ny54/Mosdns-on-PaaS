@@ -67,6 +67,23 @@ var isBase64URLChar = func() [256]bool {
 	return table
 }()
 
+// pooledRequestBody presents a pooled POST-body buffer to the HTTP transport
+// as an io.ReadCloser and signals, by closing done, when the transport has
+// closed it. Per the RoundTripper contract the transport may read and close
+// the request body asynchronously, after Client.Do has returned, so the
+// backing memory must not be reused until that close has been observed.
+type pooledRequestBody struct {
+	reader *bytes.Reader
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (b *pooledRequestBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
+func (b *pooledRequestBody) Close() error {
+	b.once.Do(func() { close(b.done) })
+	return nil
+}
+
 type fixedWindowLimiter struct {
 	mu       sync.Mutex
 	limit    int
@@ -290,21 +307,27 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	var err error
 	var dnsParam string
 	var bodyBuf *[]byte
-	// The POST body buffer stays OUT of the pool until the upstream exchange
-	// is finished: the transport can still be reading the request body after
-	// Do returns (early response, cancellation), so it must not be handed to
-	// another request meanwhile. Holding it across the backend call avoids
-	// copying the body. Every exit path is covered by this defer; because it
-	// is registered before the response-body defer below, the response body
-	// (and with it the transport's use of the request body) is always closed
-	// BEFORE the buffer goes back to the pool. Set bodyReturned once the
-	// buffer has explicitly been put back, so the defer skips it.
+	var bodyClosed <-chan struct{}
+	// The POST body buffer stays OUT of the pool until the HTTP transport has
+	// closed the outgoing request body. The transport may finish with (and
+	// close) the body asynchronously after Client.Do returns, so the buffer
+	// must not be handed to another request meanwhile. pooledRequestBody
+	// signals its Close on bodyClosed; returnBodyBuffer waits for that
+	// signal before recycling the buffer. The wait is deadlock-free: the
+	// transport always closes the request body eventually, on success and on
+	// error.
 	bodyReturned := false
-	defer func() {
-		if !bodyReturned && bodyBuf != nil {
-			dnsMessageBufferPool.Put(bodyBuf)
+	returnBodyBuffer := func() {
+		if bodyReturned || bodyBuf == nil {
+			return
 		}
-	}()
+		bodyReturned = true
+		if bodyClosed != nil {
+			<-bodyClosed
+		}
+		dnsMessageBufferPool.Put(bodyBuf)
+	}
+	defer returnBodyBuffer()
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -374,17 +397,25 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
 		return
 	}
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, r.Method, outURL, reader)
+	req, err := http.NewRequestWithContext(ctx, r.Method, outURL, nil)
 	if err != nil {
 		// The request never reached the transport, so the buffer is free;
 		// the deferred put handles it.
 		g.metrics.backendErrorTotal.Add(1)
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
 		return
+	}
+	if body != nil {
+		// Attach the pooled body through a close-signaling ReadCloser: the
+		// transport may finish with (and close) it asynchronously, so the
+		// backing buffer is only recycled once that Close is observed.
+		pb := &pooledRequestBody{reader: bytes.NewReader(body), done: make(chan struct{})}
+		bodyClosed = pb.done
+		req.Body = pb
+		req.ContentLength = int64(len(body))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("X-Forwarded-For", clientIP)
@@ -394,18 +425,9 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	backendStart := time.Now()
 	resp, err := g.client.Do(req)
 	if err != nil {
-		// Do returned: the RoundTripper contract guarantees it is done with
-		// the request body; the deferred put handles the buffer.
 		g.failBackend(w, r, err)
 		return
 	}
-	// Count latency only for completed upstream calls: recording timeout and
-	// connection failures here would inflate the average-latency gauge.
-	g.metrics.backendLatencySamples.Add(1)
-	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
-	// Registered after the body-buffer defer above, so on every early-return
-	// path this close runs FIRST and ends the transport's use of the pooled
-	// request body before that defer returns it to the pool.
 	defer resp.Body.Close()
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
@@ -414,6 +436,13 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		g.failBackend(w, r, err)
 		return
 	}
+	// Count latency only for fully completed upstream calls (response
+	// headers AND body): recording header time would let a backend that
+	// answers headers quickly but stalls or truncates the body look healthy
+	// in the average-latency gauge, and recording timeout/connection
+	// failures would inflate it.
+	g.metrics.backendLatencySamples.Add(1)
+	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
 	if int64(len(respBody)) > g.maxResponseBytes {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
@@ -434,15 +463,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// The response body is fully read and closed, which also ends the
-	// transport's use of the request body, so the pooled request buffer can
-	// be recycled now instead of being copied. Mark it returned so the defer
-	// does not hand it back a second time.
+	// The response body is fully read and explicitly closed, which also ends
+	// the transport's use of the request body; recycle the pooled request
+	// buffer now (returnBodyBuffer only waits for the transport's
+	// asynchronous request-body close, which has already happened).
 	_ = resp.Body.Close()
-	bodyReturned = true
-	if bodyBuf != nil {
-		dnsMessageBufferPool.Put(bodyBuf)
-	}
+	returnBodyBuffer()
 	releaseSlot()
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
@@ -809,12 +835,16 @@ func newHTTPClient(maxConns int, responseHeaderTimeout time.Duration) *http.Clie
 	return &http.Client{Transport: transport, CheckRedirect: noRedirect}
 }
 
-// serverWriteTimeout keeps the server's write deadline above the longest time a
-// request may legitimately spend waiting for a slot and for MosDNS. Without it a
-// larger QUEUE_WAIT or UPSTREAM_TIMEOUT would be cut off by the connection
-// deadline, and the client would see a dropped connection instead of 503/504.
-func serverWriteTimeout(queueWait, upstreamTimeout time.Duration) time.Duration {
-	if need := queueWait + upstreamTimeout + 2*time.Second; need > defaultWriteTimeout {
+// serverWriteTimeout keeps the server's write deadline above the longest time
+// a request may legitimately spend: reading its body, waiting for a slot, and
+// waiting for MosDNS. The body-read budget is included explicitly because the
+// write deadline starts when the request headers are read, so it is already
+// running while the handler reads a slow POST body. Without this, an enlarged
+// QUEUE_WAIT or UPSTREAM_TIMEOUT (or a slow upload) would be cut off by the
+// connection deadline, and the client would see a dropped connection instead
+// of 503/504.
+func serverWriteTimeout(readTimeout, queueWait, upstreamTimeout time.Duration) time.Duration {
+	if need := readTimeout + queueWait + upstreamTimeout + 2*time.Second; need > defaultWriteTimeout {
 		return need
 	}
 	return defaultWriteTimeout
@@ -869,7 +899,7 @@ func main() {
 		Handler:           g,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      serverWriteTimeout(queueWait, upstreamTimeout),
+		WriteTimeout:      serverWriteTimeout(defaultReadTimeout, queueWait, upstreamTimeout),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}

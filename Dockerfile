@@ -6,11 +6,15 @@
 ARG MOSDNS_GO_VERSION=1.19.13
 ARG GATEWAY_GO_VERSION=1.27
 ARG MOSDNS_VERSION=v4.5.3
-# Optional supply-chain pin: set to the full commit SHA of the MOSDNS_VERSION tag
-# and the build fails if the tag ever resolves to a different commit.
-ARG MOSDNS_COMMIT=
+# Supply-chain pin (mandatory): the full commit SHA the MOSDNS_VERSION tag must
+# resolve to; the build fails if the tag ever moves. This is the commit behind
+# the v4.5.3 tag; re-resolve with:
+#   git ls-remote https://github.com/IrineSistiana/mosdns.git 'refs/tags/v4.5.3^{}'
+# An unexpected tag change now fails the build instead of silently producing a
+# different binary.
+ARG MOSDNS_COMMIT=760a660192fdf996463b024d1d0e19bd66b6ed31
 ARG ALPINE_VERSION=3.24.2
-ARG GATEWAY_VERSION=0.5.8
+ARG GATEWAY_VERSION=0.5.9
 
 FROM golang:${MOSDNS_GO_VERSION}-bookworm AS mosdns-builder
 ARG MOSDNS_VERSION
@@ -18,7 +22,11 @@ ARG MOSDNS_COMMIT
 ARG TARGETARCH
 WORKDIR /src
 RUN git clone --depth 1 --branch "${MOSDNS_VERSION}" https://github.com/IrineSistiana/mosdns.git . \
-    && if [ -n "${MOSDNS_COMMIT}" ] && [ "$(git rev-parse HEAD)" != "${MOSDNS_COMMIT}" ]; then \
+    && if [ -z "${MOSDNS_COMMIT}" ]; then \
+         echo "MOSDNS_COMMIT must be set to the commit SHA of ${MOSDNS_VERSION} (see the ARG comment above)" >&2; \
+         exit 1; \
+       fi \
+    && if [ "$(git rev-parse HEAD)" != "${MOSDNS_COMMIT}" ]; then \
          echo "MosDNS ${MOSDNS_VERSION} resolved to $(git rev-parse HEAD), expected ${MOSDNS_COMMIT}" >&2; \
          exit 1; \
        fi
