@@ -1105,8 +1105,9 @@ func TestHTTPClientIdlePoolFollowsConcurrency(t *testing.T) {
 	}
 }
 func TestServerWriteTimeoutCoversUpstreamTimeout(t *testing.T) {
-	if got := serverWriteTimeout(defaultReadTimeout, defaultQueueWait, defaultUpstreamTO); got != defaultWriteTimeout {
-		t.Fatalf("default write timeout changed: got %s, want %s", got, defaultWriteTimeout)
+	want := defaultReadTimeout + defaultQueueWait + defaultUpstreamTO + 2*time.Second
+	if got := serverWriteTimeout(defaultReadTimeout, defaultQueueWait, defaultUpstreamTO); got != want {
+		t.Fatalf("default write timeout changed: got %s, want %s", got, want)
 	}
 	if got := serverWriteTimeout(defaultReadTimeout, defaultQueueWait, 10*time.Second); got <= defaultQueueWait+10*time.Second {
 		t.Fatalf("write timeout %s does not exceed queue wait plus upstream timeout", got)

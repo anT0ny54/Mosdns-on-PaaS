@@ -93,9 +93,12 @@ func TestPooledBodyHeldUntilTransportCloses(t *testing.T) {
 }
 
 func TestServerWriteTimeoutIncludesReadBudget(t *testing.T) {
-	// Shipped defaults stay at the 8 s floor.
-	if got := serverWriteTimeout(defaultReadTimeout, defaultQueueWait, defaultUpstreamTO); got != defaultWriteTimeout {
-		t.Fatalf("default budget: got %v, want %v", got, defaultWriteTimeout)
+	// Shipped defaults: the full budget (5s read + queue + upstream + 2s
+	// margin = 9.6s) exceeds the 8s floor, so the floor is NOT returned; the
+	// whole budget must be covered.
+	if got, want := serverWriteTimeout(defaultReadTimeout, defaultQueueWait, defaultUpstreamTO),
+		defaultReadTimeout+defaultQueueWait+defaultUpstreamTO+2*time.Second; got != want {
+		t.Fatalf("default budget: got %v, want %v", got, want)
 	}
 	// Raised queue/upstream timeouts must also cover the body-read budget:
 	// 5s upload + 5s queue + 5s upstream + 2s margin = 17s. The old formula
