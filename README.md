@@ -21,12 +21,20 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
   DoH upstreams, falling back to a third HaGeZi endpoint if no answer arrives
   within 400 ms.
 
-`entrypoint.sh` starts both processes and checks once per second that each process is
-still alive (`kill -0` supervision only; it issues no HTTP health checks).
-It traps `TERM`, `INT`, and `HUP`; on shutdown it stops the gateway first so
-the gateway can drain while MosDNS is still available, then stops MosDNS. If
-either supervised process exits, the entrypoint terminates the remaining
-process and exits with status 1. The entrypoint honours two optional
+`entrypoint.sh` starts both processes and then blocks in `wait -n` until one of
+them exits. `wait` reaps the exited child immediately -- a `kill -0` poll could
+never detect the death, because `kill -0` still succeeds on an unreaped zombie
+(the pre-0.5.7 loop polled `kill -0` once per second and never fired). Death
+detection is now instantaneous. It traps `TERM`, `INT`, and `HUP`, which
+interrupt `wait` so shutdown stays prompt; on shutdown it stops the gateway
+first (TERM plus a 15 s bounded wait, with `kill -KILL` escalation, so the
+gateway can drain while MosDNS is still available and a wedged gateway cannot
+hang the container), then stops MosDNS the same way (5 s grace). If either
+supervised process exits, the entrypoint terminates the remaining process and
+exits with status 1. Supervision is process-level only (no HTTP health checks
+from the entrypoint): it detects *exit*, not wedges -- if MosDNS deadlocks
+without exiting, configure the platform to probe the gateway's `/readyz` (HTTP,
+not just TCP), which catches a wedged backend. The entrypoint honours two optional
 variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`) and
 `MOSDNS_DIR` (default `/etc/mosdns`).
 
@@ -125,8 +133,8 @@ does not set `get_user_ip_from_header`, so MosDNS currently ignores
 `fallback_hagezi` is `juuri.hagezi.org`. Upstreams use pinned `dial_addr` IPs,
 so no bootstrap DNS lookup is needed, but those IPs must be updated by hand if
 HaGeZi renumbers its endpoints. The server timeout is 2 s. `enable_pipeline` has no effect on DoH upstreams in
-MosDNS v4.5.3 (it only applies to TCP/DoT); it stays in the file because
-`check-config.sh` requires the key.
+MosDNS v4.5.3 (it only applies to TCP/DoT), so the file does not set it;
+`check-config.sh` treats the key as optional and validates it only when present.
 
 `check-config.sh` (requires Python 3.8+ with PyYAML; run via
 `make check-config`) validates it:
@@ -138,10 +146,11 @@ MosDNS v4.5.3 (it only applies to TCP/DoT); it stays in the file because
   be loopback);
 - the Dockerfile's `MOSDNS_DOH_URL` port and path match that listener;
 - the timeout chain `fast_fallback < servers[0].timeout < UPSTREAM_TIMEOUT`,
-  using `UPSTREAM_TIMEOUT` from the Dockerfile (`<number>ms` or `<number>s`) or, if
-  unset there, `defaultUpstreamTO` from `main.go` (`<number> * time.Millisecond`
-  or `<number> * time.Second`). The check fails (rather than silently skipping)
-  if neither can be read;
+  using `UPSTREAM_TIMEOUT` from the Dockerfile (`<number>ms`, `<number>s`,
+  `<number>m` or `<number>h`) or, if unset there, `defaultUpstreamTO` from
+  `main.go` (`<n> * time.Millisecond`, `<n> * time.Second`, `<n> * time.Minute`
+  or `<n> * time.Hour`). The check fails (rather than silently skipping) if
+  neither can be read;
 - `VERSION` matches the Dockerfile's default `ARG GATEWAY_VERSION`.
 
 The checks are written for the pinned, MosDNS v4.5.3-compatible layout. If
@@ -178,7 +187,7 @@ and `BUILD_DATE`.
 
 ## Version
 
-Gateway version is tracked in `VERSION` (0.5.6) and injected at build time
+Gateway version is tracked in `VERSION` (0.5.8) and injected at build time
 via `-ldflags -X main.version=...`; the MosDNS version is pinned in the
 Dockerfile (`ARG MOSDNS_VERSION=v4.5.3`, with an optional `MOSDNS_COMMIT`
 supply-chain pin). When bumping, change `VERSION` and the Dockerfile's

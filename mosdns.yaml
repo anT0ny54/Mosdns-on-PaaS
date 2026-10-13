@@ -24,12 +24,10 @@ plugins:
       upstream:
         - addr: "https://root.hagezi.org/dns-query"
           dial_addr: "188.34.161.210"
-          enable_pipeline: true
           idle_timeout: 20
           max_conns: 2
         - addr: "https://wurzn.hagezi.org/dns-query"
           dial_addr: "159.69.155.94"
-          enable_pipeline: true
           idle_timeout: 20
           max_conns: 2
 
@@ -39,7 +37,6 @@ plugins:
       upstream:
         - addr: "https://juuri.hagezi.org/dns-query"
           dial_addr: "95.217.163.17"
-          enable_pipeline: true
           idle_timeout: 20
           max_conns: 2
 

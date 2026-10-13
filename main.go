@@ -259,7 +259,9 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/dns-query":
 		g.serveDNS(w, r)
 	default:
-		http.NotFound(w, r)
+		// Plain text like every other gateway-generated error; http.NotFound
+		// would emit Go's HTML error page despite the nosniff header.
+		writeText(w, http.StatusNotFound, "not found\n")
 	}
 }
 func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
@@ -287,6 +289,22 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var err error
 	var dnsParam string
+	var bodyBuf *[]byte
+	// The POST body buffer stays OUT of the pool until the upstream exchange
+	// is finished: the transport can still be reading the request body after
+	// Do returns (early response, cancellation), so it must not be handed to
+	// another request meanwhile. Holding it across the backend call avoids
+	// copying the body. Every exit path is covered by this defer; because it
+	// is registered before the response-body defer below, the response body
+	// (and with it the transport's use of the request body) is always closed
+	// BEFORE the buffer goes back to the pool. Set bodyReturned once the
+	// buffer has explicitly been put back, so the defer skips it.
+	bodyReturned := false
+	defer func() {
+		if !bodyReturned && bodyBuf != nil {
+			dnsMessageBufferPool.Put(bodyBuf)
+		}
+	}()
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -296,8 +314,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
-		bodyBuf := dnsMessageBufferPool.Get().(*[]byte)
-		defer dnsMessageBufferPool.Put(bodyBuf)
+		bodyBuf = dnsMessageBufferPool.Get().(*[]byte)
 		body, err = readBoundedBody(r.Body, (*bodyBuf)[:0], int(g.maxRequestBytes))
 		if err != nil {
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
@@ -359,13 +376,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	var reader io.Reader
 	if body != nil {
-		// The transport can still be reading the request body after Do returns
-		// (early response, cancellation), so it must not alias the pooled buffer,
-		// which is handed to another request as soon as this handler returns.
-		reader = bytes.NewReader(append([]byte(nil), body...))
+		reader = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, outURL, reader)
 	if err != nil {
+		// The request never reached the transport, so the buffer is free;
+		// the deferred put handles it.
 		g.metrics.backendErrorTotal.Add(1)
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
 		return
@@ -378,6 +394,8 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	backendStart := time.Now()
 	resp, err := g.client.Do(req)
 	if err != nil {
+		// Do returned: the RoundTripper contract guarantees it is done with
+		// the request body; the deferred put handles the buffer.
 		g.failBackend(w, r, err)
 		return
 	}
@@ -385,6 +403,9 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	// connection failures here would inflate the average-latency gauge.
 	g.metrics.backendLatencySamples.Add(1)
 	g.metrics.backendLatencyNanos.Add(uint64(time.Since(backendStart)))
+	// Registered after the body-buffer defer above, so on every early-return
+	// path this close runs FIRST and ends the transport's use of the pooled
+	// request body before that defer returns it to the pool.
 	defer resp.Body.Close()
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
@@ -413,7 +434,15 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The response body is fully read and closed, which also ends the
+	// transport's use of the request body, so the pooled request buffer can
+	// be recycled now instead of being copied. Mark it returned so the defer
+	// does not hand it back a second time.
 	_ = resp.Body.Close()
+	bodyReturned = true
+	if bodyBuf != nil {
+		dnsMessageBufferPool.Put(bodyBuf)
+	}
 	releaseSlot()
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))

@@ -125,5 +125,6 @@ func throughputHarness() (*httptest.Server, *http.Client, func()) {
 	return server, client, backend.Close
 }
 func getenvBool(key string) bool {
-	return envString(key, "") == "1" || envString(key, "") == "true"
+	v := envString(key, "")
+	return v == "1" || v == "true"
 }

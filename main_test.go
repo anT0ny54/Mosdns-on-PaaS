@@ -249,6 +249,7 @@ func TestActiveRequestCap(t *testing.T) {
 		limiter:          limiter,
 		activeSlots:      make(chan struct{}, 1),
 		processingSlots:  make(chan struct{}, 1),
+		queueWait:        time.Second,
 		upstreamTimeout:  2 * time.Second,
 		maxRequestBytes:  maxDNSMessageBytes,
 		maxResponseBytes: maxDNSMessageBytes,

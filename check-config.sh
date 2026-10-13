@@ -55,6 +55,7 @@ def exact_bool(value, path: str) -> bool:
     return value
 def strip_comments(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+DURATION_UNIT_MS = {"Millisecond": 1, "Second": 1000, "Minute": 60000, "Hour": 3600000}
 def check_ip(value, path: str) -> None:
     try:
         ipaddress.ip_address(non_empty_string(value, path))
@@ -73,6 +74,11 @@ def check_listen_addr(value, path: str) -> None:
         fail(f"{path} must be a host:port address")
 def check_loopback(value: str, path: str) -> None:
     host = urlsplit("//" + value).hostname
+    if host is not None and "%" in host:
+        # urlsplit keeps an IPv6 zone id in the hostname ([fe80::1%eth0]
+        # parses to "fe80::1%eth0"); strip it before the loopback match so
+        # link-local loopback binds do not fail with a confusing message.
+        host = host.split("%", 1)[0]
     if host is None:
         fail(f"{path} must bind to loopback explicitly (an empty host listens on every interface)")
     if host not in {"127.0.0.1", "localhost", "::1"}:
@@ -150,7 +156,11 @@ for tag in ("primary_fast", "fallback_hagezi"):
         upstream = expect_mapping(upstream, f"plugins[{tag}].args.upstream[{index}]")
         check_upstream_addr(upstream.get("addr"), f"plugins[{tag}].args.upstream[{index}].addr")
         check_ip(upstream.get("dial_addr"), f"plugins[{tag}].args.upstream[{index}].dial_addr")
-        exact_bool(upstream.get("enable_pipeline"), f"plugins[{tag}].args.upstream[{index}].enable_pipeline")
+        # Optional: MosDNS v4.5.3 only applies pipeline to TCP/DoT upstreams,
+        # so for DoH it is a dead key -- validate it when present, but do not
+        # force it into the config.
+        if "enable_pipeline" in upstream:
+            exact_bool(upstream.get("enable_pipeline"), f"plugins[{tag}].args.upstream[{index}].enable_pipeline")
         if exact_int(upstream.get("idle_timeout"), f"plugins[{tag}].args.upstream[{index}].idle_timeout") <= 0:
             fail(f"plugins[{tag}].args.upstream[{index}].idle_timeout must be greater than 0")
         if exact_int(upstream.get("max_conns"), f"plugins[{tag}].args.upstream[{index}].max_conns") <= 0:
@@ -201,8 +211,9 @@ if "idle_timeout" in listener and exact_int(listener.get("idle_timeout"), "serve
 check_loopback(listener["addr"], "servers[0].listeners[0].addr")
 project_dir = config_path.resolve().parent
 dockerfile = project_dir / "Dockerfile"
-dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
-if dockerfile.is_file():
+dockerfile_exists = dockerfile.is_file()
+dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile_exists else ""
+if dockerfile_exists:
     match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", dockerfile_text)
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
@@ -219,18 +230,18 @@ if fallback["fast_fallback"] >= server_timeout_ms:
     )
 gateway_timeout_ms = None
 if re.search(r"\bUPSTREAM_TIMEOUT=", dockerfile_text):
-    env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s)\b", dockerfile_text)
+    env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s|m|h)\b", dockerfile_text)
     if env_match is None:
-        fail("Dockerfile sets UPSTREAM_TIMEOUT in a format this check cannot read; use <number>ms or <number>s")
-    gateway_timeout_ms = float(env_match.group(1)) * (1 if env_match.group(2) == "ms" else 1000)
+        fail("Dockerfile sets UPSTREAM_TIMEOUT in a format this check cannot read; use <number>ms, <number>s, <number>m or <number>h")
+    gateway_timeout_ms = float(env_match.group(1)) * {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}[env_match.group(2)]
 else:
     main_go = project_dir / "main.go"
     if not main_go.is_file():
         fail("main.go not found next to the config; cannot verify the gateway UPSTREAM_TIMEOUT default")
-    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second)\b", main_go.read_text(encoding="utf-8"))
+    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_go.read_text(encoding="utf-8"))
     if go_match is None:
-        fail("could not read defaultUpstreamTO from main.go (expected '<n> * time.Millisecond' or '<n> * time.Second'); the timeout-chain check would be skipped")
-    gateway_timeout_ms = float(go_match.group(1)) * (1 if go_match.group(2) == "Millisecond" else 1000)
+        fail("could not read defaultUpstreamTO from main.go (expected '<n> * time.Millisecond', '<n> * time.Second', '<n> * time.Minute' or '<n> * time.Hour'); the timeout-chain check failed")
+    gateway_timeout_ms = float(go_match.group(1)) * DURATION_UNIT_MS[go_match.group(2)]
 if server_timeout_ms >= gateway_timeout_ms:
     fail(
         f"servers[0].timeout ({server_timeout_ms} ms) must be below the gateway UPSTREAM_TIMEOUT ({gateway_timeout_ms:g} ms)"
