@@ -3,11 +3,12 @@
 .gitignore
 .gitattributes
 .dockerignore
-LICENSE
 README.md
 CHANGELOG.md
 keep-alive.txt
-main_test.go
-throughput_test.go
+*_test.go
 Makefile
 check-config.sh
+test-entrypoint.sh
+doh-gateway
+.env
