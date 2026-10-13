@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: make test (check-config, vet, unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27" # keep in sync with GATEWAY_GO_VERSION and go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install PyYAML (check-config dependency)
+        run: pip install pyyaml
+      - name: make test
+        run: make test
+
+  race:
+    name: go test -race ./...
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: go test -race ./...
+        run: go test -race ./...
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Dockerfile pins MOSDNS_COMMIT by default (supply-chain check);
+      # the build fails loudly if the v4.5.3 tag ever moves.
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg GATEWAY_VERSION="$(cat VERSION)" \
+            -t mosdns-koyeb-doh-gateway:ci .
