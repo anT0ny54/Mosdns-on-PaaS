@@ -1,5 +1,12 @@
 name: CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
@@ -7,13 +14,14 @@ on:
 
 jobs:
   test:
-    name: make test (check-config, vet, unit tests)
+    name: make test (check-config, entrypoint test, vet, unit tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27" # keep in sync with GATEWAY_GO_VERSION and go.mod
+          cache: false # no dependencies and no go.sum, so there is nothing to cache
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -26,10 +34,11 @@ jobs:
     name: go test -race ./...
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27"
+          cache: false
       - name: go test -race ./...
         run: go test -race ./...
 
@@ -37,7 +46,7 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The Dockerfile pins MOSDNS_COMMIT by default (supply-chain check);
       # the build fails loudly if the v4.5.3 tag ever moves.
       - name: Build image
