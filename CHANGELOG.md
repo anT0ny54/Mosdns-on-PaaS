@@ -83,11 +83,6 @@ uploads, and supply-chain pinning.
   `go test -race` passes, with 83.5% coverage; the 5000 RPS gate measured
   ~20k RPS; the entrypoint test passes under dash and BusyBox ash.
 
-### Removed
-- `.github/workflows/Keep-Alive.yml` and `keep-alive.txt`. They pushed a commit
-  twice a month only to keep scheduled workflows alive, but the repository
-  has no scheduled workflows (CI runs on push and pull request).
-
 ### Known, not changed
 - MosDNS v4.5.3 still builds with Go 1.19 (quic-go v0.30 does not build on
   newer Go). The long-term fix is MosDNS v5.
