@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       # The Dockerfile pins MOSDNS_COMMIT and every base-image digest; the
       # build fails loudly if the v4.5.3 tag ever moves. No GATEWAY_VERSION
       # build-arg: like Koyeb, CI takes the version from the VERSION file.
