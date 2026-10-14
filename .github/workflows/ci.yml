@@ -14,7 +14,7 @@ on:
 
 jobs:
   test:
-    name: make test (check-config, entrypoint test, vet, unit tests)
+    name: make test (gofmt, check-config, entrypoint test, vet, go test -race)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -30,27 +30,20 @@ jobs:
       - name: make test
         run: make test
 
-  race:
-    name: go test -race ./...
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.27"
-          cache: false
-      - name: go test -race ./...
-        run: go test -race ./...
-
   docker:
     name: docker build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # The Dockerfile pins MOSDNS_COMMIT by default (supply-chain check);
-      # the build fails loudly if the v4.5.3 tag ever moves.
+      - uses: docker/setup-buildx-action@v3
+      # The Dockerfile pins MOSDNS_COMMIT and every base-image digest; the
+      # build fails loudly if the v4.5.3 tag ever moves. No GATEWAY_VERSION
+      # build-arg: like Koyeb, CI takes the version from the VERSION file.
       - name: Build image
-        run: |
-          docker build \
-            --build-arg GATEWAY_VERSION="$(cat VERSION)" \
-            -t mosdns-koyeb-doh-gateway:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: mosdns-koyeb-doh-gateway:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
