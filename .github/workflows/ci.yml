@@ -17,7 +17,7 @@ jobs:
     name: make test (gofmt, check-config, entrypoint test, vet, go test -race)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27" # keep in sync with GATEWAY_GO_VERSION and go.mod
@@ -34,7 +34,7 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       # The Dockerfile pins MOSDNS_COMMIT and every base-image digest; the
       # build fails loudly if the v4.5.3 tag ever moves. No GATEWAY_VERSION
