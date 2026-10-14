@@ -1,0 +1,14 @@
+# Keeps the digest-pinned base images (Dockerfile) and the GitHub Actions
+# versions current. Note: MOSDNS_GO_VERSION must stay on Go 1.19 for MosDNS
+# v4 -- reject Dependabot PRs that move the golang:1.19.13 stage to a newer
+# Go minor; digest refreshes of the same tag are fine.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
