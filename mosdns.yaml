@@ -4,14 +4,18 @@
 # upstream outage cannot make the platform restart the container.
 # EDNS: every option except ECS is stripped before the cache key is built, so
 # clients that send EDNS0 (padding, cookies) share cache entries.
-# Primary: race two HaGeZi DoH endpoints and use the first response.
+# Primary: race two HaGeZi DoH endpoints and use the first response. Both are
+# "trusted": MosDNS v4 trusts only the first upstream of a fast_forward by
+# default and silently drops non-NOERROR answers (NXDOMAIN, SERVFAIL) from the
+# others, which would turn the race into a single upstream for those answers.
 # Fallback: if the primary has not produced a usable answer within 400 ms, also
 # query the standby HaGeZi endpoint and use whichever answers first.
-# servers[0].timeout must stay below the gateway UPSTREAM_TIMEOUT (default 2.5s).
+# servers[0].timeout must stay below the gateway UPSTREAM_TIMEOUT (default 2.5s)
+# and equal mosdnsServerTimeout in main.go (check-config.sh verifies both).
+# max_conns is not set: 2 is already the MosDNS v4.5.3 default for DoH.
 
 log:
   level: error
-  file: ""
 
 plugins:
   # Must answer the gateway's readinessProbeName (main.go); check-config.sh
@@ -41,11 +45,10 @@ plugins:
         - addr: "https://root.hagezi.org/dns-query"
           dial_addr: "188.34.161.210"
           idle_timeout: 20
-          max_conns: 2
         - addr: "https://wurzn.hagezi.org/dns-query"
           dial_addr: "159.69.155.94"
+          trusted: true
           idle_timeout: 20
-          max_conns: 2
 
   - tag: fallback_hagezi
     type: fast_forward
@@ -54,7 +57,6 @@ plugins:
         - addr: "https://juuri.hagezi.org/dns-query"
           dial_addr: "95.217.163.17"
           idle_timeout: 20
-          max_conns: 2
 
   - tag: main_sequence
     type: sequence
@@ -68,7 +70,6 @@ plugins:
           secondary:
             - fallback_hagezi
           fast_fallback: 400
-          always_standby: false
 
 servers:
   - exec: main_sequence

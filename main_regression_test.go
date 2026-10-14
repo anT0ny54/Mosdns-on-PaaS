@@ -14,25 +14,10 @@ import (
 	"time"
 )
 
-func newRegTestGateway(t testing.TB, backend string, client *http.Client) *gateway {
-	return newTestGateway(t, gatewayOptions{
-		BackendURL:       backend,
-		Client:           client,
-		RateLimit:        1000,
-		RateLimitClients: 1000,
-		MaxActive:        16,
-		Processing:       8,
-		QueueWait:        100 * time.Millisecond,
-		UpstreamTimeout:  5 * time.Second,
-	})
-}
-
-func newRegDoHPostRequest(t *testing.T, msg []byte) *http.Request {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(msg))
-	req.Header.Set("Content-Type", "application/dns-message")
-	req.RemoteAddr = "127.0.0.1:4242"
-	return req
+// regGateway is a gateway with the default limits, the given client (nil
+// for the production client) and a 5 s upstream timeout.
+func regGateway(t testing.TB, backend string, client *http.Client) *gateway {
+	return newTestGateway(t, gatewayOptions{BackendURL: backend, Client: client, UpstreamTimeout: 5 * time.Second})
 }
 
 // asyncBodyTransport returns an error immediately and reads the request
@@ -57,10 +42,10 @@ func (t *asyncBodyTransport) RoundTrip(req *http.Request) (*http.Response, error
 // that reads the body late must still see the original bytes.
 func TestTransportBodyIsNotAliasedToPool(t *testing.T) {
 	tr := &asyncBodyTransport{got: make(chan []byte, 1)}
-	g := newRegTestGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{Transport: tr})
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{Transport: tr})
 	want := bytes.Repeat([]byte{0xAB}, 32)
 	rec := httptest.NewRecorder()
-	g.ServeHTTP(rec, newRegDoHPostRequest(t, want))
+	g.ServeHTTP(rec, postReq(bytes.NewReader(want)))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
 	}
@@ -99,7 +84,7 @@ func TestServerWriteTimeoutIncludesReadBudget(t *testing.T) {
 // body), so a backend that answers headers quickly but stalls or truncates
 // the body cannot look healthy in the gauge.
 func TestBackendLatencyRecordedAfterBodyRead(t *testing.T) {
-	okBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	slowBodyBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
@@ -108,11 +93,11 @@ func TestBackendLatencyRecordedAfterBodyRead(t *testing.T) {
 		time.Sleep(120 * time.Millisecond)
 		_, _ = w.Write(make([]byte, 32))
 	}))
-	defer okBackend.Close()
+	defer slowBodyBackend.Close()
 
-	g := newRegTestGateway(t, okBackend.URL+"/dns-query", okBackend.Client())
+	g := regGateway(t, slowBodyBackend.URL+"/dns-query", slowBodyBackend.Client())
 	rec := httptest.NewRecorder()
-	g.ServeHTTP(rec, newRegDoHPostRequest(t, make([]byte, 32)))
+	g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, 32))))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -132,9 +117,9 @@ func TestBackendLatencyRecordedAfterBodyRead(t *testing.T) {
 	}))
 	defer brokenBackend.Close()
 
-	g2 := newRegTestGateway(t, brokenBackend.URL+"/dns-query", brokenBackend.Client())
+	g2 := regGateway(t, brokenBackend.URL+"/dns-query", brokenBackend.Client())
 	rec2 := httptest.NewRecorder()
-	g2.ServeHTTP(rec2, newRegDoHPostRequest(t, make([]byte, 32)))
+	g2.ServeHTTP(rec2, postReq(bytes.NewReader(make([]byte, 32))))
 
 	if rec2.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec2.Code)
@@ -157,7 +142,7 @@ func TestWriteTimeoutCoversSlowBodyAndRaisedTimeouts(t *testing.T) {
 
 	queueWait := 100 * time.Millisecond
 	upstreamTimeout := 2 * time.Second
-	g := newRegTestGateway(t, backend.URL+"/dns-query", backend.Client())
+	g := regGateway(t, backend.URL+"/dns-query", backend.Client())
 	g.upstreamTimeout = upstreamTimeout
 	g.queueWait = queueWait
 	g.bodyReadTimeout = 3 * time.Second // the trickled upload below takes ~2.5s
@@ -230,9 +215,9 @@ func TestBackendLatencyNotRecordedForRejectedResponses(t *testing.T) {
 			}))
 			defer backend.Close()
 
-			g := newRegTestGateway(t, backend.URL+"/dns-query", backend.Client())
+			g := regGateway(t, backend.URL+"/dns-query", backend.Client())
 			rec := httptest.NewRecorder()
-			g.ServeHTTP(rec, newRegDoHPostRequest(t, make([]byte, 32)))
+			g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, 32))))
 
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
@@ -287,9 +272,9 @@ func (tr *getBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 func TestPOSTRetryBodyMatchesOriginal(t *testing.T) {
 	msg := []byte("0123456789abcdef")
-	g := newRegTestGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{Transport: &getBodyTransport{t: t, want: msg}})
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{Transport: &getBodyTransport{t: t, want: msg}})
 	rec := httptest.NewRecorder()
-	g.ServeHTTP(rec, newRegDoHPostRequest(t, msg))
+	g.ServeHTTP(rec, postReq(bytes.NewReader(msg)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -306,7 +291,7 @@ func TestReadyProbeCanceledByClientIsNotCounted(t *testing.T) {
 	}))
 	defer backend.Close()
 	defer close(release)
-	g := newRegTestGateway(t, backend.URL, nil)
+	g := regGateway(t, backend.URL, nil)
 	g.readyCacheTTL = defaultReadyCacheTTL
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -357,7 +342,7 @@ func startRegServer(t *testing.T, g *gateway) net.Listener {
 // A POST body that is not complete within the body-read budget is rejected
 // and its active slot freed, instead of being held for the whole ReadTimeout.
 func TestSlowPOSTBodyIsCutOffAndFreesSlot(t *testing.T) {
-	g := newRegTestGateway(t, "http://127.0.0.1:9/dns-query", nil)
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", nil)
 	g.bodyReadTimeout = 200 * time.Millisecond
 	ln := startRegServer(t, g)
 	conn, err := net.Dial("tcp", ln.Addr().String())
@@ -398,7 +383,7 @@ func TestBodyDeadlineDoesNotCancelSlowBackend(t *testing.T) {
 		_, _ = w.Write(make([]byte, 32))
 	}))
 	defer backend.Close()
-	g := newRegTestGateway(t, backend.URL+"/dns-query", nil)
+	g := regGateway(t, backend.URL+"/dns-query", nil)
 	g.bodyReadTimeout = 100 * time.Millisecond
 	ln := startRegServer(t, g)
 	client := &http.Client{Timeout: 5 * time.Second}

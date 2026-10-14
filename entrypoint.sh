@@ -18,8 +18,8 @@ MOSDNS_SHUTDOWN_GRACE=3
 # True while the process exists and is not a zombie. `kill -0` alone is not
 # enough: an exited child stays a zombie (and `kill -0` keeps succeeding) until
 # its parent reaps it, so the state is read from /proc as well. Without /proc
-# the check degrades to `kill -0`. Only shell builtins are used, so the
-# once-per-second poll forks nothing.
+# the check degrades to `kill -0`. Only shell builtins are used, so the check
+# itself forks nothing (the supervision loop forks one `sleep` per second).
 is_alive() {
   kill -0 "$1" 2>/dev/null || return 1
   [ -r "/proc/$1/stat" ] || return 0

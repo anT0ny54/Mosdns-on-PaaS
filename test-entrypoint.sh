@@ -18,7 +18,9 @@ echo $$ > "$FAKE_DIR/$name.pid"
 mode=$(cat "$FAKE_DIR/$name.mode" 2>/dev/null || echo run)
 case "$mode" in
   exit) sleep "${FAKE_EXIT_AFTER:-1}"; exit 3 ;;
-  stubborn) trap '' TERM; while :; do sleep 1; done ;;
+  # An ignored signal stays ignored across exec, so this is a TERM-proof
+  # process with the recorded PID and no child that a KILL would orphan.
+  stubborn) trap '' TERM; exec sleep 3600 ;;
   *) trap 'exit 0' TERM; while :; do sleep 1 & wait $!; done ;;
 esac
 FAKE

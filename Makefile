@@ -3,7 +3,7 @@ IMAGE ?= $(PROJECT):local
 VERSION := $(shell cat VERSION)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: test fmt-check check-config entrypoint-test vet build docker-build run clean
+.PHONY: test fmt-check check-config entrypoint-test entrypoint-test-busybox vet build docker-build run clean
 
 # Unit tests always run with the race detector: the gateway is heavily
 # concurrent (slots, limiter, shared readiness probe).
@@ -19,6 +19,11 @@ check-config:
 entrypoint-test:
 	sh ./test-entrypoint.sh
 
+# The image runs the entrypoint under BusyBox ash (Alpine), whose `wait`
+# behavior is the reason the entrypoint polls; CI runs this target too.
+entrypoint-test-busybox:
+	TEST_SHELL="busybox sh" sh ./test-entrypoint.sh
+
 vet:
 	go vet ./...
 
@@ -30,7 +35,7 @@ docker-build:
 	docker build --build-arg GATEWAY_VERSION=$(VERSION) --build-arg BUILD_DATE=$(BUILD_DATE) -t $(IMAGE) .
 
 run: build
-	PORT=8080 ./doh-gateway
+	./doh-gateway
 
 clean:
 	rm -f doh-gateway

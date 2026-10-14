@@ -1,93 +1,72 @@
 # Changelog
 
-## 0.5.12 — 2026-10-14
+## 0.5.13 — 2026-10-14
 
-Fixes from a full-project review: cache, readiness, shutdown timing, slow
-uploads, and supply-chain pinning.
+Fixes from a second full-project review: upstream racing, base-image updates,
+cross-file drift, dead code and CI coverage.
 
 ### Fixed
-- **The cache almost never hit.** MosDNS v4.5.3 skips the cache for any query
-  carrying an EDNS0 OPT record unless `cache_everything` is set, and nearly
-  every DoH client sends one. With `cache_everything` alone, per-query EDNS
-  padding and cookies still split the cache keys. `mosdns.yaml` now runs
-  `_edns0_filter_ecs_only` before a `cache_everything: true` cache. Measured
-  end to end through the gateway: repeat queries went from ~100-170 ms
-  (upstream) to under 1 ms.
-- **`/readyz` depended on the public upstreams.** Each probe was a unique name
-  that went to HaGeZi, so an upstream outage failed the health check and the
-  platform restarted a healthy container (Koyeb restarts after 3 failed
-  checks). The probe is now a fixed `A ready.doh-gateway.invalid`, answered
-  locally by a new `readiness` (`arbitrary`) plugin before the cache. The
-  gateway requires NOERROR with at least one answer, so an NXDOMAIN (local rule
-  missing) is reported as not ready. Verified: with all upstreams unreachable,
-  `/readyz` stays 200 (queries return SERVFAIL after 2 s); with MosDNS down it
-  returns 503.
-- **Concurrent `/readyz` calls queued behind each other.** Callers now share
-  one in-flight probe, and each still honours its own request context.
-- **Shutdown did not fit Docker's 10 s stop timeout.** The gateway drain is now
-  4 s (was 10 s), and the entrypoint graces are 6 s and 3 s (were 15 s and 5 s).
-- **A TERM during crash teardown turned exit 1 into exit 0.** The supervision
-  loop now ignores further signals once it is tearing down after a child
-  died. New entrypoint test scenarios 6 and 7 cover this; the test fails if
-  the fix is removed.
-- **A slow POST body held an active slot for the whole 5 s ReadTimeout.** The
-  body now has a 2 s read deadline; a slower upload gets `400` (`Connection:
-  close`) and frees its slot. The deadline is cleared after the body is read,
-  so it cannot cancel a slow upstream answer (covered by a test).
-- **`X-Forwarded-For: unknown` was sent to MosDNS** when the client address
-  could not be parsed; the header is now only sent with a valid IP.
-  IPv4-mapped IPv6 clients are normalised to IPv4.
-- **Duplicate `X-Content-Type-Options`** when MosDNS also set it; the gateway
-  now sets it once.
-- **The limiter map never shrank** after a spike of distinct clients; it is
-  reallocated at window rollover when it held more than 4096 keys.
-- **`ListenAndServe` errors other than `ErrServerClosed` exited 0**; any
-  unexpected return now exits 1. A startup warning is logged when
-  `UPSTREAM_TIMEOUT` is not above the MosDNS server timeout.
+- **The primary upstream race was half disabled.** MosDNS v4.5.3 trusts only
+  the first upstream of a `fast_forward` and drops non-NOERROR answers
+  (NXDOMAIN, SERVFAIL) from the others, so for those answers
+  `wurzn.hagezi.org` could never win and queries waited for `root` or the
+  400 ms fallback. `wurzn` is now `trusted: true`, and `check-config.sh`
+  fails if any upstream after the first in a `fast_forward` is not trusted.
+- **Dependabot never updated the base images.** It cannot read
+  ARG-templated `FROM` lines (dependabot-core #2057), so every pinned digest
+  stayed frozen. The `FROM` lines are now literal (tag + digest), and
+  `dependabot.yml` ignores golang minor/major bumps, which keeps the MosDNS
+  builder on Go 1.19 and leaves gateway Go minor bumps to a manual change
+  that also updates `go.mod` and `ci.yml`.
+- **The MosDNS server timeout was hard-coded in the startup warning.** It is
+  now `mosdnsServerTimeout` in `main.go`, and `check-config.sh` requires it to
+  equal `servers[0].timeout`.
+- **`Retry-After` could be wrong at a window boundary.** The limiter read the
+  clock twice (once outside the lock). `admit` now returns the decision and
+  the `Retry-After` value from one clock reading, under the lock.
+- **The write deadline used constants** instead of the gateway's own
+  body-read, queue and upstream timeouts.
+- **`X-Real-IP` was trusted as a fallback** although only `CLIENT_IP_HEADER`
+  was configured. Only the configured header is trusted now; a missing or
+  invalid value falls back to the socket peer.
+- **README:** the readiness probe ID is incrementing, not random.
+
+### Removed (dead code and config)
+- `gatewayOptions.ReadyClient` and `gatewayOptions.BodyReadTimeout` (never set).
+- The `X-Forwarded-For` header sent to MosDNS (MosDNS never read it);
+  `check-config.sh` now rejects `get_user_ip_from_header`.
+- The second bounded-read implementation: request, answer and readiness
+  bodies all use `readDNSMessage` with the pooled buffer.
+- From `mosdns.yaml`: `max_conns: 2` (the DoH default), `always_standby: false`
+  and `log.file: ""` (defaults). `check-config.sh` validates `max_conns`,
+  `idle_timeout` and `always_standby` only when present.
+- Build args `MOSDNS_GO_VERSION`, `GATEWAY_GO_VERSION`, `ALPINE_VERSION` and
+  the `*_DIGEST` args (replaced by literal `FROM` lines). `check-config.sh`
+  reads the gateway Go version from the `gateway-builder` `FROM` line and
+  checks that the `mosdns-builder` stage stays on Go 1.19.
 
 ### Changed
-- Gateway internals: a `newGateway(options)` constructor validates the backend
-  URL once at startup (an invalid `MOSDNS_DOH_URL` now fails at start instead
-  of on every request) and replaces the lazy `sync.Once`, the per-gateway
-  size-limit fields and the constructor fallbacks. The pooled-request-body
-  wrapper was replaced by an exact-size copy, which is simpler and about 12%
-  faster in the POST benchmark. The transport no longer sets
-  `ResponseHeaderTimeout` (the per-request context timeout already covers it),
-  and `IdleConnTimeout` is 15 s, below MosDNS's 20 s, so the gateway never
-  reuses a connection MosDNS is closing.
-- The write deadline is 2 s body read + `QUEUE_WAIT` + `UPSTREAM_TIMEOUT` + 2 s,
-  with an 8 s floor, which is the effective default (was 9.6 s).
-- Metrics: the `*_seconds_avg` gauges are removed (compute
-  `_seconds_total / _samples_total` in the scraper); new
-  `doh_gateway_build_info{version="..."}`.
-- Dockerfile: every base image is pinned by multi-arch digest; builder stages
-  run on `$BUILDPLATFORM` and cross-compile (GOARM only for 32-bit arm); the
-  version is read from `VERSION`, so `VERSION` is the single source of truth
-  and plain `docker build` (Koyeb) gets it too; the MosDNS config is
-  root-owned and read-only (`0444`); the label is renamed to
-  `io.github.ant0ny54.mosdns.version`.
-- `check-config.sh` validates the layout generically instead of fixed tag
-  names. It checks that the cache and EDNS filter are set up, that the
-  readiness rule matches `main.go`, and that the `MOSDNS_DOH_URL` host
-  matches. Go versions are compared on major.minor, and the obsolete
-  VERSION/`GATEWAY_VERSION` check is gone.
-- `entrypoint.sh` `is_alive` uses only shell builtins (no `sed` fork per poll).
-- `make test` adds a gofmt check and runs `go test -race`; CI drops the
-  separate race job and builds the image with Buildx and the GitHub Actions
-  cache. New `.github/dependabot.yml` covers Docker digests and Actions.
-- `test-entrypoint.sh` now also checks, after every scenario, that neither
-  fake child is still running (not only the exit code).
-- Tests: shared constructors, duplicate tests merged, and new tests for every
-  fix above. The benchmark is renamed `BenchmarkGatewayParallelPOST`.
-  Verified: `go vet`, staticcheck (all checks) and deadcode are clean;
-  `go test -race` passes, with 83.5% coverage; the 5000 RPS gate measured
-  ~20k RPS; the entrypoint test passes under dash and BusyBox ash.
+- CI runs the entrypoint test under BusyBox ash too (new
+  `make entrypoint-test-busybox`) and smoke-tests the built image: `/readyz`,
+  `/healthz`, a local DoH query, `404`, `build_info` version and a `docker
+  stop` within 10 s.
+- Tests: shared `postReq`/`okBackend`/`regGateway` helpers replace about 25
+  copies of the request setup and the duplicate regression helpers; the
+  metrics tests and the readiness-rejection tests are merged into one test
+  each; the constant-only checks are dropped. New tests cover `Retry-After`
+  for key-cap rejections and the untrusted `X-Real-IP`.
+- `test-entrypoint.sh`: the TERM-ignoring fake child now `exec`s `sleep`, so
+  a KILL no longer leaves an orphaned `sleep` behind.
+- `entrypoint.sh` comment corrected (the loop forks one `sleep` per second);
+  `make run` no longer repeats the default `PORT=8080`.
 
-### Known, not changed
-- MosDNS v4.5.3 still builds with Go 1.19 (quic-go v0.30 does not build on
-  newer Go). The long-term fix is MosDNS v5.
-- With `CLIENT_IP_HEADER` set, a request without a valid value in that header
-  falls back to `X-Real-IP`; behind the trusted proxy this cannot happen.
-- Not verified here: the Docker build itself (no Docker in the review
-  environment). CI builds it on push.
+### Verified
+`gofmt`, `go vet`, staticcheck (all checks) and deadcode are clean; `go test
+-race` passes (83.2% coverage); the entrypoint test passes under dash and
+BusyBox ash; `check-config.sh` passes and rejects each new failure case. The
+gateway and the entrypoint were run against a real MosDNS v4.5.3 built with Go
+1.19.13 and this `mosdns.yaml`: `/readyz` 200, the local DoH answer, a real
+upstream query (repeat served from cache in under 1 ms), NXDOMAIN relayed,
+clean stop in 0.4 s. Not verified here: the Docker build itself (no Docker in
+the review environment); CI builds and smoke-tests it on push.
 

@@ -52,6 +52,10 @@ const (
 	// limiterShrinkThreshold: above this many keys the limiter map is
 	// reallocated at window rollover, because a cleared Go map keeps its memory.
 	limiterShrinkThreshold = 4096
+	// mosdnsServerTimeout mirrors servers[0].timeout in mosdns.yaml
+	// (check-config.sh verifies that both agree). UPSTREAM_TIMEOUT must stay
+	// above it so slow lookups end in a SERVFAIL answer, not a gateway 504.
+	mosdnsServerTimeout = 2 * time.Second
 	// readinessProbeName is answered locally by the "readiness" arbitrary
 	// plugin in mosdns.yaml (check-config.sh verifies that both agree), so the
 	// probe checks MosDNS itself and never depends on the public upstreams.
@@ -103,10 +107,15 @@ func newFixedWindowLimiterWithMaxKeys(limit int, window time.Duration, maxKeys i
 	}
 }
 
-func (l *fixedWindowLimiter) allow(key string) bool {
+// admit counts one request for key and returns 0 if it is allowed, or else
+// the seconds until the current window ends (for Retry-After). The decision
+// and the Retry-After value come from the same clock reading, under the lock.
+func (l *fixedWindowLimiter) admit(key string) (retryAfter int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	windowID := l.now().UnixNano() / l.window.Nanoseconds()
+	nowNanos := l.now().UnixNano()
+	windowNanos := l.window.Nanoseconds()
+	windowID := nowNanos / windowNanos
 	if windowID != l.windowID {
 		l.windowID = windowID
 		if len(l.counts) > limiterShrinkThreshold {
@@ -116,19 +125,16 @@ func (l *fixedWindowLimiter) allow(key string) bool {
 		}
 	}
 	count, exists := l.counts[key]
-	if !exists && len(l.counts) >= l.maxKeys {
-		return false
-	}
-	if count >= l.limit {
-		return false
+	if (!exists && len(l.counts) >= l.maxKeys) || count >= l.limit {
+		return secondsToWindowEnd(nowNanos, windowNanos)
 	}
 	l.counts[key] = count + 1
-	return true
+	return 0
 }
 
-func (l *fixedWindowLimiter) retryAfterSeconds() int {
-	windowNanos := l.window.Nanoseconds()
-	elapsed := l.now().UnixNano() % windowNanos
+// secondsToWindowEnd rounds up and is never below 1.
+func secondsToWindowEnd(nowNanos, windowNanos int64) int {
+	elapsed := nowNanos % windowNanos
 	if elapsed < 0 {
 		elapsed += windowNanos
 	}
@@ -162,7 +168,6 @@ type gatewayMetrics struct {
 type gatewayOptions struct {
 	BackendURL       string
 	Client           *http.Client
-	ReadyClient      *http.Client
 	RateLimit        int
 	RateWindow       time.Duration
 	RateLimitClients int
@@ -170,7 +175,6 @@ type gatewayOptions struct {
 	Processing       int
 	QueueWait        time.Duration
 	UpstreamTimeout  time.Duration
-	BodyReadTimeout  time.Duration
 	TrustedIPHeader  string
 	ReadyCacheTTL    time.Duration
 }
@@ -221,13 +225,13 @@ func newGateway(o gatewayOptions) (*gateway, error) {
 	processing := orInt(o.Processing, defaultConcurrency)
 	g := &gateway{
 		client:          o.Client,
-		readyClient:     o.ReadyClient,
+		readyClient:     newHTTPClient(1),
 		limiter:         newFixedWindowLimiterWithMaxKeys(orInt(o.RateLimit, defaultRateLimit), orDuration(o.RateWindow, defaultRateWindow), orInt(o.RateLimitClients, defaultRateLimitClients)),
 		activeSlots:     make(chan struct{}, orInt(o.MaxActive, defaultMaxActiveRequests)),
 		processingSlots: make(chan struct{}, processing),
 		queueWait:       orDuration(o.QueueWait, defaultQueueWait),
 		upstreamTimeout: orDuration(o.UpstreamTimeout, defaultUpstreamTO),
-		bodyReadTimeout: orDuration(o.BodyReadTimeout, defaultBodyReadTimeout),
+		bodyReadTimeout: defaultBodyReadTimeout,
 		trustedIPHeader: o.TrustedIPHeader,
 		backendBase:     u,
 		backendPlain:    u.String(),
@@ -236,9 +240,6 @@ func newGateway(o gatewayOptions) (*gateway, error) {
 	}
 	if g.client == nil {
 		g.client = newHTTPClient(processing)
-	}
-	if g.readyClient == nil {
-		g.readyClient = newHTTPClient(1)
 	}
 	return g, nil
 }
@@ -371,10 +372,9 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, "GET, POST")
 		return
 	}
-	clientIP := extractClientIP(r, g.trustedIPHeader)
-	if !g.limiter.allow(rateLimitKey(clientIP)) {
+	if retryAfter := g.limiter.admit(rateLimitKey(extractClientIP(r, g.trustedIPHeader))); retryAfter > 0 {
 		g.metrics.rateLimitedTotal.Add(1)
-		w.Header().Set("Retry-After", strconv.Itoa(g.limiter.retryAfterSeconds()))
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		writeText(w, http.StatusTooManyRequests, "rate limit exceeded\n")
 		return
 	}
@@ -407,7 +407,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		// are typically < 100 bytes) and recycle the buffer at once, so the
 		// transport never references pooled memory.
 		buf := dnsMessageBufferPool.Get().(*[]byte)
-		raw, err := readBoundedBody(r.Body, (*buf)[:0], maxDNSMessageBytes)
+		raw, err := readDNSMessage(r.Body, buf)
 		if err == nil {
 			body = bytes.Clone(raw)
 		}
@@ -486,12 +486,10 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		g.badUpstreamRequest(w)
 		return
 	}
+	// No X-Forwarded-For: mosdns.yaml does not use the client address
+	// (check-config.sh rejects get_user_ip_from_header), so it would be dead
+	// work on every request.
 	req.Header.Set("Accept", "application/dns-message")
-	if clientIP.IsValid() {
-		// Only a real address: MosDNS answers 400 to an unparseable
-		// X-Forwarded-For when get_user_ip_from_header is enabled.
-		req.Header.Set("X-Forwarded-For", clientIP.String())
-	}
 	if r.Method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/dns-message")
 	}
@@ -504,7 +502,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
-	respBody, err := readBoundedBody(resp.Body, (*respBuf)[:0], maxDNSMessageBytes)
+	respBody, err := readDNSMessage(resp.Body, respBuf)
 	if err != nil {
 		g.failBackend(w, r, err)
 		return
@@ -580,14 +578,12 @@ func (g *gateway) backendRequestURL(dns string) string {
 	return u.String()
 }
 
-// readBoundedBody reads r into buf (which must have capacity maxBytes+1) and
-// returns at most maxBytes+1 bytes; a result longer than maxBytes means the
-// body was too large.
-func readBoundedBody(r io.Reader, buf []byte, maxBytes int) ([]byte, error) {
-	if cap(buf) != maxBytes+1 {
-		return nil, errors.New("invalid body buffer")
-	}
-	buf = buf[:0]
+// readDNSMessage reads r into a buffer from dnsMessageBufferPool (capacity
+// maxDNSMessageBytes+1) and returns at most that many bytes; a result longer
+// than maxDNSMessageBytes means the message was too large. The result aliases
+// *pooled, so it is only valid until the buffer is returned to the pool.
+func readDNSMessage(r io.Reader, pooled *[]byte) ([]byte, error) {
+	buf := (*pooled)[:0]
 	for len(buf) < cap(buf) {
 		n, err := r.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]
@@ -662,7 +658,9 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
 		return g.probeFailed(parent)
 	}
-	buf, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageBytes+1))
+	pooled := dnsMessageBufferPool.Get().(*[]byte)
+	defer dnsMessageBufferPool.Put(pooled)
+	buf, err := readDNSMessage(resp.Body, pooled)
 	if err != nil || len(buf) > maxDNSMessageBytes || !isUsableDNSProbeResponse(buf, wantID, question) {
 		return g.probeFailed(parent)
 	}
@@ -747,20 +745,16 @@ doh_gateway_ready_probe_total{result="not_ready"} %d
 
 // extractClientIP returns the client address, or the zero Addr if none can
 // be determined. With a trusted header, the last entry of its last value is
-// used (the address the trusted proxy appended), then X-Real-IP.
-func extractClientIP(r *http.Request, preferredHeader string) netip.Addr {
-	if preferredHeader != "" {
-		if values := r.Header.Values(preferredHeader); len(values) != 0 {
+// used (the address the trusted proxy appended). No other header is trusted:
+// a missing or invalid value falls back to the socket peer.
+func extractClientIP(r *http.Request, trustedHeader string) netip.Addr {
+	if trustedHeader != "" {
+		if values := r.Header.Values(trustedHeader); len(values) != 0 {
 			value := values[len(values)-1]
 			if comma := strings.LastIndexByte(value, ','); comma >= 0 {
 				value = value[comma+1:]
 			}
 			if ip, err := netip.ParseAddr(strings.TrimSpace(value)); err == nil {
-				return ip.Unmap()
-			}
-		}
-		if raw := r.Header.Get("X-Real-IP"); raw != "" {
-			if ip, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil {
 				return ip.Unmap()
 			}
 		}
@@ -939,8 +933,8 @@ func main() {
 	if processing > maxActive {
 		log.Printf("warning: MAX_CONCURRENT_REQUESTS (%d) exceeds MAX_ACTIVE_REQUESTS (%d); requests are rejected before they can queue, so QUEUE_WAIT never applies", processing, maxActive)
 	}
-	if upstreamTimeout <= 2*time.Second {
-		log.Printf("warning: UPSTREAM_TIMEOUT (%s) is not above the MosDNS server timeout (2s); slow lookups end in 504 instead of a SERVFAIL answer", upstreamTimeout)
+	if upstreamTimeout <= mosdnsServerTimeout {
+		log.Printf("warning: UPSTREAM_TIMEOUT (%s) is not above the MosDNS server timeout (%s); slow lookups end in 504 instead of a SERVFAIL answer", upstreamTimeout, mosdnsServerTimeout)
 	}
 	g, err := newGateway(gatewayOptions{
 		BackendURL:       backend,
@@ -962,7 +956,7 @@ func main() {
 		Handler:           g,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      serverWriteTimeout(defaultBodyReadTimeout, queueWait, upstreamTimeout),
+		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, g.queueWait, g.upstreamTimeout),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}

@@ -160,7 +160,7 @@ path = non_empty_string(listener.get("url_path"), "servers[0].listeners[0].url_p
 if not path.startswith("/"):
     fail("servers[0].listeners[0].url_path must start with /")
 if "get_user_ip_from_header" in listener:
-    non_empty_string(listener.get("get_user_ip_from_header"), "servers[0].listeners[0].get_user_ip_from_header")
+    fail("servers[0].listeners[0].get_user_ip_from_header must not be set: the gateway does not forward the client address to MosDNS")
 if "idle_timeout" in listener and exact_int(listener.get("idle_timeout"), "servers[0].listeners[0].idle_timeout") < 0:
     fail("servers[0].listeners[0].idle_timeout must not be negative")
 check_loopback(listener["addr"], "servers[0].listeners[0].addr")
@@ -220,17 +220,25 @@ for side in ("primary", "secondary"):
             check_upstream_addr(upstream.get("addr"), f"{p}.addr")
             if "dial_addr" in upstream:
                 check_ip(upstream.get("dial_addr"), f"{p}.dial_addr")
-            # MosDNS v4.5.3 only applies pipeline to TCP/DoT upstreams, so for
-            # DoH it is a dead key -- validate it when present only.
+            # Optional keys are validated only when present. MosDNS v4.5.3
+            # only applies pipeline to TCP/DoT upstreams (a dead key for DoH),
+            # and max_conns defaults to 2 for DoH.
             if "enable_pipeline" in upstream:
                 exact_bool(upstream.get("enable_pipeline"), f"{p}.enable_pipeline")
-            if exact_int(upstream.get("idle_timeout"), f"{p}.idle_timeout") <= 0:
+            if "idle_timeout" in upstream and exact_int(upstream.get("idle_timeout"), f"{p}.idle_timeout") <= 0:
                 fail(f"{p}.idle_timeout must be greater than 0")
-            if exact_int(upstream.get("max_conns"), f"{p}.max_conns") <= 0:
+            if "max_conns" in upstream and exact_int(upstream.get("max_conns"), f"{p}.max_conns") <= 0:
                 fail(f"{p}.max_conns must be greater than 0")
+            trusted = exact_bool(upstream["trusted"], f"{p}.trusted") if "trusted" in upstream else False
+            # MosDNS v4 trusts only the first upstream implicitly and drops
+            # non-NOERROR answers (NXDOMAIN, SERVFAIL) from untrusted ones, so
+            # a race between untrusted upstreams silently degrades.
+            if index > 1 and not trusted:
+                fail(f"{p}.trusted must be true: MosDNS v4 drops NXDOMAIN/SERVFAIL answers from untrusted upstreams, so the parallel race in {tag} would only use the first upstream for them")
 if exact_int(fallback.get("fast_fallback"), f"{seq_path}[].fast_fallback") <= 0:
     fail("main sequence fast_fallback must be greater than 0 ms")
-exact_bool(fallback.get("always_standby"), f"{seq_path}[].always_standby")
+if "always_standby" in fallback:
+    exact_bool(fallback.get("always_standby"), f"{seq_path}[].always_standby")
 server_timeout_ms = server["timeout"] * 1000
 if fallback["fast_fallback"] >= server_timeout_ms:
     fail(f"fast_fallback ({fallback['fast_fallback']} ms) must be below servers[0].timeout ({server_timeout_ms} ms)")
@@ -254,6 +262,12 @@ if main_text:
                 answered = True
     if not answered:
         fail(f"no arbitrary plugin before {cache_tag} answers 'A {probe}' (main.go readinessProbeName); /readyz would depend on the public upstreams")
+    m = re.search(r"mosdnsServerTimeout\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_text)
+    if m is None:
+        fail("could not read mosdnsServerTimeout from main.go (expected '<n> * time.Millisecond|Second|Minute|Hour')")
+    go_server_timeout_ms = float(m.group(1)) * DURATION_UNIT_MS[m.group(2)]
+    if go_server_timeout_ms != server_timeout_ms:
+        fail(f"main.go mosdnsServerTimeout ({go_server_timeout_ms:g} ms) must equal servers[0].timeout ({server_timeout_ms} ms)")
 
 # --- Dockerfile cross-checks -------------------------------------------------
 dockerfile = project_dir / "Dockerfile"
@@ -296,10 +310,17 @@ if go_mod.is_file():
         fail("go.mod has no 'go <version>' directive")
     go_versions["go.mod"] = m.group(1)
     if dockerfile_text:
-        m = re.search(r"^ARG[ \t]+GATEWAY_GO_VERSION=(\S+)", dockerfile_text, re.MULTILINE)
+        # FROM lines are literal (Dependabot cannot read ARG-templated ones).
+        from_re = r"^FROM[ \t]+(?:--platform=\S+[ \t]+)?golang:(\d+(?:\.\d+)*)\S*[ \t]+AS[ \t]+{}[ \t]*$"
+        m = re.search(from_re.format("gateway-builder"), dockerfile_text, re.MULTILINE | re.IGNORECASE)
         if m is None:
-            fail("Dockerfile does not declare ARG GATEWAY_GO_VERSION")
-        go_versions["Dockerfile GATEWAY_GO_VERSION"] = m.group(1)
+            fail("Dockerfile has no literal 'FROM golang:<version>... AS gateway-builder' line")
+        go_versions["Dockerfile gateway-builder"] = m.group(1)
+        m = re.search(from_re.format("mosdns-builder"), dockerfile_text, re.MULTILINE | re.IGNORECASE)
+        if m is None:
+            fail("Dockerfile has no literal 'FROM golang:<version>... AS mosdns-builder' line")
+        if major_minor(m.group(1)) != "1.19":
+            fail(f"Dockerfile mosdns-builder uses Go {m.group(1)}; MosDNS v4 (quic-go v0.30) only builds with Go 1.19")
     ci_file = project_dir / ".github" / "workflows" / "ci.yml"
     if ci_file.is_file():
         for n, m in enumerate(re.finditer(r"^\s*go-version:\s*[\"']?([^\s\"'#]+)", ci_file.read_text(encoding="utf-8"), re.MULTILINE), 1):

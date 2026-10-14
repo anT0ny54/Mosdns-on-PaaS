@@ -33,6 +33,22 @@ func newTestGateway(t testing.TB, o gatewayOptions) *gateway {
 	g.limiter.now = func() time.Time { return time.Unix(120, 0) }
 	return g
 }
+
+// postReq builds a DoH POST request with the required content type.
+func postReq(body io.Reader) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", body)
+	r.Header.Set("Content-Type", "application/dns-message")
+	return r
+}
+
+// okBackend answers every query with testDNSBody.
+func okBackend() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write([]byte(testDNSBody))
+	}))
+}
+
 func testGateway(t testing.TB, backend string, limit int, concurrency int) *gateway {
 	t.Helper()
 	return newTestGateway(t, gatewayOptions{
@@ -61,15 +77,11 @@ func TestNormalizeListenAddr(t *testing.T) {
 	}
 }
 func TestRateLimitPerClient(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte(testDNSBody))
-	}))
+	backend := okBackend()
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 2, 10)
 	for i := 0; i < 2; i++ {
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-		r.Header.Set("Content-Type", "application/dns-message")
+		r := postReq(strings.NewReader(testDNSBody))
 		r.Header.Set("X-Forwarded-For", "192.0.2.10")
 		r.ContentLength = int64(len(testDNSBody))
 		w := httptest.NewRecorder()
@@ -78,16 +90,14 @@ func TestRateLimitPerClient(t *testing.T) {
 			t.Fatalf("request %d: got %d, want %d", i+1, w.Code, http.StatusOK)
 		}
 	}
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	r.Header.Set("X-Forwarded-For", "192.0.2.10")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("got %d, want %d", w.Code, http.StatusTooManyRequests)
 	}
-	r = httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r = postReq(strings.NewReader(testDNSBody))
 	r.Header.Set("X-Forwarded-For", "192.0.2.11")
 	w = httptest.NewRecorder()
 	g.ServeHTTP(w, r)
@@ -98,24 +108,21 @@ func TestRateLimitPerClient(t *testing.T) {
 func TestRateLimiterClientCap(t *testing.T) {
 	l := newFixedWindowLimiterWithMaxKeys(10, time.Minute, 2)
 	l.now = func() time.Time { return time.Unix(120, 0) }
-	if !l.allow("198.51.100.1") {
+	if l.admit("198.51.100.1") != 0 {
 		t.Fatal("first client denied")
 	}
-	if !l.allow("198.51.100.2") {
+	if l.admit("198.51.100.2") != 0 {
 		t.Fatal("second client denied")
 	}
-	if l.allow("198.51.100.3") {
+	if l.admit("198.51.100.3") == 0 {
 		t.Fatal("third client exceeded key cap but was allowed")
 	}
-	if !l.allow("198.51.100.1") {
+	if l.admit("198.51.100.1") != 0 {
 		t.Fatal("existing client denied after key cap reached")
 	}
 }
 func TestDoHContentTypeAndSize(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte(testDNSBody))
-	}))
+	backend := okBackend()
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
 	badType := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
@@ -132,8 +139,7 @@ func TestDoHContentTypeAndSize(t *testing.T) {
 	if w.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("parameterized content type: got %d, want %d", w.Code, http.StatusUnsupportedMediaType)
 	}
-	tooLarge := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(strings.Repeat("a", maxDNSMessageBytes+1)))
-	tooLarge.Header.Set("Content-Type", "application/dns-message")
+	tooLarge := postReq(strings.NewReader(strings.Repeat("a", maxDNSMessageBytes+1)))
 	tooLarge.ContentLength = maxDNSMessageBytes + 1
 	w = httptest.NewRecorder()
 	g.ServeHTTP(w, tooLarge)
@@ -196,8 +202,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-		r.Header.Set("Content-Type", "application/dns-message")
+		r := postReq(strings.NewReader(testDNSBody))
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, r)
 		if w.Code != http.StatusOK {
@@ -208,8 +213,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 	<-entered
 	go func() {
 		defer wg.Done()
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-		r.Header.Set("Content-Type", "application/dns-message")
+		r := postReq(strings.NewReader(testDNSBody))
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, r)
 		if w.Code != http.StatusOK {
@@ -228,10 +232,7 @@ func TestProcessingConcurrencyQueues(t *testing.T) {
 	wg.Wait()
 }
 func TestActiveRequestCap(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte(testDNSBody))
-	}))
+	backend := okBackend()
 	defer backend.Close()
 	g := newTestGateway(t, gatewayOptions{
 		BackendURL:       backend.URL,
@@ -245,24 +246,14 @@ func TestActiveRequestCap(t *testing.T) {
 	})
 	g.activeSlots <- struct{}{}
 	defer func() { <-g.activeSlots }()
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("got %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 }
-func TestDefaultCapacityConfiguration(t *testing.T) {
-	if defaultRateLimitClients != 65536 {
-		t.Fatalf("default rate-limit client guard=%d, want 65536", defaultRateLimitClients)
-	}
-	if defaultMaxActiveRequests != 16 {
-		t.Fatalf("default active-request capacity=%d, want 16", defaultMaxActiveRequests)
-	}
-	if defaultConcurrency != 8 {
-		t.Fatalf("default backend processing cap=%d, want 8", defaultConcurrency)
-	}
+func TestBackendPoolSizing(t *testing.T) {
 	transport := newHTTPClient(defaultConcurrency).Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost != defaultConcurrency {
 		t.Fatalf("MaxIdleConnsPerHost=%d, want %d", transport.MaxIdleConnsPerHost, defaultConcurrency)
@@ -318,8 +309,7 @@ func TestActiveRequestBurstCapacity(t *testing.T) {
 	for i := 0; i < burst; i++ {
 		go func() {
 			defer wg.Done()
-			r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-			r.Header.Set("Content-Type", "application/dns-message")
+			r := postReq(strings.NewReader(testDNSBody))
 			r.Header.Set("X-Forwarded-For", "198.18.0.1")
 			w := httptest.NewRecorder()
 			g.ServeHTTP(w, r)
@@ -474,58 +464,12 @@ func TestReadyEndpointTracksBackend(t *testing.T) {
 		t.Fatalf("dead backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 }
-func TestReadyEndpointRejectsServfail(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write(probeResponse(t, r, 2))
-	}))
-	defer backend.Close()
-	g := testGateway(t, backend.URL, 100, 10)
-	w := httptest.NewRecorder()
-	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("SERVFAIL backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
-	}
-}
-func TestReadyEndpointRejectsBareHeader(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := probeResponse(t, r, 0)
-		if len(resp) >= 12 {
-			resp = resp[:12]
-		}
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write(resp)
-	}))
-	defer backend.Close()
-	g := testGateway(t, backend.URL, 100, 10)
-	w := httptest.NewRecorder()
-	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("question-less backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
-	}
-}
-func TestReadyEndpointRejectsMismatchedID(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := probeResponse(t, r, 0)
-		if len(resp) >= 2 {
-			resp[0], resp[1] = 0xff, 0xff
-		}
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write(resp)
-	}))
-	defer backend.Close()
-	g := testGateway(t, backend.URL, 100, 10)
-	w := httptest.NewRecorder()
-	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("mismatched-ID backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
-	}
-}
 func TestMetricsEndpoint(t *testing.T) {
 	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
 	g.metrics.requestsTotal.Add(7)
 	g.metrics.queueWaitSamples.Add(2)
 	g.metrics.queueWaitNanos.Add(uint64(150 * time.Millisecond))
+	g.metrics.backendLatencySamples.Add(5)
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if w.Code != http.StatusOK {
@@ -537,6 +481,8 @@ func TestMetricsEndpoint(t *testing.T) {
 		"doh_gateway_queue_timeout_total",
 		"doh_gateway_ready_probe_total{result=\"ready\"}",
 		"doh_gateway_queue_wait_seconds_total 0.150000",
+		"doh_gateway_queue_wait_samples_total 2",
+		"doh_gateway_backend_latency_samples_total 5",
 		"doh_gateway_build_info{version=",
 	} {
 		if !strings.Contains(body, want) {
@@ -552,8 +498,7 @@ func TestMaxSizeResponseAccepted(t *testing.T) {
 	defer boundaryBackend.Close()
 	g := testGateway(t, boundaryBackend.URL, 100, 10)
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("max-size response: got %d, want %d", w.Code, http.StatusOK)
@@ -604,47 +549,44 @@ func TestGETValidBase64URL(t *testing.T) {
 func TestFixedWindowResets(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(120, 0) }
-	if !l.allow("198.51.100.1") {
+	if l.admit("198.51.100.1") != 0 {
 		t.Fatal("first request denied")
 	}
-	if l.allow("198.51.100.1") {
+	if l.admit("198.51.100.1") == 0 {
 		t.Fatal("second request allowed in same window")
 	}
 	l.now = func() time.Time { return time.Unix(180, 0) }
-	if !l.allow("198.51.100.1") {
+	if l.admit("198.51.100.1") != 0 {
 		t.Fatal("request denied after window reset")
 	}
 }
 func TestFixedWindowRetryAfter(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(125, 0) }
-	if !l.allow("198.51.100.20") {
-		t.Fatal("first request denied")
+	if got := l.admit("198.51.100.20"); got != 0 {
+		t.Fatalf("first request denied (retry-after=%d)", got)
 	}
-	if l.allow("198.51.100.20") {
-		t.Fatal("second request allowed in same window")
-	}
-	if got := l.retryAfterSeconds(); got != 55 {
+	if got := l.admit("198.51.100.20"); got != 55 {
 		t.Fatalf("retry-after=%d, want 55", got)
 	}
 	l.now = func() time.Time { return time.Unix(179, 0) }
-	if got := l.retryAfterSeconds(); got != 1 {
+	if got := l.admit("198.51.100.20"); got != 1 {
 		t.Fatalf("retry-after=%d, want 1", got)
 	}
-}
-func okBackend() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte(testDNSBody))
-	}))
+	// A new client rejected by the key cap gets the same window-based value.
+	capped := newFixedWindowLimiterWithMaxKeys(10, time.Minute, 1)
+	capped.now = func() time.Time { return time.Unix(125, 0) }
+	capped.admit("198.51.100.1")
+	if got := capped.admit("198.51.100.2"); got != 55 {
+		t.Fatalf("key-cap retry-after=%d, want 55", got)
+	}
 }
 func TestSlowBodyDoesNotHoldProcessingSlot(t *testing.T) {
 	backend := okBackend()
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 1)
 	pr, pw := io.Pipe()
-	slow := httptest.NewRequest(http.MethodPost, "/dns-query", pr)
-	slow.Header.Set("Content-Type", "application/dns-message")
+	slow := postReq(pr)
 	slow.Header.Set("X-Forwarded-For", "192.0.2.50")
 	slowDone := make(chan int, 1)
 	go func() {
@@ -652,8 +594,7 @@ func TestSlowBodyDoesNotHoldProcessingSlot(t *testing.T) {
 		g.ServeHTTP(w, slow)
 		slowDone <- w.Code
 	}()
-	fast := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	fast.Header.Set("Content-Type", "application/dns-message")
+	fast := postReq(strings.NewReader(testDNSBody))
 	fast.Header.Set("X-Forwarded-For", "192.0.2.51")
 	fastDone := make(chan int, 1)
 	go func() {
@@ -691,8 +632,7 @@ func TestPOSTShortBodyRejected(t *testing.T) {
 	}))
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody[:11]))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody[:11]))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
@@ -711,8 +651,7 @@ func TestClientHeadersAreNotForwarded(t *testing.T) {
 	}))
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	r.Header.Set("Cookie", "session=secret")
 	r.Header.Set("Authorization", "Bearer secret")
 	r.Header.Set("X-Forwarded-For", "203.0.113.5")
@@ -725,7 +664,8 @@ func TestClientHeadersAreNotForwarded(t *testing.T) {
 	if got.Get("Cookie") != "" || got.Get("Authorization") != "" {
 		t.Fatalf("client credentials leaked upstream: %v", got)
 	}
-	if got.Get("X-Forwarded-For") != "203.0.113.5" || got.Get("Accept") != "application/dns-message" {
+	// MosDNS does not use the client address, so the gateway sends none.
+	if got.Get("X-Forwarded-For") != "" || got.Get("Accept") != "application/dns-message" {
 		t.Fatalf("unexpected upstream headers: %v", got)
 	}
 }
@@ -751,18 +691,18 @@ func TestClientIPHeaderTrust(t *testing.T) {
 	if got := extractClientIP(r, "").String(); got != "192.0.2.1" {
 		t.Fatalf("with header trust disabled got %q, want the socket peer", got)
 	}
-	r = httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
-	r.Header.Set("X-Real-IP", "203.0.113.8")
-	if got := extractClientIP(r, "X-Forwarded-For").String(); got != "203.0.113.8" {
-		t.Fatalf("X-Real-IP fallback got %q", got)
-	}
-}
-func TestClientIPHeaderInvalidFallsBackToRealIP(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
-	r.Header.Set("X-Forwarded-For", "not-an-ip")
-	r.Header.Set("X-Real-IP", "203.0.113.8")
-	if got := extractClientIP(r, "X-Forwarded-For").String(); got != "203.0.113.8" {
-		t.Fatalf("invalid preferred header did not fall back to X-Real-IP: got %q", got)
+	// Only the configured header is trusted: X-Real-IP is client-controlled
+	// unless the proxy strips it, so a missing or invalid trusted value falls
+	// back to the socket peer.
+	for _, xff := range []string{"", "not-an-ip"} {
+		r = httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
+		if xff != "" {
+			r.Header.Set("X-Forwarded-For", xff)
+		}
+		r.Header.Set("X-Real-IP", "203.0.113.8")
+		if got := extractClientIP(r, "X-Forwarded-For").String(); got != "192.0.2.1" {
+			t.Fatalf("XFF=%q: got %q, want the socket peer (X-Real-IP must not be trusted)", xff, got)
+		}
 	}
 }
 func TestReadyEndpointCachesResult(t *testing.T) {
@@ -794,8 +734,7 @@ func TestMetricsCountGatewayGeneratedResponses(t *testing.T) {
 	if got := g.metrics.responses4xxTotal.Load(); got != 1 {
 		t.Fatalf("4xx count=%d, want 1", got)
 	}
-	dead := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	dead.Header.Set("Content-Type", "application/dns-message")
+	dead := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, dead)
 	if w.Code != http.StatusBadGateway {
@@ -818,8 +757,7 @@ func TestBackendRedirectIsNotFollowed(t *testing.T) {
 	}))
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusBadGateway {
@@ -844,8 +782,7 @@ func TestUpstreamTimeoutMapsTo504(t *testing.T) {
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
 	g.upstreamTimeout = 50 * time.Millisecond
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusGatewayTimeout {
@@ -865,8 +802,7 @@ func TestClientDisconnectIsNotABackendError(t *testing.T) {
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
 	ctx, cancel := context.WithCancel(context.Background())
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody)).WithContext(ctx)
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody)).WithContext(ctx)
 	w := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -883,22 +819,6 @@ func TestClientDisconnectIsNotABackendError(t *testing.T) {
 	close(backendRelease)
 	if got := g.metrics.backendErrorTotal.Load(); got != 0 {
 		t.Fatalf("client disconnect counted as %d backend errors, want 0", got)
-	}
-}
-func TestMetricsExposeSampleCounters(t *testing.T) {
-	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
-	g.metrics.queueWaitSamples.Add(3)
-	g.metrics.backendLatencySamples.Add(5)
-	w := httptest.NewRecorder()
-	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	body := w.Body.String()
-	for _, want := range []string{
-		"doh_gateway_queue_wait_samples_total 3",
-		"doh_gateway_backend_latency_samples_total 5",
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("metrics missing %q in %s", want, body)
-		}
 	}
 }
 func TestQueueTimeoutReturns503(t *testing.T) {
@@ -919,13 +839,11 @@ func TestQueueTimeoutReturns503(t *testing.T) {
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-		r.Header.Set("Content-Type", "application/dns-message")
+		r := postReq(strings.NewReader(testDNSBody))
 		g.ServeHTTP(httptest.NewRecorder(), r)
 	}()
 	<-entered
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable {
@@ -971,8 +889,7 @@ func TestRateLimitedResponseIsPlainText(t *testing.T) {
 	g := testGateway(t, backend.URL, 1, 10)
 	var w *httptest.ResponseRecorder
 	for i := 0; i < 2; i++ {
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-		r.Header.Set("Content-Type", "application/dns-message")
+		r := postReq(strings.NewReader(testDNSBody))
 		w = httptest.NewRecorder()
 		g.ServeHTTP(w, r)
 	}
@@ -993,8 +910,7 @@ func TestRelayedResponseSetsContentLength(t *testing.T) {
 	}))
 	defer backend.Close()
 	g := testGateway(t, backend.URL, 100, 10)
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -1016,7 +932,7 @@ func TestLimiterReadsClockUnderLock(t *testing.T) {
 		}
 		return time.Unix(120, 0)
 	}
-	if !l.allow("198.51.100.1") {
+	if l.admit("198.51.100.1") != 0 {
 		t.Fatal("first request denied")
 	}
 }
@@ -1070,8 +986,7 @@ func TestSlowReadingClientDoesNotHoldProcessingSlot(t *testing.T) {
 	slowDone := make(chan struct{})
 	go func() {
 		defer close(slowDone)
-		r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-		r.Header.Set("Content-Type", "application/dns-message")
+		r := postReq(strings.NewReader(testDNSBody))
 		g.ServeHTTP(bw, r)
 	}()
 	select {
@@ -1079,8 +994,7 @@ func TestSlowReadingClientDoesNotHoldProcessingSlot(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("slow client's response was never written")
 	}
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
+	r := postReq(strings.NewReader(testDNSBody))
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -1103,7 +1017,7 @@ func TestGETInvalidParameterRejected(t *testing.T) {
 		}
 	}
 }
-func TestReadyEndpointRejectsUpstreamStyleAnswers(t *testing.T) {
+func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		build func(t *testing.T, r *http.Request) []byte
@@ -1111,6 +1025,21 @@ func TestReadyEndpointRejectsUpstreamStyleAnswers(t *testing.T) {
 		// NXDOMAIN means the local readiness rule is missing and the probe
 		// leaked to the public upstreams.
 		{"nxdomain", func(t *testing.T, r *http.Request) []byte { return probeResponse(t, r, 3) }},
+		{"servfail", func(t *testing.T, r *http.Request) []byte { return probeResponse(t, r, 2) }},
+		{"bare header without question", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			if len(resp) >= 12 {
+				resp = resp[:12]
+			}
+			return resp
+		}},
+		{"mismatched id", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			if len(resp) >= 2 {
+				resp[0], resp[1] = 0xff, 0xff
+			}
+			return resp
+		}},
 		{"noerror without answer", func(t *testing.T, r *http.Request) []byte {
 			resp := probeResponse(t, r, 0)
 			resp[7] = 0
@@ -1181,11 +1110,11 @@ func TestLimiterReleasesMemoryAfterSpike(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(120, 0) }
 	for i := 0; i <= limiterShrinkThreshold; i++ {
-		l.allow("k" + strconv.Itoa(i))
+		l.admit("k" + strconv.Itoa(i))
 	}
 	before := l.counts
 	l.now = func() time.Time { return time.Unix(180, 0) }
-	l.allow("fresh")
+	l.admit("fresh")
 	if len(l.counts) != 1 {
 		t.Fatalf("counts after rollover=%d, want 1", len(l.counts))
 	}
@@ -1203,28 +1132,6 @@ func TestBackendNosniffHeaderIsNotDuplicated(t *testing.T) {
 	}
 	if dst.Get("Cache-Control") != "max-age=30" {
 		t.Fatal("Cache-Control from MosDNS not relayed")
-	}
-}
-func TestUnknownClientIPIsNotForwarded(t *testing.T) {
-	seen := make(chan http.Header, 1)
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Header.Clone()
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte(testDNSBody))
-	}))
-	defer backend.Close()
-	g := testGateway(t, backend.URL, 100, 10)
-	g.trustedIPHeader = ""
-	r := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
-	r.Header.Set("Content-Type", "application/dns-message")
-	r.RemoteAddr = "not-an-address"
-	w := httptest.NewRecorder()
-	g.ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("got %d", w.Code)
-	}
-	if got := (<-seen).Get("X-Forwarded-For"); got != "" {
-		t.Fatalf("X-Forwarded-For=%q sent for an unknown client", got)
 	}
 }
 func TestIPv4MappedClientIsUnmapped(t *testing.T) {
