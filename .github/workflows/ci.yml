@@ -40,7 +40,7 @@ jobs:
       # build fails loudly if the v4.5.3 tag ever moves. No GATEWAY_VERSION
       # build-arg: like Koyeb, CI takes the version from the VERSION file.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
