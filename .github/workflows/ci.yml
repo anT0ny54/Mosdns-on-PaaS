@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.27" # keep in sync with GATEWAY_GO_VERSION and go.mod
+          go-version: "1.27" # keep in sync with the gateway-builder FROM line and go.mod
           cache: false # no dependencies and no go.sum, so there is nothing to cache
       - uses: actions/setup-python@v7
         with:
@@ -29,6 +29,11 @@ jobs:
         run: pip install pyyaml
       - name: make test
         run: make test
+      # Production runs the entrypoint under BusyBox ash (Alpine), not dash.
+      - name: Install BusyBox
+        run: sudo apt-get update -q && sudo apt-get install -y -q busybox
+      - name: Entrypoint test under BusyBox ash
+        run: make entrypoint-test-busybox
 
   docker:
     name: docker build
@@ -44,6 +49,32 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: mosdns-koyeb-doh-gateway:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Start the real image and check it end to end without touching the
+      # public upstreams: /readyz and the DoH query below are both answered
+      # by the local readiness rule in mosdns.yaml.
+      - name: Smoke test image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run -d --name smoke -p 127.0.0.1:8080:8080 mosdns-koyeb-doh-gateway:ci
+          trap 'docker logs smoke || true; docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1; then break; fi
+            if [ "$i" = 30 ]; then echo "/readyz never became ready" >&2; exit 1; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz | grep -qx ok
+          # "A ready.doh-gateway.invalid" as a raw base64url DoH GET parameter.
+          q=$(python3 -c 'import base64; n=b"".join(bytes([len(l)])+l for l in b"ready.doh-gateway.invalid".split(b"."))+b"\0"; print(base64.urlsafe_b64encode(b"\0\0\1\0\0\1\0\0\0\0\0\0"+n+b"\0\1\0\1").decode().rstrip("="))')
+          ct=$(curl -fsS -o /tmp/answer -w '%{content_type}' "http://127.0.0.1:8080/dns-query?dns=${q}")
+          [ "$ct" = "application/dns-message" ] || { echo "unexpected content type: $ct" >&2; exit 1; }
+          [ "$(stat -c %s /tmp/answer)" -gt 12 ] || { echo "answer too short" >&2; exit 1; }
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/nope)" = 404 ]
+          curl -fsS http://127.0.0.1:8080/metrics | grep -q '^doh_gateway_build_info{version="'"$(cat VERSION)"'"} 1$'
+          # Graceful stop must fit Docker's default 10 s stop timeout.
+          start=$(date +%s); docker stop smoke >/dev/null; end=$(date +%s)
+          [ $((end - start)) -lt 10 ] || { echo "docker stop took $((end - start)) s" >&2; exit 1; }
