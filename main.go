@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 )
 
 const (
+	// maxDNSMessageBytes bounds both DoH requests and MosDNS answers.
 	maxDNSMessageBytes       = 4096
 	minDNSMessageBytes       = 12
 	maxHeaderBytes           = 8 * 1024
@@ -39,9 +41,21 @@ const (
 	defaultReadHeaderTimeout = 5 * time.Second
 	defaultQueueWait         = 100 * time.Millisecond
 	defaultReadTimeout       = 5 * time.Second
-	defaultWriteTimeout      = 8 * time.Second
-	defaultIdleTimeout       = 20 * time.Second
-	defaultShutdownTimeout   = 10 * time.Second
+	// defaultBodyReadTimeout bounds reading one POST body (at most 4 KiB) while
+	// the request holds an active slot, so slow uploads cannot pin the slots.
+	defaultBodyReadTimeout = 2 * time.Second
+	defaultWriteTimeout    = 8 * time.Second
+	defaultIdleTimeout     = 20 * time.Second
+	// Requests are bounded by body read + QUEUE_WAIT + UPSTREAM_TIMEOUT, so a
+	// short drain is enough and stays inside common 10 s stop timeouts.
+	defaultShutdownTimeout = 4 * time.Second
+	// limiterShrinkThreshold: above this many keys the limiter map is
+	// reallocated at window rollover, because a cleared Go map keeps its memory.
+	limiterShrinkThreshold = 4096
+	// readinessProbeName is answered locally by the "readiness" arbitrary
+	// plugin in mosdns.yaml (check-config.sh verifies that both agree), so the
+	// probe checks MosDNS itself and never depends on the public upstreams.
+	readinessProbeName = "ready.doh-gateway.invalid"
 )
 
 var version = "dev"
@@ -67,23 +81,8 @@ var isBase64URLChar = func() [256]bool {
 	return table
 }()
 
-// pooledRequestBody presents a pooled POST-body buffer to the HTTP transport
-// as an io.ReadCloser and signals, by closing done, when the transport has
-// closed it. Per the RoundTripper contract the transport may read and close
-// the request body asynchronously, after Client.Do has returned, so the
-// backing memory must not be reused until that close has been observed.
-type pooledRequestBody struct {
-	reader *bytes.Reader
-	done   chan struct{}
-	once   sync.Once
-}
-
-func (b *pooledRequestBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
-func (b *pooledRequestBody) Close() error {
-	b.once.Do(func() { close(b.done) })
-	return nil
-}
-
+// fixedWindowLimiter expects limit >= 1, window > 0 and maxKeys >= 1; the
+// gateway constructor applies the defaults.
 type fixedWindowLimiter struct {
 	mu       sync.Mutex
 	limit    int
@@ -95,15 +94,6 @@ type fixedWindowLimiter struct {
 }
 
 func newFixedWindowLimiterWithMaxKeys(limit int, window time.Duration, maxKeys int) *fixedWindowLimiter {
-	if limit < 1 {
-		limit = defaultRateLimit
-	}
-	if window <= 0 {
-		window = defaultRateWindow
-	}
-	if maxKeys < 1 {
-		maxKeys = defaultRateLimitClients
-	}
 	return &fixedWindowLimiter{
 		limit:   limit,
 		window:  window,
@@ -112,13 +102,18 @@ func newFixedWindowLimiterWithMaxKeys(limit int, window time.Duration, maxKeys i
 		now:     time.Now,
 	}
 }
+
 func (l *fixedWindowLimiter) allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	windowID := l.now().UnixNano() / l.window.Nanoseconds()
 	if windowID != l.windowID {
 		l.windowID = windowID
-		clear(l.counts)
+		if len(l.counts) > limiterShrinkThreshold {
+			l.counts = make(map[string]int)
+		} else {
+			clear(l.counts)
+		}
 	}
 	count, exists := l.counts[key]
 	if !exists && len(l.counts) >= l.maxKeys {
@@ -130,18 +125,14 @@ func (l *fixedWindowLimiter) allow(key string) bool {
 	l.counts[key] = count + 1
 	return true
 }
+
 func (l *fixedWindowLimiter) retryAfterSeconds() int {
-	now := l.now()
 	windowNanos := l.window.Nanoseconds()
-	if windowNanos <= 0 {
-		return 1
-	}
-	elapsed := now.UnixNano() % windowNanos
+	elapsed := l.now().UnixNano() % windowNanos
 	if elapsed < 0 {
 		elapsed += windowNanos
 	}
-	remaining := windowNanos - elapsed
-	seconds := int((remaining + int64(time.Second) - 1) / int64(time.Second))
+	seconds := int((windowNanos - elapsed + int64(time.Second) - 1) / int64(time.Second))
 	if seconds < 1 {
 		return 1
 	}
@@ -165,29 +156,93 @@ type gatewayMetrics struct {
 	backendLatencySamples atomic.Uint64
 	backendLatencyNanos   atomic.Uint64
 }
-type gateway struct {
-	backendURL       string
-	client           *http.Client
-	limiter          *fixedWindowLimiter
-	activeSlots      chan struct{}
-	processingSlots  chan struct{}
-	queueWait        time.Duration
-	upstreamTimeout  time.Duration
-	maxRequestBytes  int64
-	maxResponseBytes int64
-	trustedIPHeader  string
-	readyClient      *http.Client
-	metrics          gatewayMetrics
-	probeSeq         atomic.Uint64
-	backendOnce      sync.Once
-	backendBase      *url.URL
-	backendPlain     string
-	backendSimple    bool
-	readyCacheTTL    time.Duration
-	readyMu          sync.Mutex
-	readyAt          time.Time
-	readyOK          bool
+
+// gatewayOptions configures newGateway. Zero values select the defaults,
+// except ReadyCacheTTL, where zero disables the readiness cache.
+type gatewayOptions struct {
+	BackendURL       string
+	Client           *http.Client
+	ReadyClient      *http.Client
+	RateLimit        int
+	RateWindow       time.Duration
+	RateLimitClients int
+	MaxActive        int
+	Processing       int
+	QueueWait        time.Duration
+	UpstreamTimeout  time.Duration
+	BodyReadTimeout  time.Duration
+	TrustedIPHeader  string
+	ReadyCacheTTL    time.Duration
 }
+
+type gateway struct {
+	client          *http.Client
+	readyClient     *http.Client
+	limiter         *fixedWindowLimiter
+	activeSlots     chan struct{}
+	processingSlots chan struct{}
+	queueWait       time.Duration
+	upstreamTimeout time.Duration
+	bodyReadTimeout time.Duration
+	trustedIPHeader string
+	metrics         gatewayMetrics
+	probeSeq        atomic.Uint64
+	backendBase     *url.URL
+	backendPlain    string
+	backendSimple   bool
+	readyCacheTTL   time.Duration
+	readyMu         sync.Mutex
+	readyAt         time.Time
+	readyOK         bool
+	readyInflight   chan struct{}
+}
+
+func orInt(v, def int) int {
+	if v < 1 {
+		return def
+	}
+	return v
+}
+
+func orDuration(v, def time.Duration) time.Duration {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// newGateway validates the backend URL once and applies every default, so
+// the request path needs no lazy parsing or defensive fallbacks.
+func newGateway(o gatewayOptions) (*gateway, error) {
+	u, err := url.Parse(o.BackendURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("invalid backend URL %q: want an absolute http(s) URL", o.BackendURL)
+	}
+	processing := orInt(o.Processing, defaultConcurrency)
+	g := &gateway{
+		client:          o.Client,
+		readyClient:     o.ReadyClient,
+		limiter:         newFixedWindowLimiterWithMaxKeys(orInt(o.RateLimit, defaultRateLimit), orDuration(o.RateWindow, defaultRateWindow), orInt(o.RateLimitClients, defaultRateLimitClients)),
+		activeSlots:     make(chan struct{}, orInt(o.MaxActive, defaultMaxActiveRequests)),
+		processingSlots: make(chan struct{}, processing),
+		queueWait:       orDuration(o.QueueWait, defaultQueueWait),
+		upstreamTimeout: orDuration(o.UpstreamTimeout, defaultUpstreamTO),
+		bodyReadTimeout: orDuration(o.BodyReadTimeout, defaultBodyReadTimeout),
+		trustedIPHeader: o.TrustedIPHeader,
+		backendBase:     u,
+		backendPlain:    u.String(),
+		backendSimple:   u.RawQuery == "" && !u.ForceQuery && u.Fragment == "",
+		readyCacheTTL:   o.ReadyCacheTTL,
+	}
+	if g.client == nil {
+		g.client = newHTTPClient(processing)
+	}
+	if g.readyClient == nil {
+		g.readyClient = newHTTPClient(1)
+	}
+	return g, nil
+}
+
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -199,12 +254,17 @@ func (s *statusRecorder) WriteHeader(code int) {
 	}
 	s.ResponseWriter.WriteHeader(code)
 }
+
 func (s *statusRecorder) Write(b []byte) (int, error) {
 	if s.status == 0 {
 		s.status = http.StatusOK
 	}
 	return s.ResponseWriter.Write(b)
 }
+
+// Unwrap lets http.ResponseController reach the connection (read deadlines).
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 func (g *gateway) countStatus(status int) {
 	switch {
 	case status >= 200 && status < 300:
@@ -217,30 +277,53 @@ func (g *gateway) countStatus(status int) {
 		g.metrics.responses5xxTotal.Add(1)
 	}
 }
+
+// ready returns the (cached) readiness result. Concurrent callers share one
+// in-flight probe; a waiter whose own client goes away stops waiting. A probe
+// aborted by its caller's cancellation is not cached, and the waiters retry.
 func (g *gateway) ready(ctx context.Context) bool {
-	if g.readyCacheTTL <= 0 {
-		return g.backendReady(ctx)
-	}
-	g.readyMu.Lock()
-	defer g.readyMu.Unlock()
-	if !g.readyAt.IsZero() {
-		ttl := g.readyCacheTTL
-		if !g.readyOK && ttl > readyFailCacheTTL {
-			ttl = readyFailCacheTTL
+	for {
+		g.readyMu.Lock()
+		if g.readyCacheTTL > 0 && !g.readyAt.IsZero() {
+			ttl := g.readyCacheTTL
+			if !g.readyOK && ttl > readyFailCacheTTL {
+				ttl = readyFailCacheTTL
+			}
+			if time.Since(g.readyAt) < ttl {
+				ok := g.readyOK
+				g.readyMu.Unlock()
+				return ok
+			}
 		}
-		if time.Since(g.readyAt) < ttl {
-			return g.readyOK
+		if g.readyInflight == nil {
+			done := make(chan struct{})
+			g.readyInflight = done
+			g.readyMu.Unlock()
+			ok := g.backendReady(ctx)
+			g.readyMu.Lock()
+			if ctx.Err() == nil {
+				g.readyAt = time.Now()
+				g.readyOK = ok
+			}
+			g.readyInflight = nil
+			close(done)
+			g.readyMu.Unlock()
+			return ok
+		}
+		inflight := g.readyInflight
+		g.readyMu.Unlock()
+		select {
+		case <-inflight:
+			if g.readyCacheTTL <= 0 {
+				// No cache to read the shared result from: probe again.
+				continue
+			}
+		case <-ctx.Done():
+			return false
 		}
 	}
-	ok := g.backendReady(ctx)
-	// Only cache the outcome when the caller is still there: a probe aborted
-	// by client cancellation says nothing about backend health.
-	if ctx.Err() == nil {
-		g.readyAt = time.Now()
-		g.readyOK = ok
-	}
-	return ok
 }
+
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &statusRecorder{ResponseWriter: w}
 	w = rec
@@ -252,9 +335,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, "GET, HEAD")
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok\n")
+		writeText(w, http.StatusOK, "ok\n")
 	case "/readyz":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w, "GET, HEAD")
@@ -268,9 +349,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeText(w, http.StatusServiceUnavailable, "not ready\n")
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok\n")
+		writeText(w, http.StatusOK, "ok\n")
 	case "/metrics":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w, "GET, HEAD")
@@ -285,6 +364,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeText(w, http.StatusNotFound, "not found\n")
 	}
 }
+
 func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	g.metrics.requestsTotal.Add(1)
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -308,46 +388,46 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body []byte
-	var err error
 	var dnsParam string
-	var bodyBuf *[]byte
-	var bodyClosed <-chan struct{}
-	// The POST body buffer stays OUT of the pool until the HTTP transport has
-	// closed the outgoing request body. The transport may finish with (and
-	// close) the body asynchronously after Client.Do returns, so the buffer
-	// must not be handed to another request meanwhile. pooledRequestBody
-	// signals its Close on bodyClosed; returnBodyBuffer waits for that
-	// signal before recycling the buffer. The wait is deadlock-free: the
-	// transport always closes the request body eventually, on success and on
-	// error.
-	bodyReturned := false
-	returnBodyBuffer := func() {
-		if bodyReturned || bodyBuf == nil {
-			return
-		}
-		bodyReturned = true
-		if bodyClosed != nil {
-			<-bodyClosed
-		}
-		dnsMessageBufferPool.Put(bodyBuf)
-	}
-	defer returnBodyBuffer()
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
 			return
 		}
-		if r.ContentLength > g.maxRequestBytes {
+		if r.ContentLength > maxDNSMessageBytes {
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
-		bodyBuf = dnsMessageBufferPool.Get().(*[]byte)
-		body, err = readBoundedBody(r.Body, (*bodyBuf)[:0], int(g.maxRequestBytes))
+		// A DNS message is at most 4 KiB: do not let a slow upload hold the
+		// active slot for the whole server ReadTimeout. Not every
+		// ResponseWriter supports deadlines (tests), so the error is ignored.
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(g.bodyReadTimeout))
+		// Read into a pooled buffer, then keep an exact-size copy (DNS queries
+		// are typically < 100 bytes) and recycle the buffer at once, so the
+		// transport never references pooled memory.
+		buf := dnsMessageBufferPool.Get().(*[]byte)
+		raw, err := readBoundedBody(r.Body, (*buf)[:0], maxDNSMessageBytes)
+		if err == nil {
+			body = bytes.Clone(raw)
+		}
+		dnsMessageBufferPool.Put(buf)
+		if err == nil {
+			// Clear the short deadline again: once the body is consumed the
+			// server keeps a background read on the connection, and a
+			// deadline expiring there (during the upstream wait) would cancel
+			// the request context. The server sets fresh deadlines for the
+			// next request on this connection.
+			_ = rc.SetReadDeadline(time.Time{})
+		}
 		if err != nil {
+			if isTimeoutError(err) {
+				w.Header().Set("Connection", "close")
+			}
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
 			return
 		}
-		if int64(len(body)) > g.maxRequestBytes {
+		if len(body) > maxDNSMessageBytes {
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -357,7 +437,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		dnsParam = r.URL.Query().Get("dns")
-		if !isValidDoHGetParameter(dnsParam, g.maxRequestBytes) {
+		if !isValidDoHGetParameter(dnsParam) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -395,36 +475,23 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	defer releaseSlot()
 	ctx, cancel := context.WithTimeout(r.Context(), g.upstreamTimeout)
 	defer cancel()
-	outURL, ok := g.backendRequestURL(dnsParam)
-	if !ok {
-		g.badUpstreamRequest(w)
-		return
-	}
-	req, err := http.NewRequestWithContext(ctx, r.Method, outURL, nil)
-	if err != nil {
-		// The request never reached the transport, so the buffer is free;
-		// the deferred put handles it.
-		g.badUpstreamRequest(w)
-		return
-	}
+	var reqBody io.Reader
 	if body != nil {
-		// Attach the pooled body through a close-signaling ReadCloser: the
-		// transport may finish with (and close) it asynchronously, so the
-		// backing buffer is only recycled once that Close is observed.
-		pb := &pooledRequestBody{reader: bytes.NewReader(body), done: make(chan struct{})}
-		bodyClosed = pb.done
-		req.Body = pb
-		req.ContentLength = int64(len(body))
-		// The transport calls GetBody to retry on a stale idle connection.
-		// The retry body is a copy: once the original body is closed the
-		// pooled buffer may be recycled, and a retry body that still
-		// aliased it could be read after another request reused it.
-		req.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(bytes.Clone(body))), nil
-		}
+		// bytes.Reader lets net/http set ContentLength and a GetBody for
+		// stale-connection retries; body is owned by this request alone.
+		reqBody = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, g.backendRequestURL(dnsParam), reqBody)
+	if err != nil {
+		g.badUpstreamRequest(w)
+		return
 	}
 	req.Header.Set("Accept", "application/dns-message")
-	req.Header.Set("X-Forwarded-For", clientIP)
+	if clientIP.IsValid() {
+		// Only a real address: MosDNS answers 400 to an unparseable
+		// X-Forwarded-For when get_user_ip_from_header is enabled.
+		req.Header.Set("X-Forwarded-For", clientIP.String())
+	}
 	if r.Method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/dns-message")
 	}
@@ -437,17 +504,17 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
-	respBody, err := readBoundedBody(resp.Body, (*respBuf)[:0], int(g.maxResponseBytes))
+	respBody, err := readBoundedBody(resp.Body, (*respBuf)[:0], maxDNSMessageBytes)
 	if err != nil {
 		g.failBackend(w, r, err)
 		return
 	}
 	// Take the elapsed time as soon as the body has been read, but only
-	// record it once the response has passed every check below: a header-only
-	// time, a timeout, an oversize body or an invalid/non-2xx answer must not
-	// feed the backend-latency gauge.
+	// record it once the response has passed every check below: a timeout,
+	// an oversize body or an invalid/non-2xx answer must not feed the
+	// backend-latency metrics.
 	backendElapsed := time.Since(backendStart)
-	if int64(len(respBody)) > g.maxResponseBytes {
+	if len(respBody) > maxDNSMessageBytes {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -469,24 +536,23 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// The response body is fully read and explicitly closed, which also ends
-	// the transport's use of the request body; recycle the pooled request
-	// buffer now (returnBodyBuffer only waits for the transport's
-	// asynchronous request-body close, which has already happened).
+	// Answer fully read: free the processing slot before writing to the
+	// client. The deferred Close stays as the safety net for early returns.
 	_ = resp.Body.Close()
-	returnBodyBuffer()
 	releaseSlot()
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 }
+
 // badUpstreamRequest answers a request the gateway could not turn into a valid
 // backend request: a backend error and a 502 with a short text body.
 func (g *gateway) badUpstreamRequest(w http.ResponseWriter) {
 	g.metrics.backendErrorTotal.Add(1)
-	http.Error(w, "bad upstream request", http.StatusBadGateway)
+	writeText(w, http.StatusBadGateway, "bad upstream request\n")
 }
+
 func (g *gateway) failBackend(w http.ResponseWriter, r *http.Request, err error) {
 	if r.Context().Err() != nil {
 		return
@@ -498,46 +564,33 @@ func (g *gateway) failBackend(w http.ResponseWriter, r *http.Request, err error)
 	}
 	w.WriteHeader(status)
 }
-func (g *gateway) backendRequestURL(dns string) (string, bool) {
-	g.backendOnce.Do(func() {
-		if u, err := url.Parse(g.backendURL); err == nil && u.Host != "" {
-			g.backendBase = u
-			g.backendPlain = u.String()
-			g.backendSimple = u.RawQuery == "" && !u.ForceQuery && u.Fragment == ""
-		}
-	})
-	if g.backendBase == nil {
-		return "", false
-	}
+
+func (g *gateway) backendRequestURL(dns string) string {
 	if dns == "" {
-		return g.backendPlain, true
+		return g.backendPlain
 	}
 	if g.backendSimple {
 		// dns is always validated base64url (or generated by the readiness probe), so it needs no escaping.
-		return g.backendPlain + "?dns=" + dns, true
+		return g.backendPlain + "?dns=" + dns
 	}
 	u := *g.backendBase
 	values := u.Query()
 	values.Set("dns", dns)
 	u.RawQuery = values.Encode()
-	return u.String(), true
+	return u.String()
 }
+
+// readBoundedBody reads r into buf (which must have capacity maxBytes+1) and
+// returns at most maxBytes+1 bytes; a result longer than maxBytes means the
+// body was too large.
 func readBoundedBody(r io.Reader, buf []byte, maxBytes int) ([]byte, error) {
-	if maxBytes < 1 || cap(buf) < maxBytes+1 {
+	if cap(buf) != maxBytes+1 {
 		return nil, errors.New("invalid body buffer")
 	}
 	buf = buf[:0]
-	for {
-		if len(buf) == cap(buf) {
-			return buf, nil
-		}
+	for len(buf) < cap(buf) {
 		n, err := r.Read(buf[len(buf):cap(buf)])
-		if n > 0 {
-			buf = buf[:len(buf)+n]
-			if len(buf) > maxBytes {
-				return buf, nil
-			}
-		}
+		buf = buf[:len(buf)+n]
 		if err != nil {
 			if err == io.EOF {
 				return buf, nil
@@ -548,12 +601,11 @@ func readBoundedBody(r io.Reader, buf []byte, maxBytes int) ([]byte, error) {
 			return nil, io.ErrNoProgress
 		}
 	}
+	return buf, nil
 }
-func isValidDoHGetParameter(value string, maxBytes int64) bool {
-	if value == "" || maxBytes <= 0 || maxBytes > maxDNSMessageBytes {
-		return false
-	}
-	if int64(len(value)) > int64(base64.RawURLEncoding.EncodedLen(int(maxBytes))) {
+
+func isValidDoHGetParameter(value string) bool {
+	if value == "" || len(value) > base64.RawURLEncoding.EncodedLen(maxDNSMessageBytes) {
 		return false
 	}
 	remainder := len(value) & 3
@@ -566,7 +618,7 @@ func isValidDoHGetParameter(value string, maxBytes int64) bool {
 	} else if remainder == 3 {
 		decodedLen += 2
 	}
-	if decodedLen < minDNSMessageBytes || int64(decodedLen) > maxBytes {
+	if decodedLen < minDNSMessageBytes || decodedLen > maxDNSMessageBytes {
 		return false
 	}
 	for i := 0; i < len(value); i++ {
@@ -576,9 +628,11 @@ func isValidDoHGetParameter(value string, maxBytes int64) bool {
 	}
 	return true
 }
+
 func isStrictDoHContentType(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(value), "application/dns-message")
 }
+
 // probeFailed records a failed readiness probe and returns false. A probe
 // aborted because the caller went away (parent canceled) says nothing about
 // backend health, so it is not counted.
@@ -588,28 +642,19 @@ func (g *gateway) probeFailed(parent context.Context) bool {
 	}
 	return false
 }
+
 func (g *gateway) backendReady(parent context.Context) bool {
 	ctx, cancel := context.WithTimeout(parent, defaultReadyProbeTimeout)
 	defer cancel()
 	query, wantID := buildReadinessDNSQuery(g.probeSeq.Add(1))
 	question := query[12:]
-	probeURL, ok := g.backendRequestURL(base64.RawURLEncoding.EncodeToString(query))
-	if !ok {
-		return g.probeFailed(parent)
-	}
+	probeURL := g.backendRequestURL(base64.RawURLEncoding.EncodeToString(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		return g.probeFailed(parent)
 	}
 	req.Header.Set("Accept", "application/dns-message")
-	client := g.readyClient
-	if client == nil {
-		client = g.client
-	}
-	if client == nil {
-		return g.probeFailed(parent)
-	}
-	resp, err := client.Do(req)
+	resp, err := g.readyClient.Do(req)
 	if err != nil {
 		return g.probeFailed(parent)
 	}
@@ -624,15 +669,16 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	g.metrics.readyPassTotal.Add(1)
 	return true
 }
+
+// buildReadinessDNSQuery builds "A readinessProbeName" with the given ID.
 func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
-	label := "ready-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.FormatUint(seq, 36)
 	id := uint16(seq)
 	query := make([]byte, 12, 64)
 	query[0] = byte(id)
 	query[1] = byte(id >> 8)
 	query[2] = 0x01
 	query[5] = 0x01
-	for _, part := range []string{label, "example", "com"} {
+	for _, part := range strings.Split(readinessProbeName, ".") {
 		query = append(query, byte(len(part)))
 		query = append(query, part...)
 	}
@@ -641,6 +687,10 @@ func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
 	query = append(query, 0, 1)
 	return query, id
 }
+
+// isUsableDNSProbeResponse accepts only the local answer: matching ID, QR set,
+// NOERROR, one echoed question and at least one answer record. NXDOMAIN means
+// the readiness rule is missing and the query leaked to the upstreams.
 func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if len(msg) < 12+len(question) {
 		return false
@@ -652,33 +702,25 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if msg[2]&0x80 == 0 {
 		return false
 	}
-	rcode := msg[3] & 0x0f
-	if rcode != 0 && rcode != 3 {
+	if msg[3]&0x0f != 0 {
 		return false
 	}
 	if msg[4] != 0 || msg[5] != 1 {
 		return false
 	}
+	if msg[6] == 0 && msg[7] == 0 {
+		return false
+	}
 	return bytes.Equal(msg[12:12+len(question)], question)
 }
+
 func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	m := &g.metrics
-	queueSamples := m.queueWaitSamples.Load()
-	queueNanos := m.queueWaitNanos.Load()
-	backendSamples := m.backendLatencySamples.Load()
-	backendNanos := m.backendLatencyNanos.Load()
-	avgQueueSeconds := 0.0
-	if queueSamples != 0 {
-		avgQueueSeconds = float64(queueNanos) / float64(queueSamples) / float64(time.Second)
-	}
-	avgBackendSeconds := 0.0
-	if backendSamples != 0 {
-		avgBackendSeconds = float64(backendNanos) / float64(backendSamples) / float64(time.Second)
-	}
 	var b strings.Builder
 	b.Grow(4096)
+	fmt.Fprintf(&b, "# HELP doh_gateway_build_info Gateway build information.\n# TYPE doh_gateway_build_info gauge\ndoh_gateway_build_info{version=%q} 1\n", version)
 	fmt.Fprintf(&b, "# HELP doh_gateway_requests_total Total DoH requests received.\n# TYPE doh_gateway_requests_total counter\ndoh_gateway_requests_total %d\n", m.requestsTotal.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_rate_limited_total Requests rejected by the per-client rate limiter.\n# TYPE doh_gateway_rate_limited_total counter\ndoh_gateway_rate_limited_total %d\n", m.rateLimitedTotal.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total %d\n", m.activeRejectedTotal.Load())
@@ -696,58 +738,72 @@ doh_gateway_responses_total{class="5xx"} %d
 doh_gateway_ready_probe_total{result="ready"} %d
 doh_gateway_ready_probe_total{result="not_ready"} %d
 `, m.readyPassTotal.Load(), m.readyFailTotal.Load())
-	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total %.6f\n", float64(queueNanos)/float64(time.Second))
-	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total %d\n", queueSamples)
-	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_avg Average processing-slot wait time for admitted requests.\n# TYPE doh_gateway_queue_wait_seconds_avg gauge\ndoh_gateway_queue_wait_seconds_avg %.6f\n", avgQueueSeconds)
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total time of valid MosDNS answers (request sent until the 2xx DNS body was fully read and validated).\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(backendNanos)/float64(time.Second))
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total Valid MosDNS answers included in the latency total.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", backendSamples)
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_avg Average time of valid MosDNS answers.\n# TYPE doh_gateway_backend_latency_seconds_avg gauge\ndoh_gateway_backend_latency_seconds_avg %.6f\n", avgBackendSeconds)
+	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total %.6f\n", float64(m.queueWaitNanos.Load())/float64(time.Second))
+	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total %d\n", m.queueWaitSamples.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total time of valid MosDNS answers (request sent until the 2xx DNS body was fully read and validated).\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(m.backendLatencyNanos.Load())/float64(time.Second))
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total Valid MosDNS answers included in the latency total.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", m.backendLatencySamples.Load())
 	_, _ = io.WriteString(w, b.String())
 }
-func extractClientIP(r *http.Request, preferredHeader string) string {
+
+// extractClientIP returns the client address, or the zero Addr if none can
+// be determined. With a trusted header, the last entry of its last value is
+// used (the address the trusted proxy appended), then X-Real-IP.
+func extractClientIP(r *http.Request, preferredHeader string) netip.Addr {
 	if preferredHeader != "" {
 		if values := r.Header.Values(preferredHeader); len(values) != 0 {
 			value := values[len(values)-1]
 			if comma := strings.LastIndexByte(value, ','); comma >= 0 {
 				value = value[comma+1:]
 			}
-			if ip := net.ParseIP(strings.TrimSpace(value)); ip != nil {
-				return ip.String()
+			if ip, err := netip.ParseAddr(strings.TrimSpace(value)); err == nil {
+				return ip.Unmap()
 			}
 		}
 		if raw := r.Header.Get("X-Real-IP"); raw != "" {
-			if ip := net.ParseIP(strings.TrimSpace(raw)); ip != nil {
-				return ip.String()
+			if ip, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil {
+				return ip.Unmap()
 			}
 		}
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if ip := net.ParseIP(host); ip != nil {
-			return ip.String()
-		}
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		return ap.Addr().Unmap()
 	}
-	return "unknown"
+	return netip.Addr{}
 }
-func rateLimitKey(ip string) string {
-	parsed := net.ParseIP(ip)
-	if parsed == nil || parsed.To4() != nil {
-		return ip
+
+// rateLimitKey keys IPv4 clients by address and IPv6 clients by /64.
+func rateLimitKey(ip netip.Addr) string {
+	if !ip.IsValid() {
+		return "unknown"
 	}
-	return parsed.Mask(net.CIDRMask(64, 128)).String()
+	if ip.Is4() {
+		return ip.String()
+	}
+	p, err := ip.WithZone("").Prefix(64)
+	if err != nil {
+		return ip.String()
+	}
+	return p.Addr().String()
 }
+
 func methodNotAllowed(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
+
 func writeText(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, body)
 }
+
+// copyResponseHeaders relays backend headers except hop-by-hop headers,
+// Content-Length (recomputed) and X-Content-Type-Options (set by the gateway).
 func copyResponseHeaders(dst, src http.Header) {
 	connectionTokens := connectionHeaderTokens(src)
 	for k, values := range src {
-		if isHopByHopHeader(k) || connectionTokens[strings.ToLower(k)] || strings.EqualFold(k, "Content-Length") {
+		if isHopByHopHeader(k) || connectionTokens[strings.ToLower(k)] ||
+			strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "X-Content-Type-Options") {
 			continue
 		}
 		for _, v := range values {
@@ -755,6 +811,7 @@ func copyResponseHeaders(dst, src http.Header) {
 		}
 	}
 }
+
 func connectionHeaderTokens(h http.Header) map[string]bool {
 	values := h.Values("Connection")
 	if len(values) == 0 {
@@ -771,6 +828,7 @@ func connectionHeaderTokens(h http.Header) map[string]bool {
 	}
 	return tokens
 }
+
 func isHopByHopHeader(name string) bool {
 	switch strings.ToLower(name) {
 	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
@@ -779,22 +837,26 @@ func isHopByHopHeader(name string) bool {
 		return false
 	}
 }
+
 func isTimeoutError(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
+
 func noRedirect(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }
+
 func envString(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
 	}
 	return fallback
 }
+
 func normalizeListenAddr(value string) string {
 	v := strings.TrimSpace(value)
 	if v == "" {
@@ -808,6 +870,7 @@ func normalizeListenAddr(value string) string {
 	}
 	return v
 }
+
 func envInt(key string, fallback int) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -820,6 +883,7 @@ func envInt(key string, fallback int) int {
 	}
 	return n
 }
+
 func envDuration(key string, fallback time.Duration) time.Duration {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -832,20 +896,18 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	return d
 }
-func newHTTPClient(maxConns int, responseHeaderTimeout time.Duration) *http.Client {
-	if maxConns < 1 {
-		maxConns = defaultConcurrency
-	}
+
+// newHTTPClient returns a client for the loopback MosDNS backend. Request
+// deadlines come from the per-request context, so no transport-level
+// timeouts are set. The idle timeout (15 s) stays below MosDNS's listener
+// idle_timeout (20 s) so the client always closes an idle connection first.
+func newHTTPClient(maxConns int) *http.Client {
 	transport := &http.Transport{
-		Proxy:                 nil,
-		MaxIdleConns:          maxConns,
-		MaxIdleConnsPerHost:   maxConns,
-		MaxConnsPerHost:       maxConns,
-		IdleConnTimeout:       15 * time.Second,
-		TLSHandshakeTimeout:   3 * time.Second,
-		ResponseHeaderTimeout: responseHeaderTimeout,
-		DisableCompression:    true,
-		ForceAttemptHTTP2:     false,
+		MaxIdleConns:        maxConns,
+		MaxIdleConnsPerHost: maxConns,
+		MaxConnsPerHost:     maxConns,
+		IdleConnTimeout:     15 * time.Second,
+		DisableCompression:  true,
 	}
 	return &http.Client{Transport: transport, CheckRedirect: noRedirect}
 }
@@ -853,85 +915,68 @@ func newHTTPClient(maxConns int, responseHeaderTimeout time.Duration) *http.Clie
 // serverWriteTimeout keeps the server's write deadline above the longest time
 // a request may legitimately spend: reading its body, waiting for a slot, and
 // waiting for MosDNS. The body-read budget is included explicitly because the
-// write deadline starts when the request headers are read, so it is already
-// running while the handler reads a slow POST body. Without this, an enlarged
-// QUEUE_WAIT or UPSTREAM_TIMEOUT (or a slow upload) would be cut off by the
-// connection deadline, and the client would see a dropped connection instead
-// of 503/504.
-func serverWriteTimeout(readTimeout, queueWait, upstreamTimeout time.Duration) time.Duration {
-	if need := readTimeout + queueWait + upstreamTimeout + 2*time.Second; need > defaultWriteTimeout {
+// write deadline starts when the request headers are read.
+func serverWriteTimeout(bodyReadTimeout, queueWait, upstreamTimeout time.Duration) time.Duration {
+	if need := bodyReadTimeout + queueWait + upstreamTimeout + 2*time.Second; need > defaultWriteTimeout {
 		return need
 	}
 	return defaultWriteTimeout
 }
-func newReadinessClient() *http.Client {
-	transport := &http.Transport{
-		Proxy:                 nil,
-		MaxIdleConns:          1,
-		MaxIdleConnsPerHost:   1,
-		MaxConnsPerHost:       1,
-		IdleConnTimeout:       10 * time.Second,
-		TLSHandshakeTimeout:   500 * time.Millisecond,
-		ResponseHeaderTimeout: 750 * time.Millisecond,
-		DisableCompression:    true,
-		ForceAttemptHTTP2:     false,
-	}
-	return &http.Client{Transport: transport, CheckRedirect: noRedirect}
-}
+
 func main() {
-	listen := normalizeListenAddr(envString("PORT", defaultListen))
+	listen := normalizeListenAddr(os.Getenv("PORT"))
 	backend := envString("MOSDNS_DOH_URL", defaultBackend)
-	if u, err := url.Parse(backend); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		log.Fatalf("invalid MOSDNS_DOH_URL %q: want an absolute http(s) URL", backend)
-	}
 	limit := envInt("RATE_LIMIT", defaultRateLimit)
 	window := envDuration("RATE_WINDOW", defaultRateWindow)
-	processingConcurrency := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
-	maxActiveRequests := envInt("MAX_ACTIVE_REQUESTS", defaultMaxActiveRequests)
-	maxRateLimitClients := envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients)
+	processing := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
+	maxActive := envInt("MAX_ACTIVE_REQUESTS", defaultMaxActiveRequests)
 	queueWait := envDuration("QUEUE_WAIT", defaultQueueWait)
 	upstreamTimeout := envDuration("UPSTREAM_TIMEOUT", defaultUpstreamTO)
 	trustedIPHeader := envString("CLIENT_IP_HEADER", "none")
 	if strings.EqualFold(trustedIPHeader, "none") {
 		trustedIPHeader = ""
 	}
-	if processingConcurrency > maxActiveRequests {
-		log.Printf("warning: MAX_CONCURRENT_REQUESTS (%d) exceeds MAX_ACTIVE_REQUESTS (%d); requests are rejected before they can queue, so QUEUE_WAIT never applies", processingConcurrency, maxActiveRequests)
+	if processing > maxActive {
+		log.Printf("warning: MAX_CONCURRENT_REQUESTS (%d) exceeds MAX_ACTIVE_REQUESTS (%d); requests are rejected before they can queue, so QUEUE_WAIT never applies", processing, maxActive)
 	}
-	g := &gateway{
-		backendURL:       backend,
-		client:           newHTTPClient(processingConcurrency, upstreamTimeout),
-		limiter:          newFixedWindowLimiterWithMaxKeys(limit, window, maxRateLimitClients),
-		activeSlots:      make(chan struct{}, maxActiveRequests),
-		processingSlots:  make(chan struct{}, processingConcurrency),
-		queueWait:        queueWait,
-		upstreamTimeout:  upstreamTimeout,
-		maxRequestBytes:  maxDNSMessageBytes,
-		maxResponseBytes: maxDNSMessageBytes,
-		trustedIPHeader:  trustedIPHeader,
-		readyClient:      newReadinessClient(),
-		readyCacheTTL:    defaultReadyCacheTTL,
+	if upstreamTimeout <= 2*time.Second {
+		log.Printf("warning: UPSTREAM_TIMEOUT (%s) is not above the MosDNS server timeout (2s); slow lookups end in 504 instead of a SERVFAIL answer", upstreamTimeout)
+	}
+	g, err := newGateway(gatewayOptions{
+		BackendURL:       backend,
+		RateLimit:        limit,
+		RateWindow:       window,
+		RateLimitClients: envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients),
+		MaxActive:        maxActive,
+		Processing:       processing,
+		QueueWait:        queueWait,
+		UpstreamTimeout:  upstreamTimeout,
+		TrustedIPHeader:  trustedIPHeader,
+		ReadyCacheTTL:    defaultReadyCacheTTL,
+	})
+	if err != nil {
+		log.Fatalf("MOSDNS_DOH_URL: %v", err)
 	}
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           g,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      serverWriteTimeout(defaultReadTimeout, queueWait, upstreamTimeout),
+		WriteTimeout:      serverWriteTimeout(defaultBodyReadTimeout, queueWait, upstreamTimeout),
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	log.Printf("doh-gateway %s listening on %s, backend=%s, rate=%d/%s, active=%d, processing=%d", version, listen, backend, limit, window, maxActiveRequests, processingConcurrency)
+	log.Printf("doh-gateway %s listening on %s, backend=%s, rate=%d/%s, active=%d, processing=%d", version, listen, backend, limit, window, maxActive, processing)
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
 	select {
 	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("server failed: %v", err)
-			os.Exit(1)
-		}
+		// Shutdown is only called in the other branch, so any return here
+		// is a startup or listener failure.
+		log.Printf("server failed: %v", err)
+		os.Exit(1)
 	case <-sigCtx.Done():
 		stop()
 		log.Printf("shutdown signal received, draining in-flight requests")

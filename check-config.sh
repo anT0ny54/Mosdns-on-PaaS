@@ -55,7 +55,10 @@ def exact_bool(value, path: str) -> bool:
     return value
 def strip_comments(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-DURATION_UNIT_MS = {"Millisecond": 1, "Second": 1000, "Minute": 60000, "Hour": 3600000}
+DURATION_UNIT_MS = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000,
+                    "Millisecond": 1, "Second": 1000, "Minute": 60000, "Hour": 3600000}
+def major_minor(version: str) -> str:
+    return ".".join(version.split(".")[:2])
 def check_ip(value, path: str) -> None:
     try:
         ipaddress.ip_address(non_empty_string(value, path))
@@ -72,13 +75,15 @@ def check_listen_addr(value, path: str) -> None:
         fail(f"{path} must include a valid port from 1 to 65535")
     if parsed.path or parsed.query or parsed.fragment:
         fail(f"{path} must be a host:port address")
-def check_loopback(value: str, path: str) -> None:
+def listen_host(value: str):
     host = urlsplit("//" + value).hostname
     if host is not None and "%" in host:
         # urlsplit keeps an IPv6 zone id in the hostname ([fe80::1%eth0]
-        # parses to "fe80::1%eth0"); strip it before the loopback match so
-        # link-local loopback binds do not fail with a confusing message.
+        # parses to "fe80::1%eth0"); strip it before comparing.
         host = host.split("%", 1)[0]
+    return host
+def check_loopback(value: str, path: str) -> None:
+    host = listen_host(value)
     if host is None:
         fail(f"{path} must bind to loopback explicitly (an empty host listens on every interface)")
     if host not in {"127.0.0.1", "localhost", "::1"}:
@@ -105,6 +110,7 @@ except yaml.YAMLError as exc:
     fail(f"invalid YAML: {problem}")
 except OSError as exc:
     fail(f"cannot read {config_path}: {exc}")
+project_dir = config_path.resolve().parent
 root = expect_mapping(cfg, "root")
 log = expect_mapping(root.get("log"), "log")
 level = non_empty_string(log.get("level"), "log.level")
@@ -115,6 +121,8 @@ if api is not None:
     api = expect_mapping(api, "api")
     check_listen_addr(api.get("http"), "api.http")
     check_loopback(api["http"], "api.http")
+
+# --- plugins -----------------------------------------------------------------
 plugins = expect_list(root.get("plugins"), "plugins")
 plugin_by_tag = {}
 for index, plugin in enumerate(plugins, start=1):
@@ -122,75 +130,22 @@ for index, plugin in enumerate(plugins, start=1):
     tag = non_empty_string(plugin.get("tag"), f"plugins[{index}].tag")
     if tag in plugin_by_tag:
         fail(f"duplicate plugin tag: {tag}")
+    non_empty_string(plugin.get("type"), f"plugins[{tag}].type")
     plugin_by_tag[tag] = plugin
-required_plugins = {
-    "cache": "cache",
-    "primary_fast": "fast_forward",
-    "fallback_hagezi": "fast_forward",
-    "main_sequence": "sequence",
-}
-for tag, expected_type in required_plugins.items():
-    plugin = plugin_by_tag.get(tag)
+def plugin_of_type(tag, expected_type: str, path: str) -> dict:
+    plugin = plugin_by_tag.get(tag) if isinstance(tag, str) else None
     if plugin is None:
-        fail(f"missing plugin: {tag}")
-    actual_type = non_empty_string(plugin.get("type"), f"plugins[{tag}].type")
-    if actual_type != expected_type:
-        fail(f"plugin {tag} must use type {expected_type}")
-cache = expect_mapping(plugin_by_tag["cache"].get("args"), "plugins[cache].args")
-if exact_int(cache.get("size"), "plugins[cache].args.size") <= 0:
-    fail("plugins[cache].args.size must be greater than 0")
-if exact_int(cache.get("lazy_cache_ttl"), "plugins[cache].args.lazy_cache_ttl") < 0:
-    fail("plugins[cache].args.lazy_cache_ttl must not be negative")
-if exact_int(cache.get("lazy_cache_reply_ttl"), "plugins[cache].args.lazy_cache_reply_ttl") < 0:
-    fail("plugins[cache].args.lazy_cache_reply_ttl must not be negative")
-exact_bool(cache.get("cache_everything"), "plugins[cache].args.cache_everything")
-if cache.get("when_hit") != "_return":
-    fail("plugins[cache].args.when_hit must be _return")
-for tag in ("primary_fast", "fallback_hagezi"):
-    args = expect_mapping(plugin_by_tag[tag].get("args"), f"plugins[{tag}].args")
-    upstreams = expect_list(args.get("upstream"), f"plugins[{tag}].args.upstream")
-    expected_count = 2 if tag == "primary_fast" else 1
-    if len(upstreams) != expected_count:
-        fail(f"plugins[{tag}].args.upstream must contain exactly {expected_count} entries")
-    for index, upstream in enumerate(upstreams, start=1):
-        upstream = expect_mapping(upstream, f"plugins[{tag}].args.upstream[{index}]")
-        check_upstream_addr(upstream.get("addr"), f"plugins[{tag}].args.upstream[{index}].addr")
-        check_ip(upstream.get("dial_addr"), f"plugins[{tag}].args.upstream[{index}].dial_addr")
-        # Optional: MosDNS v4.5.3 only applies pipeline to TCP/DoT upstreams,
-        # so for DoH it is a dead key -- validate it when present, but do not
-        # force it into the config.
-        if "enable_pipeline" in upstream:
-            exact_bool(upstream.get("enable_pipeline"), f"plugins[{tag}].args.upstream[{index}].enable_pipeline")
-        if exact_int(upstream.get("idle_timeout"), f"plugins[{tag}].args.upstream[{index}].idle_timeout") <= 0:
-            fail(f"plugins[{tag}].args.upstream[{index}].idle_timeout must be greater than 0")
-        if exact_int(upstream.get("max_conns"), f"plugins[{tag}].args.upstream[{index}].max_conns") <= 0:
-            fail(f"plugins[{tag}].args.upstream[{index}].max_conns must be greater than 0")
-sequence = expect_mapping(plugin_by_tag["main_sequence"].get("args"), "plugins[main_sequence].args")
-exec_chain = expect_list(sequence.get("exec"), "plugins[main_sequence].args.exec")
-if len(exec_chain) < 2 or exec_chain[0] != "cache":
-    fail("plugins[main_sequence].args.exec must start with cache")
-fallback = None
-for item in exec_chain:
-    if isinstance(item, dict) and "primary" in item:
-        fallback = item
-        break
-if fallback is None:
-    fail("plugins[main_sequence].args.exec must contain a primary/secondary fallback entry")
-primary = expect_list(fallback.get("primary"), "plugins[main_sequence].args.exec[].primary")
-secondary = expect_list(fallback.get("secondary"), "plugins[main_sequence].args.exec[].secondary")
-if primary != ["primary_fast"]:
-    fail("main sequence primary must execute primary_fast")
-if secondary != ["fallback_hagezi"]:
-    fail("main sequence secondary must execute fallback_hagezi")
-if exact_int(fallback.get("fast_fallback"), "plugins[main_sequence].args.exec[].fast_fallback") <= 0:
-    fail("main sequence fast_fallback must be greater than 0 ms")
-exact_bool(fallback.get("always_standby"), "plugins[main_sequence].args.exec[].always_standby")
+        fail(f"{path}: unknown plugin {tag!r}")
+    if plugin["type"] != expected_type:
+        fail(f"{path}: plugin {tag} must use type {expected_type}, not {plugin['type']}")
+    return plugin
+
+# --- servers -----------------------------------------------------------------
 servers = expect_list(root.get("servers"), "servers")
 if len(servers) != 1:
     fail("servers must contain exactly one server entry")
 server = expect_mapping(servers[0], "servers[0]")
-if non_empty_string(server.get("exec"), "servers[0].exec") != "main_sequence":
-    fail("servers[0].exec must be main_sequence")
+entry = non_empty_string(server.get("exec"), "servers[0].exec")
 if exact_int(server.get("timeout"), "servers[0].timeout") <= 0:
     fail("servers[0].timeout must be greater than 0 seconds")
 listeners = expect_list(server.get("listeners"), "servers[0].listeners")
@@ -209,51 +164,130 @@ if "get_user_ip_from_header" in listener:
 if "idle_timeout" in listener and exact_int(listener.get("idle_timeout"), "servers[0].listeners[0].idle_timeout") < 0:
     fail("servers[0].listeners[0].idle_timeout must not be negative")
 check_loopback(listener["addr"], "servers[0].listeners[0].addr")
-project_dir = config_path.resolve().parent
+
+# --- entry sequence: [local answers / EDNS filters]..., cache, fallback ------
+sequence = plugin_of_type(entry, "sequence", "servers[0].exec")
+seq_path = f"plugins[{entry}].args.exec"
+exec_chain = expect_list(expect_mapping(sequence.get("args"), f"plugins[{entry}].args").get("exec"), seq_path)
+LOCAL_TYPES = {"arbitrary", "hosts"}
+position = 0
+local_tags = []
+edns_filters = []
+while position < len(exec_chain):
+    item = exec_chain[position]
+    if isinstance(item, str) and item.startswith("_edns0_filter_"):
+        edns_filters.append(item)
+    elif isinstance(item, str) and item in plugin_by_tag and plugin_by_tag[item]["type"] in LOCAL_TYPES:
+        local_tags.append(item)
+    else:
+        break
+    position += 1
+if position >= len(exec_chain):
+    fail(f"{seq_path} must contain a cache plugin")
+cache_tag = exec_chain[position]
+cache = expect_mapping(plugin_of_type(cache_tag, "cache", f"{seq_path}[{position}] (expected the cache after optional local-answer/_edns0_filter_* entries)").get("args"), f"plugins[{cache_tag}].args")
+if exact_int(cache.get("size"), f"plugins[{cache_tag}].args.size") <= 0:
+    fail(f"plugins[{cache_tag}].args.size must be greater than 0")
+if exact_int(cache.get("lazy_cache_ttl"), f"plugins[{cache_tag}].args.lazy_cache_ttl") < 0:
+    fail(f"plugins[{cache_tag}].args.lazy_cache_ttl must not be negative")
+if exact_int(cache.get("lazy_cache_reply_ttl"), f"plugins[{cache_tag}].args.lazy_cache_reply_ttl") < 0:
+    fail(f"plugins[{cache_tag}].args.lazy_cache_reply_ttl must not be negative")
+if not exact_bool(cache.get("cache_everything"), f"plugins[{cache_tag}].args.cache_everything") and "_edns0_filter_no_edns0" not in edns_filters:
+    fail(f"plugins[{cache_tag}].args.cache_everything must be true: MosDNS v4 skips the cache for every query with an EDNS0 record, which nearly all DoH clients send")
+if cache.get("cache_everything") and not edns_filters:
+    fail(f"{seq_path}: with cache_everything an _edns0_filter_* entry must precede {cache_tag}, or EDNS padding/cookies fragment the cache keys")
+if cache.get("when_hit") != "_return":
+    fail(f"plugins[{cache_tag}].args.when_hit must be _return")
+fallback = None
+for item in exec_chain[position + 1:]:
+    if isinstance(item, dict) and "primary" in item:
+        fallback = item
+        break
+if fallback is None:
+    fail(f"{seq_path} must contain a primary/secondary fallback entry after {cache_tag}")
+for side in ("primary", "secondary"):
+    tags = expect_list(fallback.get(side), f"{seq_path}[].{side}")
+    if not tags:
+        fail(f"{seq_path}[].{side} must not be empty")
+    for tag in tags:
+        args = expect_mapping(plugin_of_type(tag, "fast_forward", f"{seq_path}[].{side}").get("args"), f"plugins[{tag}].args")
+        upstreams = expect_list(args.get("upstream"), f"plugins[{tag}].args.upstream")
+        if not upstreams:
+            fail(f"plugins[{tag}].args.upstream must not be empty")
+        for index, upstream in enumerate(upstreams, start=1):
+            p = f"plugins[{tag}].args.upstream[{index}]"
+            upstream = expect_mapping(upstream, p)
+            check_upstream_addr(upstream.get("addr"), f"{p}.addr")
+            if "dial_addr" in upstream:
+                check_ip(upstream.get("dial_addr"), f"{p}.dial_addr")
+            # MosDNS v4.5.3 only applies pipeline to TCP/DoT upstreams, so for
+            # DoH it is a dead key -- validate it when present only.
+            if "enable_pipeline" in upstream:
+                exact_bool(upstream.get("enable_pipeline"), f"{p}.enable_pipeline")
+            if exact_int(upstream.get("idle_timeout"), f"{p}.idle_timeout") <= 0:
+                fail(f"{p}.idle_timeout must be greater than 0")
+            if exact_int(upstream.get("max_conns"), f"{p}.max_conns") <= 0:
+                fail(f"{p}.max_conns must be greater than 0")
+if exact_int(fallback.get("fast_fallback"), f"{seq_path}[].fast_fallback") <= 0:
+    fail("main sequence fast_fallback must be greater than 0 ms")
+exact_bool(fallback.get("always_standby"), f"{seq_path}[].always_standby")
+server_timeout_ms = server["timeout"] * 1000
+if fallback["fast_fallback"] >= server_timeout_ms:
+    fail(f"fast_fallback ({fallback['fast_fallback']} ms) must be below servers[0].timeout ({server_timeout_ms} ms)")
+
+# --- main.go: readiness name and default upstream timeout ---------------------
+main_go = project_dir / "main.go"
+main_text = main_go.read_text(encoding="utf-8") if main_go.is_file() else ""
+if main_text:
+    m = re.search(r'readinessProbeName\s*=\s*"([^"]+)"', main_text)
+    if m is None:
+        fail("could not read readinessProbeName from main.go")
+    probe = m.group(1).rstrip(".").lower() + "."
+    answered = False
+    for tag in local_tags:
+        if plugin_by_tag[tag]["type"] != "arbitrary":
+            continue
+        rrs = expect_list(expect_mapping(plugin_by_tag[tag].get("args"), f"plugins[{tag}].args").get("rr"), f"plugins[{tag}].args.rr")
+        for rr in rrs:
+            fields = non_empty_string(rr, f"plugins[{tag}].args.rr[]").split()
+            if fields and fields[0].lower() == probe and "A" in fields[1:4]:
+                answered = True
+    if not answered:
+        fail(f"no arbitrary plugin before {cache_tag} answers 'A {probe}' (main.go readinessProbeName); /readyz would depend on the public upstreams")
+
+# --- Dockerfile cross-checks -------------------------------------------------
 dockerfile = project_dir / "Dockerfile"
-dockerfile_exists = dockerfile.is_file()
-dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile_exists else ""
-if dockerfile_exists:
+dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
+if dockerfile_text:
     match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", dockerfile_text)
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
     backend = urlsplit(match.group(1).rstrip("\\"))
+    listener_host = listen_host(listener["addr"])
     listener_port = urlsplit("//" + listener["addr"]).port
+    if backend.hostname != listener_host:
+        fail(f"Dockerfile MOSDNS_DOH_URL host {backend.hostname} does not match listener host {listener_host}")
     if backend.port != listener_port:
         fail(f"Dockerfile MOSDNS_DOH_URL port {backend.port} does not match listener port {listener_port}")
     if backend.path != listener["url_path"]:
         fail(f"Dockerfile MOSDNS_DOH_URL path {backend.path!r} does not match listener url_path {listener['url_path']!r}")
-server_timeout_ms = server["timeout"] * 1000
-if fallback["fast_fallback"] >= server_timeout_ms:
-    fail(
-        f"fast_fallback ({fallback['fast_fallback']} ms) must be below servers[0].timeout ({server_timeout_ms} ms)"
-    )
 gateway_timeout_ms = None
 if re.search(r"\bUPSTREAM_TIMEOUT=", dockerfile_text):
     env_match = re.search(r"\bUPSTREAM_TIMEOUT=(\d+(?:\.\d+)?)(ms|s|m|h)\b", dockerfile_text)
     if env_match is None:
         fail("Dockerfile sets UPSTREAM_TIMEOUT in a format this check cannot read; use <number>ms, <number>s, <number>m or <number>h")
-    gateway_timeout_ms = float(env_match.group(1)) * {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}[env_match.group(2)]
+    gateway_timeout_ms = float(env_match.group(1)) * DURATION_UNIT_MS[env_match.group(2)]
 else:
-    main_go = project_dir / "main.go"
-    if not main_go.is_file():
+    if not main_text:
         fail("main.go not found next to the config; cannot verify the gateway UPSTREAM_TIMEOUT default")
-    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_go.read_text(encoding="utf-8"))
+    go_match = re.search(r"defaultUpstreamTO\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_text)
     if go_match is None:
         fail("could not read defaultUpstreamTO from main.go (expected '<n> * time.Millisecond', '<n> * time.Second', '<n> * time.Minute' or '<n> * time.Hour'); the timeout-chain check failed")
     gateway_timeout_ms = float(go_match.group(1)) * DURATION_UNIT_MS[go_match.group(2)]
 if server_timeout_ms >= gateway_timeout_ms:
-    fail(
-        f"servers[0].timeout ({server_timeout_ms} ms) must be below the gateway UPSTREAM_TIMEOUT ({gateway_timeout_ms:g} ms)"
-    )
-version_file = project_dir / "VERSION"
-if version_file.is_file() and dockerfile_text:
-    file_version = version_file.read_text(encoding="utf-8").strip()
-    arg_match = re.search(r"^ARG[ \t]+GATEWAY_VERSION=(\S+)", dockerfile_text, re.MULTILINE)
-    if arg_match is None:
-        fail("Dockerfile does not declare a default ARG GATEWAY_VERSION")
-    if arg_match.group(1) != file_version:
-        fail(f"Dockerfile GATEWAY_VERSION {arg_match.group(1)} does not match VERSION {file_version}")
+    fail(f"servers[0].timeout ({server_timeout_ms} ms) must be below the gateway UPSTREAM_TIMEOUT ({gateway_timeout_ms:g} ms)")
+
+# --- Go version consistency (major.minor) ------------------------------------
 go_versions = {}
 go_mod = project_dir / "go.mod"
 if go_mod.is_file():
@@ -270,7 +304,7 @@ if go_mod.is_file():
     if ci_file.is_file():
         for n, m in enumerate(re.finditer(r"^\s*go-version:\s*[\"']?([^\s\"'#]+)", ci_file.read_text(encoding="utf-8"), re.MULTILINE), 1):
             go_versions[f"ci.yml go-version #{n}"] = m.group(1)
-    if len(set(go_versions.values())) > 1:
+    if len({major_minor(v) for v in go_versions.values()}) > 1:
         fail("Go versions disagree (keep them in sync): " + ", ".join(f"{k}={v}" for k, v in go_versions.items()))
 print("YAML parsed successfully; MosDNS project schema checks: OK")
 PYTHON

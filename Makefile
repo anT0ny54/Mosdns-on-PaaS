@@ -3,10 +3,15 @@ IMAGE ?= $(PROJECT):local
 VERSION := $(shell cat VERSION)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: test check-config entrypoint-test vet build docker-build run clean
+.PHONY: test fmt-check check-config entrypoint-test vet build docker-build run clean
 
-test: check-config entrypoint-test vet
-	go test ./...
+# Unit tests always run with the race detector: the gateway is heavily
+# concurrent (slots, limiter, shared readiness probe).
+test: fmt-check check-config entrypoint-test vet
+	go test -race ./...
+
+fmt-check:
+	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 
 check-config:
 	sh ./check-config.sh mosdns.yaml

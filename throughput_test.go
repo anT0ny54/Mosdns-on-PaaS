@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-func BenchmarkGateway5000RPS(b *testing.B) {
-	srv, client, cleanup := throughputHarness()
+func BenchmarkGatewayParallelPOST(b *testing.B) {
+	srv, client, cleanup := throughputHarness(b)
 	defer srv.Close()
 	defer client.CloseIdleConnections()
 	defer cleanup()
@@ -46,7 +46,7 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 	const warmup = 1000
 	const requests = 10000
 	const target = 5000.0
-	srv, client, cleanup := throughputHarness()
+	srv, client, cleanup := throughputHarness(t)
 	defer srv.Close()
 	defer client.CloseIdleConnections()
 	defer cleanup()
@@ -96,25 +96,16 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 		t.Fatalf("throughput %.0f RPS is below target %.0f RPS", rps, target)
 	}
 }
-func throughputHarness() (*httptest.Server, *http.Client, func()) {
+func throughputHarness(tb testing.TB) (*httptest.Server, *http.Client, func()) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write([]byte(testDNSBody))
 	}))
-	limiter := newFixedWindowLimiterWithMaxKeys(100000, time.Minute, defaultRateLimitClients)
-	limiter.now = func() time.Time { return time.Unix(120, 0) }
-	g := &gateway{
-		backendURL:       backend.URL,
-		client:           newHTTPClient(defaultConcurrency, defaultUpstreamTO),
-		limiter:          limiter,
-		activeSlots:      make(chan struct{}, defaultMaxActiveRequests),
-		processingSlots:  make(chan struct{}, defaultConcurrency),
-		queueWait:        defaultQueueWait,
-		upstreamTimeout:  defaultUpstreamTO,
-		maxRequestBytes:  maxDNSMessageBytes,
-		maxResponseBytes: maxDNSMessageBytes,
-		trustedIPHeader:  "X-Forwarded-For",
-	}
+	g := newTestGateway(tb, gatewayOptions{
+		BackendURL:      backend.URL,
+		RateLimit:       100000,
+		TrustedIPHeader: "X-Forwarded-For",
+	})
 	server := httptest.NewServer(g)
 	client := &http.Client{Transport: &http.Transport{
 		MaxIdleConns:        128,

@@ -1,4 +1,9 @@
 # MosDNS v4.5.3
+# Readiness: "ready.doh-gateway.invalid A" is answered locally (never cached,
+# never sent upstream), so the gateway's /readyz checks MosDNS itself and an
+# upstream outage cannot make the platform restart the container.
+# EDNS: every option except ECS is stripped before the cache key is built, so
+# clients that send EDNS0 (padding, cookies) share cache entries.
 # Primary: race two HaGeZi DoH endpoints and use the first response.
 # Fallback: if the primary has not produced a usable answer within 400 ms, also
 # query the standby HaGeZi endpoint and use whichever answers first.
@@ -9,13 +14,24 @@ log:
   file: ""
 
 plugins:
+  # Must answer the gateway's readinessProbeName (main.go); check-config.sh
+  # verifies that both agree.
+  - tag: readiness
+    type: arbitrary
+    args:
+      rr:
+        - "ready.doh-gateway.invalid. 0 IN A 127.0.0.1"
+
   - tag: cache
     type: cache
     args:
       size: 32768
       lazy_cache_ttl: 3600
       lazy_cache_reply_ttl: 30
-      cache_everything: false
+      # MosDNS v4 only caches "simple" queries unless this is true, and an
+      # EDNS0 OPT record (sent by nearly every DoH client) makes a query
+      # non-simple; the EDNS filter below keeps the keys stable.
+      cache_everything: true
       when_hit: _return
 
   - tag: primary_fast
@@ -44,6 +60,8 @@ plugins:
     type: sequence
     args:
       exec:
+        - readiness
+        - _edns0_filter_ecs_only
         - cache
         - primary:
             - primary_fast

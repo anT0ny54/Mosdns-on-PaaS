@@ -107,4 +107,18 @@ kill -TERM "$ENTRY"; wait_exit 15
 check "stubborn child escalated to KILL" 0
 check_gone "stubborn child escalated to KILL"
 
+# 6. MosDNS exits on its own while the gateway ignores TERM: the gateway is
+#    KILLed after its grace period and the exit code stays 1.
+run_entry exit stubborn
+wait_exit 15
+check "exiting MosDNS, stubborn gateway escalated to KILL" 1
+check_gone "exiting MosDNS, stubborn gateway escalated to KILL"
+
+# 7. A TERM that arrives during the crash teardown must not turn exit 1 into 0.
+run_entry exit stubborn
+sleep 2
+kill -TERM "$ENTRY" 2>/dev/null; wait_exit 15
+check "TERM during crash teardown keeps exit 1" 1
+check_gone "TERM during crash teardown keeps exit 1"
+
 exit "$fail"

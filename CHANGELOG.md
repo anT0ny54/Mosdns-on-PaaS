@@ -1,128 +1,98 @@
 # Changelog
 
-## Unreleased
+## 0.5.12 — 2026-10-14
 
-Review pass over the whole project (code, scripts, Dockerfile, CI, docs). No
-runtime change: `main.go`, `entrypoint.sh`, the Dockerfile, `mosdns.yaml`,
-`check-config.sh`, `VERSION` and the Go tests are untouched, so the image
-behaves exactly as 0.5.11. To release this as 0.5.12, bump `VERSION` and the
-Dockerfile's `ARG GATEWAY_VERSION` together (`check-config.sh` requires it) and
-rename this heading.
-
-### Changed
-- `test-entrypoint.sh` now also checks, after every scenario, that neither fake
-  child is still running. Before, it only compared the entrypoint's exit code,
-  so it could not detect the entrypoint exiting 1 while leaving the other
-  child alive, or skipping the `KILL` escalation for a child that ignores
-  `TERM`, even though the README and the 0.5.11 notes described both as
-  checked. Verified by mutation: removing the `KILL` step and removing the
-  "stop the other child" step each make the test fail (the second mutation
-  passed the old test).
-- CI: `actions/checkout` is `@v5` in all three jobs (the Keep-Alive workflow
-  already used it), and the two `actions/setup-go` steps set `cache: false`.
-  The module has no dependencies and no `go.sum`, so the cache step could only
-  warn that it had nothing to key on.
-
-### Docs
-- README: the write deadline is described correctly. It is the full request
-  budget (5 s body read + `QUEUE_WAIT` + `UPSTREAM_TIMEOUT` + 2 s) with an 8 s
-  floor, which is 9.6 s with the default settings; the old wording implied 8 s
-  was the default. The code was already right.
-- README: the entrypoint test description lists what is actually asserted
-  (exit code and no surviving child).
-- README: new "Repository automation" section for the Keep-Alive workflow and
-  `keep-alive.txt`, which were undocumented, and the CI cache setting.
-
-### Reviewed and left as-is
-- **Dead code:** none found. Every function and constant in `main.go` is used.
-  The nil-client fallbacks in `backendReady` are reached by tests that build a
-  gateway without a `readyClient`; the per-gateway `maxRequestBytes` and
-  `maxResponseBytes` fields are set by the tests; the always-zero `3xx` series
-  and the double `resp.Body.Close()` stay for the reasons given under 0.5.11.
-- **Config and version conflicts:** none. `check-config.sh` passes, and the
-  Go version (`go.mod`, Dockerfile, CI), `VERSION` and the Dockerfile's
-  `GATEWAY_VERSION`, the `MOSDNS_DOH_URL` port and path, and the timeout chain
-  (400 ms < 2 s < 2.5 s) all agree.
-- **Client-IP fallback (behavior to be aware of):** with `CLIENT_IP_HEADER`
-  set, a request that has no valid value in that header falls back to
-  `X-Real-IP`, which a client can forge when the container is reachable without
-  the trusted proxy. Behind the proxy this cannot be triggered, because the
-  proxy always appends a valid address. The behavior is documented, covered by
-  `TestClientIPHeaderInvalidFallsBackToRealIP`, and unchanged.
-- **Rate-limiter key cap:** once `RATE_LIMIT_CLIENTS` distinct keys are in a
-  window, new clients are denied until the window rolls over. This is the
-  documented trade-off for bounded memory.
-
-### Not verified in this review
-- The Go test suite, `go vet` and the Docker build were not run (no Go
-  toolchain or network in the review environment). `check-config.sh` and
-  `test-entrypoint.sh` were run and pass under `dash`; neither was run under
-  BusyBox ash or in CI.
-
-## 0.5.11 — 2026-10-14
-
-Supervision fix: the entrypoint now notices a child killed by a signal, a
-readiness-probe metrics fix, and consistency checks for the Go version.
+Fixes from a full-project review: cache, readiness, shutdown timing, slow
+uploads, and supply-chain pinning.
 
 ### Fixed
-- **The entrypoint did not detect a child killed by a signal.** It waited with
-  `wait -n`, which BusyBox ash does not return from when a child dies from a
-  signal (OOM kill, SIGSEGV, SIGKILL). If MosDNS was killed, the container kept
-  running with only the gateway and nothing restarted it. The loop now polls
-  both children once per second and treats an exited, killed or zombie process
-  (state read from `/proc`, `kill -0` only if `/proc` is missing) as gone; it
-  then stops the other child and exits 1, as before. Shutdown no longer uses a
-  background watchdog subshell (which could add up to 15 s when the child was
-  already dead): each child gets `TERM`, is polled every 0.2 s for its grace
-  period (gateway 15 s, MosDNS 5 s), is `KILL`ed if still alive, and is reaped.
-- **`/readyz` counted a probe that the client abandoned.** When the client
-  disconnected mid-probe, the aborted probe was added to
-  `doh_gateway_ready_probe_total{result="not_ready"}` and a `503` was written
-  and counted for a client that was gone. A canceled probe is no longer counted
-  as a failure and `/readyz` returns without writing a response in that case.
-  Real failures (unreachable backend, bad status, wrong content type, invalid
-  answer, probe timeout) are counted as before. Regression test:
-  `TestReadyProbeCanceledByClientIsNotCounted`.
-
-### Added
-- `test-entrypoint.sh` (`make entrypoint-test`, part of `make test` and CI): runs
-  the real `entrypoint.sh` against fake children and checks TERM shutdown
-  (exit 0), a SIGKILLed MosDNS, a SIGKILLed gateway, a child that exits on its
-  own (each exit 1), and KILL escalation for a child that ignores TERM.
-- `entrypoint.sh` reads optional `MOSDNS_BIN` and `GATEWAY_BIN` (defaults are
-  the installed paths) so the test can substitute fake children.
-- Startup warning when `MAX_CONCURRENT_REQUESTS` is greater than
-  `MAX_ACTIVE_REQUESTS`: requests are rejected before they can queue, so
-  `QUEUE_WAIT` never applies. Behavior is unchanged.
-- `check-config.sh` verifies that the Go version in `go.mod`, the Dockerfile's
-  `GATEWAY_GO_VERSION` and every `go-version` in `.github/workflows/ci.yml`
-  agree. They were documented as "keep in sync" but not checked.
+- **The cache almost never hit.** MosDNS v4.5.3 skips the cache for any query
+  carrying an EDNS0 OPT record unless `cache_everything` is set, and nearly
+  every DoH client sends one. With `cache_everything` alone, per-query EDNS
+  padding and cookies still split the cache keys. `mosdns.yaml` now runs
+  `_edns0_filter_ecs_only` before a `cache_everything: true` cache. Measured
+  end to end through the gateway: repeat queries went from ~100-170 ms
+  (upstream) to under 1 ms.
+- **`/readyz` depended on the public upstreams.** Each probe was a unique name
+  that went to HaGeZi, so an upstream outage failed the health check and the
+  platform restarted a healthy container (Koyeb restarts after 3 failed
+  checks). The probe is now a fixed `A ready.doh-gateway.invalid`, answered
+  locally by a new `readiness` (`arbitrary`) plugin before the cache. The
+  gateway requires NOERROR with at least one answer, so an NXDOMAIN (local rule
+  missing) is reported as not ready. Verified: with all upstreams unreachable,
+  `/readyz` stays 200 (queries return SERVFAIL after 2 s); with MosDNS down it
+  returns 503.
+- **Concurrent `/readyz` calls queued behind each other.** Callers now share
+  one in-flight probe, and each still honours its own request context.
+- **Shutdown did not fit Docker's 10 s stop timeout.** The gateway drain is now
+  4 s (was 10 s), and the entrypoint graces are 6 s and 3 s (were 15 s and 5 s).
+- **A TERM during crash teardown turned exit 1 into exit 0.** The supervision
+  loop now ignores further signals once it is tearing down after a child
+  died. New entrypoint test scenarios 6 and 7 cover this; the test fails if
+  the fix is removed.
+- **A slow POST body held an active slot for the whole 5 s ReadTimeout.** The
+  body now has a 2 s read deadline; a slower upload gets `400` (`Connection:
+  close`) and frees its slot. The deadline is cleared after the body is read,
+  so it cannot cancel a slow upstream answer (covered by a test).
+- **`X-Forwarded-For: unknown` was sent to MosDNS** when the client address
+  could not be parsed; the header is now only sent with a valid IP.
+  IPv4-mapped IPv6 clients are normalised to IPv4.
+- **Duplicate `X-Content-Type-Options`** when MosDNS also set it; the gateway
+  now sets it once.
+- **The limiter map never shrank** after a spike of distinct clients; it is
+  reallocated at window rollover when it held more than 4096 keys.
+- **`ListenAndServe` errors other than `ErrServerClosed` exited 0**; any
+  unexpected return now exits 1. A startup warning is logged when
+  `UPSTREAM_TIMEOUT` is not above the MosDNS server timeout.
 
 ### Changed
-- The two identical "bad upstream request" paths in the gateway share one
-  helper (`badUpstreamRequest`); the response (`502`, short text body) and the
-  backend-error count are unchanged.
-- CI declares `permissions: contents: read` and cancels runs superseded by a
-  newer push to the same ref.
-- `.dockerignore` also excludes `test-entrypoint.sh`, the `doh-gateway` binary
-  and `.env` from the build context.
-- `.gitattributes` forces LF for the Dockerfile, Makefile, `VERSION` and
-  `.dockerignore`, so a Windows checkout cannot break `cat VERSION` or `make`.
-- The tini comment in the Dockerfile now sits next to `ENTRYPOINT` and
-  describes the polling supervision.
-- `VERSION` / `ARG GATEWAY_VERSION` bumped to 0.5.11 (together, as
-  `check-config.sh` requires).
+- Gateway internals: a `newGateway(options)` constructor validates the backend
+  URL once at startup (an invalid `MOSDNS_DOH_URL` now fails at start instead
+  of on every request) and replaces the lazy `sync.Once`, the per-gateway
+  size-limit fields and the constructor fallbacks. The pooled-request-body
+  wrapper was replaced by an exact-size copy, which is simpler and about 12%
+  faster in the POST benchmark. The transport no longer sets
+  `ResponseHeaderTimeout` (the per-request context timeout already covers it),
+  and `IdleConnTimeout` is 15 s, below MosDNS's 20 s, so the gateway never
+  reuses a connection MosDNS is closing.
+- The write deadline is 2 s body read + `QUEUE_WAIT` + `UPSTREAM_TIMEOUT` + 2 s,
+  with an 8 s floor, which is the effective default (was 9.6 s).
+- Metrics: the `*_seconds_avg` gauges are removed (compute
+  `_seconds_total / _samples_total` in the scraper); new
+  `doh_gateway_build_info{version="..."}`.
+- Dockerfile: every base image is pinned by multi-arch digest; builder stages
+  run on `$BUILDPLATFORM` and cross-compile (GOARM only for 32-bit arm); the
+  version is read from `VERSION`, so `VERSION` is the single source of truth
+  and plain `docker build` (Koyeb) gets it too; the MosDNS config is
+  root-owned and read-only (`0444`); the label is renamed to
+  `io.github.ant0ny54.mosdns.version`.
+- `check-config.sh` validates the layout generically instead of fixed tag
+  names. It checks that the cache and EDNS filter are set up, that the
+  readiness rule matches `main.go`, and that the `MOSDNS_DOH_URL` host
+  matches. Go versions are compared on major.minor, and the obsolete
+  VERSION/`GATEWAY_VERSION` check is gone.
+- `entrypoint.sh` `is_alive` uses only shell builtins (no `sed` fork per poll).
+- `make test` adds a gofmt check and runs `go test -race`; CI drops the
+  separate race job and builds the image with Buildx and the GitHub Actions
+  cache. New `.github/dependabot.yml` covers Docker digests and Actions.
+- `test-entrypoint.sh` now also checks, after every scenario, that neither
+  fake child is still running (not only the exit code).
+- Tests: shared constructors, duplicate tests merged, and new tests for every
+  fix above. The benchmark is renamed `BenchmarkGatewayParallelPOST`.
+  Verified: `go vet`, staticcheck (all checks) and deadcode are clean;
+  `go test -race` passes, with 83.5% coverage; the 5000 RPS gate measured
+  ~20k RPS; the entrypoint test passes under dash and BusyBox ash.
 
-### Docs
-- README: entrypoint supervision (polling, signal/zombie detection, grace
-  periods, `MOSDNS_BIN`/`GATEWAY_BIN`), `/readyz` cancellation and metrics,
-  the capacity warning, the new `check-config.sh` Go-version check, the
-  entrypoint test, the CI settings, and the 0.5.11 version.
+### Removed
+- `.github/workflows/Keep-Alive.yml` and `keep-alive.txt`. They pushed a commit
+  twice a month only to keep scheduled workflows alive, but the repository
+  has no scheduled workflows (CI runs on push and pull request).
 
-### Evaluated and left as-is
-- No other production code was removed; the remaining apparent redundancy is
-  load-bearing or deliberate: the always-zero `3xx` response series (keeps the
-  metric set stable), the double `resp.Body.Close()` (early release plus safety
-  net), and `maxRequestBytes` / `maxResponseBytes` (effectively constants, both
-  set to the DNS message limit).
+### Known, not changed
+- MosDNS v4.5.3 still builds with Go 1.19 (quic-go v0.30 does not build on
+  newer Go). The long-term fix is MosDNS v5.
+- With `CLIENT_IP_HEADER` set, a request without a valid value in that header
+  falls back to `X-Real-IP`; behind the trusted proxy this cannot happen.
+- Not verified here: the Docker build itself (no Docker in the review
+  environment). CI builds it on push.
 

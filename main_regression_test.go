@@ -10,43 +10,21 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 )
 
-var errRegBackendDown = errors.New("backend down")
-
-// holdingErrorTransport returns an error immediately but closes the request
-// body only after a delay, mimicking a transport that finishes with the body
-// asynchronously (early upstream response, cancellation, or a failed write).
-type holdingErrorTransport struct {
-	delay      time.Duration
-	closeOnce  sync.Once
-	bodyClosed chan struct{}
-}
-
-func (t *holdingErrorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	go func() {
-		time.Sleep(t.delay)
-		_ = req.Body.Close()
-		t.closeOnce.Do(func() { close(t.bodyClosed) })
-	}()
-	return nil, errRegBackendDown
-}
-
-func newRegTestGateway(backend string, client *http.Client) *gateway {
-	return &gateway{
-		backendURL:       backend,
-		client:           client,
-		limiter:          newFixedWindowLimiterWithMaxKeys(1000, time.Minute, 1000),
-		activeSlots:      make(chan struct{}, 16),
-		processingSlots:  make(chan struct{}, 8),
-		queueWait:        100 * time.Millisecond,
-		upstreamTimeout:  5 * time.Second,
-		maxRequestBytes:  maxDNSMessageBytes,
-		maxResponseBytes: maxDNSMessageBytes,
-	}
+func newRegTestGateway(t testing.TB, backend string, client *http.Client) *gateway {
+	return newTestGateway(t, gatewayOptions{
+		BackendURL:       backend,
+		Client:           client,
+		RateLimit:        1000,
+		RateLimitClients: 1000,
+		MaxActive:        16,
+		Processing:       8,
+		QueueWait:        100 * time.Millisecond,
+		UpstreamTimeout:  5 * time.Second,
+	})
 }
 
 func newRegDoHPostRequest(t *testing.T, msg []byte) *http.Request {
@@ -57,54 +35,61 @@ func newRegDoHPostRequest(t *testing.T, msg []byte) *http.Request {
 	return req
 }
 
-// Regression test for the pooled-buffer/transport-error race: the handler
-// must not return (making the pooled POST body available to another request)
-// before the transport has closed the outgoing request body.
-func TestPooledBodyHeldUntilTransportCloses(t *testing.T) {
-	tr := &holdingErrorTransport{delay: 150 * time.Millisecond, bodyClosed: make(chan struct{})}
-	g := newRegTestGateway("http://127.0.0.1:9/dns-query", &http.Client{Transport: tr})
+// asyncBodyTransport returns an error immediately and reads the request
+// body only later, from another goroutine, as a real transport may do
+// (early response, cancellation, failed write).
+type asyncBodyTransport struct {
+	got chan []byte
+}
 
-	rec := httptest.NewRecorder()
-	done := make(chan struct{})
+func (t *asyncBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	go func() {
-		g.ServeHTTP(rec, newRegDoHPostRequest(t, make([]byte, 32)))
-		close(done)
+		time.Sleep(50 * time.Millisecond)
+		b, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		t.got <- b
 	}()
+	return nil, errors.New("backend down")
+}
 
-	select {
-	case <-done:
-		t.Fatal("handler returned before the transport closed the request body; the pooled buffer could be reused while the transport still references it")
-	case <-time.After(60 * time.Millisecond):
-	}
-
-	select {
-	case <-tr.bodyClosed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("transport never closed the request body")
-	}
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not finish after the transport closed the request body")
-	}
-
+// The body handed to the transport must not alias the pooled read buffer:
+// after the handler returns, other requests reuse the pool, and a transport
+// that reads the body late must still see the original bytes.
+func TestTransportBodyIsNotAliasedToPool(t *testing.T) {
+	tr := &asyncBodyTransport{got: make(chan []byte, 1)}
+	g := newRegTestGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{Transport: tr})
+	want := bytes.Repeat([]byte{0xAB}, 32)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, newRegDoHPostRequest(t, want))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	// Churn the pool with different bytes while the transport still holds the body.
+	for i := 0; i < 64; i++ {
+		b := dnsMessageBufferPool.Get().(*[]byte)
+		for j := range (*b)[:cap(*b)] {
+			(*b)[:cap(*b)][j] = 0x00
+		}
+		dnsMessageBufferPool.Put(b)
+	}
+	select {
+	case got := <-tr.got:
+		if !bytes.Equal(got, want) {
+			t.Fatalf("transport read %x, want %x (body aliased pooled memory)", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("transport never read the body")
 	}
 }
 
 func TestServerWriteTimeoutIncludesReadBudget(t *testing.T) {
-	// Shipped defaults: the full budget (5s read + queue + upstream + 2s
-	// margin = 9.6s) exceeds the 8s floor, so the floor is NOT returned; the
-	// whole budget must be covered.
-	if got, want := serverWriteTimeout(defaultReadTimeout, defaultQueueWait, defaultUpstreamTO),
-		defaultReadTimeout+defaultQueueWait+defaultUpstreamTO+2*time.Second; got != want {
-		t.Fatalf("default budget: got %v, want %v", got, want)
+	// Shipped defaults: 2s body read + 0.1s queue + 2.5s upstream + 2s margin
+	// = 6.6s, below the 8s floor, so the floor applies.
+	if got := serverWriteTimeout(defaultBodyReadTimeout, defaultQueueWait, defaultUpstreamTO); got != defaultWriteTimeout {
+		t.Fatalf("default budget: got %v, want %v", got, defaultWriteTimeout)
 	}
-	// Raised queue/upstream timeouts must also cover the body-read budget:
-	// 5s upload + 5s queue + 5s upstream + 2s margin = 17s. The old formula
-	// (queue+upstream+2s = 12s) would drop the connection on this budget.
+	// Raised timeouts must cover body read + queue + upstream + margin:
+	// 5s + 5s + 5s + 2s = 17s.
 	if got, want := serverWriteTimeout(5*time.Second, 5*time.Second, 5*time.Second), 17*time.Second; got != want {
 		t.Fatalf("raised budget: got %v, want %v", got, want)
 	}
@@ -125,7 +110,7 @@ func TestBackendLatencyRecordedAfterBodyRead(t *testing.T) {
 	}))
 	defer okBackend.Close()
 
-	g := newRegTestGateway(okBackend.URL+"/dns-query", okBackend.Client())
+	g := newRegTestGateway(t, okBackend.URL+"/dns-query", okBackend.Client())
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, newRegDoHPostRequest(t, make([]byte, 32)))
 
@@ -147,7 +132,7 @@ func TestBackendLatencyRecordedAfterBodyRead(t *testing.T) {
 	}))
 	defer brokenBackend.Close()
 
-	g2 := newRegTestGateway(brokenBackend.URL+"/dns-query", brokenBackend.Client())
+	g2 := newRegTestGateway(t, brokenBackend.URL+"/dns-query", brokenBackend.Client())
 	rec2 := httptest.NewRecorder()
 	g2.ServeHTTP(rec2, newRegDoHPostRequest(t, make([]byte, 32)))
 
@@ -159,11 +144,9 @@ func TestBackendLatencyRecordedAfterBodyRead(t *testing.T) {
 	}
 }
 
-// A slow POST upload must not eat the deadline reserved for the queue wait and
-// the upstream timeout: with the OLD formula (queue+upstream+2s = ~4.1s) a
-// 2.5s upload followed by a 2s upstream timeout would be cut off before the
-// gateway could write 504. The new formula (5s read + 0.1s queue + 2s upstream
-// + 2s margin ~= 9.1s) delivers the 504.
+// A slow (but allowed) POST upload must not eat the deadline reserved for the
+// queue wait and the upstream timeout: a 2.5s upload followed by a 2s upstream
+// timeout must still end in 504, not a dropped connection.
 func TestWriteTimeoutCoversSlowBodyAndRaisedTimeouts(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(3 * time.Second) // outlives the gateway's 2s upstream timeout
@@ -174,16 +157,17 @@ func TestWriteTimeoutCoversSlowBodyAndRaisedTimeouts(t *testing.T) {
 
 	queueWait := 100 * time.Millisecond
 	upstreamTimeout := 2 * time.Second
-	g := newRegTestGateway(backend.URL+"/dns-query", backend.Client())
+	g := newRegTestGateway(t, backend.URL+"/dns-query", backend.Client())
 	g.upstreamTimeout = upstreamTimeout
 	g.queueWait = queueWait
+	g.bodyReadTimeout = 3 * time.Second // the trickled upload below takes ~2.5s
 
 	server := &http.Server{
 		Addr:              "127.0.0.1:0",
 		Handler:           g,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      serverWriteTimeout(defaultReadTimeout, queueWait, upstreamTimeout),
+		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, queueWait, upstreamTimeout),
 	}
 	ln, err := net.Listen("tcp", server.Addr)
 	if err != nil {
@@ -246,7 +230,7 @@ func TestBackendLatencyNotRecordedForRejectedResponses(t *testing.T) {
 			}))
 			defer backend.Close()
 
-			g := newRegTestGateway(backend.URL+"/dns-query", backend.Client())
+			g := newRegTestGateway(t, backend.URL+"/dns-query", backend.Client())
 			rec := httptest.NewRecorder()
 			g.ServeHTTP(rec, newRegDoHPostRequest(t, make([]byte, 32)))
 
@@ -303,7 +287,7 @@ func (tr *getBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 func TestPOSTRetryBodyMatchesOriginal(t *testing.T) {
 	msg := []byte("0123456789abcdef")
-	g := newRegTestGateway("http://127.0.0.1:9/dns-query", &http.Client{Transport: &getBodyTransport{t: t, want: msg}})
+	g := newRegTestGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{Transport: &getBodyTransport{t: t, want: msg}})
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, newRegDoHPostRequest(t, msg))
 	if rec.Code != http.StatusOK {
@@ -322,7 +306,7 @@ func TestReadyProbeCanceledByClientIsNotCounted(t *testing.T) {
 	}))
 	defer backend.Close()
 	defer close(release)
-	g := newRegTestGateway(backend.URL, &http.Client{})
+	g := newRegTestGateway(t, backend.URL, nil)
 	g.readyCacheTTL = defaultReadyCacheTTL
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -347,5 +331,86 @@ func TestReadyProbeCanceledByClientIsNotCounted(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("response written for a disconnected client: %q", rec.Body.String())
+	}
+	if !g.readyAt.IsZero() {
+		t.Fatal("canceled probe poisoned the readiness cache")
+	}
+}
+
+func startRegServer(t *testing.T, g *gateway) net.Listener {
+	t.Helper()
+	server := &http.Server{
+		Handler:           g,
+		ReadHeaderTimeout: defaultReadHeaderTimeout,
+		ReadTimeout:       defaultReadTimeout,
+		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, g.queueWait, g.upstreamTimeout),
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	go func() { _ = server.Serve(ln) }()
+	return ln
+}
+
+// A POST body that is not complete within the body-read budget is rejected
+// and its active slot freed, instead of being held for the whole ReadTimeout.
+func TestSlowPOSTBodyIsCutOffAndFreesSlot(t *testing.T) {
+	g := newRegTestGateway(t, "http://127.0.0.1:9/dns-query", nil)
+	g.bodyReadTimeout = 200 * time.Millisecond
+	ln := startRegServer(t, g)
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	fmt.Fprintf(conn, "POST /dns-query HTTP/1.1\r\nHost: x\r\nContent-Type: application/dns-message\r\nContent-Length: 64\r\n\r\nabcd")
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("slow body held the request for %s", d)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(g.activeSlots) != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := len(g.activeSlots); n != 0 {
+		t.Fatalf("active slots held after cut-off: %d", n)
+	}
+}
+
+// The short body deadline is cleared once the body is read: a backend that
+// answers after the body-read budget has passed must still be relayed (the
+// server's background read must not cancel the request).
+func TestBodyDeadlineDoesNotCancelSlowBackend(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(400 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(make([]byte, 32))
+	}))
+	defer backend.Close()
+	g := newRegTestGateway(t, backend.URL+"/dns-query", nil)
+	g.bodyReadTimeout = 100 * time.Millisecond
+	ln := startRegServer(t, g)
+	client := &http.Client{Timeout: 5 * time.Second}
+	for i := 0; i < 2; i++ { // second request reuses the keep-alive connection
+		resp, err := client.Post("http://"+ln.Addr().String()+"/dns-query", "application/dns-message", bytes.NewReader(make([]byte, 32)))
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, resp.StatusCode)
+		}
 	}
 }
