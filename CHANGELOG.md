@@ -104,3 +104,4 @@ gateway and the entrypoint were run against a real MosDNS v4.5.3 built with Go
 upstream query (repeat served from cache in under 1 ms), NXDOMAIN relayed,
 clean stop in 0.4 s. Not verified here: the Docker build itself (no Docker in
 the review environment); CI builds and smoke-tests it on push.
+
