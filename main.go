@@ -152,7 +152,6 @@ type gatewayMetrics struct {
 	queueTimeoutTotal     atomic.Uint64
 	backendErrorTotal     atomic.Uint64
 	responses2xxTotal     atomic.Uint64
-	responses3xxTotal     atomic.Uint64
 	responses4xxTotal     atomic.Uint64
 	responses5xxTotal     atomic.Uint64
 	readyPassTotal        atomic.Uint64
@@ -166,17 +165,28 @@ type gatewayMetrics struct {
 // gatewayOptions configures newGateway. Zero values select the defaults,
 // except ReadyCacheTTL, where zero disables the readiness cache.
 type gatewayOptions struct {
-	BackendURL       string
-	Client           *http.Client
-	RateLimit        int
-	RateWindow       time.Duration
-	RateLimitClients int
-	MaxActive        int
-	Processing       int
-	QueueWait        time.Duration
-	UpstreamTimeout  time.Duration
-	TrustedIPHeader  string
-	ReadyCacheTTL    time.Duration
+	BackendURL           string
+	Client               *http.Client
+	RateLimit            int
+	RateWindow           time.Duration
+	RateLimitClients     int
+	MaxActive            int
+	Processing           int
+	QueueWait            time.Duration
+	UpstreamTimeout      time.Duration
+	TrustedIPHeader      string
+	TrustedProxyPrefixes []netip.Prefix
+	ReadyCacheTTL        time.Duration
+}
+
+// readyProbe is the shared in-flight readiness probe. ok is only a verdict
+// when valid is true; an aborted probe (its caller went away) says nothing
+// about backend health. Fields are written by the probe owner before done is
+// closed and read by waiters after <-done.
+type readyProbe struct {
+	done  chan struct{}
+	ok    bool
+	valid bool
 }
 
 type gateway struct {
@@ -189,6 +199,9 @@ type gateway struct {
 	upstreamTimeout time.Duration
 	bodyReadTimeout time.Duration
 	trustedIPHeader string
+	// trustProxyCIDRs restricts which socket peers the trustedIPHeader
+	// may come from; empty means every peer is trusted.
+	trustProxyCIDRs []netip.Prefix
 	metrics         gatewayMetrics
 	probeSeq        atomic.Uint64
 	backendBase     *url.URL
@@ -198,7 +211,7 @@ type gateway struct {
 	readyMu         sync.Mutex
 	readyAt         time.Time
 	readyOK         bool
-	readyInflight   chan struct{}
+	readyInflight   *readyProbe
 }
 
 func orInt(v, def int) int {
@@ -233,6 +246,7 @@ func newGateway(o gatewayOptions) (*gateway, error) {
 		upstreamTimeout: orDuration(o.UpstreamTimeout, defaultUpstreamTO),
 		bodyReadTimeout: defaultBodyReadTimeout,
 		trustedIPHeader: o.TrustedIPHeader,
+		trustProxyCIDRs: o.TrustedProxyPrefixes,
 		backendBase:     u,
 		backendPlain:    u.String(),
 		backendSimple:   u.RawQuery == "" && !u.ForceQuery && u.Fragment == "",
@@ -270,8 +284,6 @@ func (g *gateway) countStatus(status int) {
 	switch {
 	case status >= 200 && status < 300:
 		g.metrics.responses2xxTotal.Add(1)
-	case status >= 300 && status < 400:
-		g.metrics.responses3xxTotal.Add(1)
 	case status >= 400 && status < 500:
 		g.metrics.responses4xxTotal.Add(1)
 	case status >= 500:
@@ -297,28 +309,31 @@ func (g *gateway) ready(ctx context.Context) bool {
 			}
 		}
 		if g.readyInflight == nil {
-			done := make(chan struct{})
-			g.readyInflight = done
+			probe := &readyProbe{done: make(chan struct{})}
+			g.readyInflight = probe
 			g.readyMu.Unlock()
 			ok := g.backendReady(ctx)
 			g.readyMu.Lock()
-			if ctx.Err() == nil {
+			probe.valid = ctx.Err() == nil
+			probe.ok = ok
+			if probe.valid {
 				g.readyAt = time.Now()
 				g.readyOK = ok
 			}
 			g.readyInflight = nil
-			close(done)
+			close(probe.done)
 			g.readyMu.Unlock()
 			return ok
 		}
-		inflight := g.readyInflight
+		probe := g.readyInflight
 		g.readyMu.Unlock()
 		select {
-		case <-inflight:
-			if g.readyCacheTTL <= 0 {
-				// No cache to read the shared result from: probe again.
-				continue
+		case <-probe.done:
+			if probe.valid {
+				// Share the verdict even when the cache is disabled.
+				return probe.ok
 			}
+			// The probe was aborted by its own caller; probe again.
 		case <-ctx.Done():
 			return false
 		}
@@ -372,7 +387,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, "GET, POST")
 		return
 	}
-	if retryAfter := g.limiter.admit(rateLimitKey(extractClientIP(r, g.trustedIPHeader))); retryAfter > 0 {
+	if retryAfter := g.limiter.admit(rateLimitKey(g.clientIP(r))); retryAfter > 0 {
 		g.metrics.rateLimitedTotal.Add(1)
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		writeText(w, http.StatusTooManyRequests, "rate limit exceeded\n")
@@ -712,6 +727,19 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	return bytes.Equal(msg[12:12+len(question)], question)
 }
 
+var metricsResponsesTemplate = `# HELP doh_gateway_responses_total Responses grouped by status class.
+# TYPE doh_gateway_responses_total counter
+doh_gateway_responses_total{class="2xx"} %d
+doh_gateway_responses_total{class="4xx"} %d
+doh_gateway_responses_total{class="5xx"} %d
+`
+
+var metricsReadyTemplate = `# HELP doh_gateway_ready_probe_total Readiness probes by result.
+# TYPE doh_gateway_ready_probe_total counter
+doh_gateway_ready_probe_total{result="ready"} %d
+doh_gateway_ready_probe_total{result="not_ready"} %d
+`
+
 func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -724,18 +752,8 @@ func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(&b, "# HELP doh_gateway_active_rejected_total Requests rejected by the active request ceiling.\n# TYPE doh_gateway_active_rejected_total counter\ndoh_gateway_active_rejected_total %d\n", m.activeRejectedTotal.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_timeout_total Requests that exhausted queue wait.\n# TYPE doh_gateway_queue_timeout_total counter\ndoh_gateway_queue_timeout_total %d\n", m.queueTimeoutTotal.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_backend_error_total Backend/protocol errors observed by the gateway.\n# TYPE doh_gateway_backend_error_total counter\ndoh_gateway_backend_error_total %d\n", m.backendErrorTotal.Load())
-	fmt.Fprintf(&b, `# HELP doh_gateway_responses_total Responses grouped by status class.
-# TYPE doh_gateway_responses_total counter
-doh_gateway_responses_total{class="2xx"} %d
-doh_gateway_responses_total{class="3xx"} %d
-doh_gateway_responses_total{class="4xx"} %d
-doh_gateway_responses_total{class="5xx"} %d
-`, m.responses2xxTotal.Load(), m.responses3xxTotal.Load(), m.responses4xxTotal.Load(), m.responses5xxTotal.Load())
-	fmt.Fprintf(&b, `# HELP doh_gateway_ready_probe_total Readiness probes by result.
-# TYPE doh_gateway_ready_probe_total counter
-doh_gateway_ready_probe_total{result="ready"} %d
-doh_gateway_ready_probe_total{result="not_ready"} %d
-`, m.readyPassTotal.Load(), m.readyFailTotal.Load())
+	fmt.Fprintf(&b, metricsResponsesTemplate, m.responses2xxTotal.Load(), m.responses4xxTotal.Load(), m.responses5xxTotal.Load())
+	fmt.Fprintf(&b, metricsReadyTemplate, m.readyPassTotal.Load(), m.readyFailTotal.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total %.6f\n", float64(m.queueWaitNanos.Load())/float64(time.Second))
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total %d\n", m.queueWaitSamples.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total time of valid MosDNS answers (request sent until the 2xx DNS body was fully read and validated).\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(m.backendLatencyNanos.Load())/float64(time.Second))
@@ -743,26 +761,57 @@ doh_gateway_ready_probe_total{result="not_ready"} %d
 	_, _ = io.WriteString(w, b.String())
 }
 
-// extractClientIP returns the client address, or the zero Addr if none can
-// be determined. With a trusted header, the last entry of its last value is
-// used (the address the trusted proxy appended). No other header is trusted:
-// a missing or invalid value falls back to the socket peer.
-func extractClientIP(r *http.Request, trustedHeader string) netip.Addr {
-	if trustedHeader != "" {
-		if values := r.Header.Values(trustedHeader); len(values) != 0 {
-			value := values[len(values)-1]
-			if comma := strings.LastIndexByte(value, ','); comma >= 0 {
-				value = value[comma+1:]
-			}
-			if ip, err := netip.ParseAddr(strings.TrimSpace(value)); err == nil {
-				return ip.Unmap()
-			}
+// headerClientIP returns the client address from the trusted header, or
+// false if none can be determined. With a trusted header, the last entry of
+// its last value is used (the address the trusted proxy appended). No other
+// header is trusted: a missing or invalid value falls back to the socket peer.
+func headerClientIP(r *http.Request, trustedHeader string) (netip.Addr, bool) {
+	if values := r.Header.Values(trustedHeader); len(values) != 0 {
+		value := values[len(values)-1]
+		if comma := strings.LastIndexByte(value, ','); comma >= 0 {
+			value = value[comma+1:]
+		}
+		if ip, err := netip.ParseAddr(strings.TrimSpace(value)); err == nil {
+			return ip.Unmap(), true
 		}
 	}
+	return netip.Addr{}, false
+}
+
+// socketClientIP returns the socket peer address, or the zero Addr if the
+// remote address cannot be parsed.
+func socketClientIP(r *http.Request) netip.Addr {
 	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
 		return ap.Addr().Unmap()
 	}
 	return netip.Addr{}
+}
+
+// clientIP returns the address used for rate limiting. The trusted header is
+// honored only when the socket peer is a trusted proxy (always, unless
+// TRUSTED_PROXY_CIDRS is set), so a client that reaches the gateway directly
+// cannot rotate spoofed addresses to get fresh rate-limit buckets or exhaust
+// the limiter's key cap.
+func (g *gateway) clientIP(r *http.Request) netip.Addr {
+	peer := socketClientIP(r)
+	if g.trustedIPHeader != "" && g.peerIsTrustedProxy(peer) {
+		if ip, ok := headerClientIP(r, g.trustedIPHeader); ok {
+			return ip
+		}
+	}
+	return peer
+}
+
+func (g *gateway) peerIsTrustedProxy(peer netip.Addr) bool {
+	if len(g.trustProxyCIDRs) == 0 {
+		return true
+	}
+	for _, p := range g.trustProxyCIDRs {
+		if p.Contains(peer) {
+			return true
+		}
+	}
+	return false
 }
 
 // rateLimitKey keys IPv4 clients by address and IPv6 clients by /64.
@@ -917,6 +966,25 @@ func serverWriteTimeout(bodyReadTimeout, queueWait, upstreamTimeout time.Duratio
 	return defaultWriteTimeout
 }
 
+// parseTrustedProxyPrefixes parses a comma-separated list of CIDRs for the
+// peers allowed to set the trusted client-IP header. An empty list means
+// every peer is trusted.
+func parseTrustedProxyPrefixes(value string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q", part)
+		}
+		prefixes = append(prefixes, p.Masked())
+	}
+	return prefixes, nil
+}
+
 func main() {
 	listen := normalizeListenAddr(os.Getenv("PORT"))
 	backend := envString("MOSDNS_DOH_URL", defaultBackend)
@@ -930,6 +998,17 @@ func main() {
 	if strings.EqualFold(trustedIPHeader, "none") {
 		trustedIPHeader = ""
 	}
+	var trustedProxyPrefixes []netip.Prefix
+	if raw := envString("TRUSTED_PROXY_CIDRS", ""); raw != "" {
+		var err error
+		trustedProxyPrefixes, err = parseTrustedProxyPrefixes(raw)
+		if err != nil {
+			log.Fatalf("TRUSTED_PROXY_CIDRS: %v", err)
+		}
+		if trustedIPHeader == "" {
+			log.Printf("warning: TRUSTED_PROXY_CIDRS is set but CLIENT_IP_HEADER is none; the proxy check has no effect")
+		}
+	}
 	if processing > maxActive {
 		log.Printf("warning: MAX_CONCURRENT_REQUESTS (%d) exceeds MAX_ACTIVE_REQUESTS (%d); requests are rejected before they can queue, so QUEUE_WAIT never applies", processing, maxActive)
 	}
@@ -937,16 +1016,17 @@ func main() {
 		log.Printf("warning: UPSTREAM_TIMEOUT (%s) is not above the MosDNS server timeout (%s); slow lookups end in 504 instead of a SERVFAIL answer", upstreamTimeout, mosdnsServerTimeout)
 	}
 	g, err := newGateway(gatewayOptions{
-		BackendURL:       backend,
-		RateLimit:        limit,
-		RateWindow:       window,
-		RateLimitClients: envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients),
-		MaxActive:        maxActive,
-		Processing:       processing,
-		QueueWait:        queueWait,
-		UpstreamTimeout:  upstreamTimeout,
-		TrustedIPHeader:  trustedIPHeader,
-		ReadyCacheTTL:    defaultReadyCacheTTL,
+		BackendURL:           backend,
+		RateLimit:            limit,
+		RateWindow:           window,
+		RateLimitClients:     envInt("RATE_LIMIT_CLIENTS", defaultRateLimitClients),
+		MaxActive:            maxActive,
+		Processing:           processing,
+		QueueWait:            queueWait,
+		UpstreamTimeout:      upstreamTimeout,
+		TrustedIPHeader:      trustedIPHeader,
+		TrustedProxyPrefixes: trustedProxyPrefixes,
+		ReadyCacheTTL:        defaultReadyCacheTTL,
 	})
 	if err != nil {
 		log.Fatalf("MOSDNS_DOH_URL: %v", err)
