@@ -1,4 +1,4 @@
-PROJECT := mosdns-koyeb-doh-gateway
+PROJECT := Mosdns-on-PaaS
 IMAGE ?= $(PROJECT):local
 VERSION := $(shell cat VERSION)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
