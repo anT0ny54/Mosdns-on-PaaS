@@ -56,9 +56,9 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 | `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes; a backend 2xx answer shorter than 12 bytes is rejected with `502`. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
 | `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then transaction ID, QR bit, RCODE 0 (NOERROR), QDCOUNT 1, echoed question, at least one answer). An NXDOMAIN or empty answer means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted in `doh_gateway_ready_probe_total{result="not_ready"}`, and no response is written or counted for that client. |
-| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`-`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the `3xx` series is always 0 because the gateway never redirects and turns a backend 1xx/3xx into `502`; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a 2xx `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and non-2xx answers add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
+| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns a backend 1xx/3xx into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a 2xx `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and non-2xx answers add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
-`/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Block or restrict `/metrics` at the platform edge if you do not want it public.
+`/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Concurrent `/readyz` callers share one in-flight probe even when the result cache is disabled. Block or restrict `/metrics` at the platform edge if you do not want it public.
 
 Anything else returns `404`; a wrong method returns `405` with an `Allow` header (`GET, POST` on `/dns-query`, `GET, HEAD` on the other endpoints). Every response generated by the gateway carries `X-Content-Type-Options: nosniff`.
 
@@ -104,6 +104,7 @@ Gateway:
 | `QUEUE_WAIT` | `100ms` | Max wait for a processing slot, then `503`. |
 | `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it — it always covers the body-read + queue + upstream budget plus a 2 s margin, so even a slow POST upload followed by a full queue wait and an upstream timeout still ends in the intended `503`/`504` (see Architecture). |
 | `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` in the shipped Dockerfile) | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used; if it is missing or not a valid IP, the socket peer is used. No other header (such as `X-Real-IP`, which clients can set themselves) is trusted. IPv4-mapped IPv6 addresses are normalised to IPv4, and IPv6 clients are rate-limited per /64. Default keys rate limits on the socket peer only (see the note below). |
+| `TRUSTED_PROXY_CIDRS` | empty (every peer may set the header) | Comma-separated CIDR list of the proxy peers allowed to set `CLIENT_IP_HEADER`. When set, a header arriving from any other socket peer is ignored and that peer is rate-limited by its own address, so a client that can reach the container directly cannot rotate spoofed addresses to get fresh rate-limit buckets or exhaust the per-window client cap. Example: `TRUSTED_PROXY_CIDRS=10.0.0.0/8,2001:db8::/32`. Fatal at startup if a CIDR is malformed; a warning is logged if it is set while `CLIENT_IP_HEADER` is `none`. |
 
 **Behind a PaaS proxy, set `CLIENT_IP_HEADER`.** With the default (`none`) the
 rate limiter sees only the socket peer, which on Koyeb and similar platforms is
@@ -112,7 +113,9 @@ address shares one `RATE_LIMIT` bucket (100 requests per minute by default).
 The shipped Dockerfile already sets `CLIENT_IP_HEADER=X-Forwarded-For` so each
 real client gets its own bucket; set it back to `none` (or remove it) if the
 container is not reachable solely through your trusted proxy, because the
-header is otherwise spoofable.
+header is otherwise spoofable. If the container can be reached both through
+the proxy and directly, also set `TRUSTED_PROXY_CIDRS` to the proxy's ranges
+so spoofed headers from direct clients are ignored.
 
 Integer variables must be >= 1 and duration variables must be positive Go
 durations (`100ms`, `2.5s`). An invalid value is ignored: the default is used
@@ -280,7 +283,9 @@ together.
   failed checks). `/healthz` only shows that the gateway process is up.
 - Keep `CLIENT_IP_HEADER=X-Forwarded-For` (the image default) only when the
   container is reachable solely through your trusted proxy; otherwise set it to
-  `none`.
+  `none`. If the container can be reached both through the proxy and directly,
+  also set `TRUSTED_PROXY_CIDRS` to the proxy's ranges so spoofed headers from
+  direct clients are ignored.
 - Restrict `/metrics` at the platform edge if it should not be public.
 - The container runs as the unprivileged user `app`.
 
@@ -294,7 +299,7 @@ together.
 
 ## Version
 
-The gateway version lives only in `VERSION` (currently 0.5.13); the Dockerfile
+The gateway version lives only in `VERSION` (currently 0.5.14); the Dockerfile
 reads it during the build (plain `docker build`, as Koyeb does, gets it too)
 and injects it with `-ldflags -X main.version=...`. The MosDNS version and its
 commit pin are set in the Dockerfile (`ARG MOSDNS_VERSION`, `ARG

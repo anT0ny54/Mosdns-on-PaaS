@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.14 — 2026-10-17
+
+Fixes from a third full-project review: readiness probe sharing without a
+result cache, proxy-trust hardening for the rate limiter, dead code removal
+and metrics scaffolding.
+
+### Fixed
+- **`/readyz` with a disabled result cache re-probed per caller.** When
+  `ReadyCacheTTL` was 0, waiters on a shared in-flight probe started their own
+  probe instead of reusing the shared verdict. The probe now carries its
+  verdict (or, when aborted by its own caller, an explicit "invalid" mark) so
+  waiters share one probe regardless of the cache setting.
+- **A direct client could bypass the rate limiter with spoofed headers.** With
+  `CLIENT_IP_HEADER` set (the shipped Dockerfile sets `X-Forwarded-For`), any
+  client that can reach the container directly — not only through the trusted
+  proxy — could rotate spoofed addresses to get fresh buckets and eventually
+  exhaust the per-window client cap (denying service to new clients). The new
+  `TRUSTED_PROXY_CIDRS` variable restricts which socket peers may set the
+  trusted header; when set, headers from any other peer are ignored.
+
+### Removed (dead code)
+- The always-zero `3xx` response-status series (`responses3xxTotal` and its
+  `doh_gateway_responses_total{class="3xx"}` output): the gateway never
+  redirects and converts backend 1xx/3xx to `502`, so the counter could never
+  be non-zero. The `*.json` eol rule in `.gitattributes` (no JSON files in the
+  repository) is also gone.
+
+### Changed
+- `serveMetrics` keeps its HELP/TYPE scaffolding in package-level templates
+  instead of re-parsing raw string literals on every scrape (scrape-path
+  cleanup; output is unchanged apart from the removed `3xx` series).
+- The Makefile image name now matches the repository (`Mosdns-on-PaaS`).
+- The keep-alive workflow only runs in `anT0ny54/Mosdns-on-PaaS` (forks no
+  longer get scheduled commits) and lost a stray whitespace line.
+
 ## 0.5.13 — 2026-10-14
 
 Fixes from a second full-project review: upstream racing, base-image updates,
@@ -69,4 +104,3 @@ gateway and the entrypoint were run against a real MosDNS v4.5.3 built with Go
 upstream query (repeat served from cache in under 1 ms), NXDOMAIN relayed,
 clean stop in 0.4 s. Not verified here: the Docker build itself (no Docker in
 the review environment); CI builds and smoke-tests it on push.
-
