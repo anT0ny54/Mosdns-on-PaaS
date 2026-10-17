@@ -1,127 +1,94 @@
 #!/bin/sh
-# Entrypoint for the MosDNS container: starts MosDNS, then supervises both
-# the gateway and MosDNS, restarting whichever child exits.
-set -u
+set -eu
 
-GATEWAY_BIN=${GATEWAY_BIN:-/app/doh-gateway}
-MOSDNS_BIN=${MOSDNS_BIN:-/usr/bin/mosdns}
-CONFIG=${CONFIG:-/etc/mosdns/config.yaml}
+MOSDNS_CONFIG="${MOSDNS_CONFIG:-/etc/mosdns/config.yaml}"
+MOSDNS_DIR="${MOSDNS_DIR:-/etc/mosdns}"
+MOSDNS_BIN="${MOSDNS_BIN:-/usr/local/bin/mosdns}"
+GATEWAY_BIN="${GATEWAY_BIN:-/usr/local/bin/doh-gateway}"
+MOSDNS_PID=""
+GATEWAY_PID=""
+# Shutdown grace periods in seconds. The gateway drains in-flight requests for
+# up to its own shutdown timeout (4s), so it gets the larger budget; MosDNS
+# stops fast, so it gets a short one. Together (9s) they fit inside Docker's
+# default 10s stop timeout. A child still alive after its grace period is
+# KILLed so a wedged child cannot hang the container.
+GATEWAY_SHUTDOWN_GRACE=6
+MOSDNS_SHUTDOWN_GRACE=3
 
-# Optional: extra args for the gateway (e.g. -listen :8080).
-GATEWAY_ARGS=${GATEWAY_ARGS:-}
-
-# When true (default), a MosDNS crash is fatal for the container; set to
-# "false" only in exceptional debugging situations.
-MOSDNS_REQUIRED=${MOSDNS_REQUIRED:-true}
-
-log() { echo "[entrypoint] $*"; }
-
-# is_alive uses /proc directly instead of `kill -0` so it also works when the
-# child is a zombie (reaped only by our next `wait`).
+# True while the process exists and is not a zombie. `kill -0` alone is not
+# enough: an exited child stays a zombie (and `kill -0` keeps succeeding) until
+# its parent reaps it, so the state is read from /proc as well. Without /proc
+# the check degrades to `kill -0`. Only shell builtins are used, so the check
+# itself forks nothing (the supervision loop forks one `sleep` per second).
 is_alive() {
-    local pid=$1 state
-    [ -r "/proc/$pid/stat" ] || return 1
-    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
-    # $3 is the process state character: R, S, D, Z, T, I... The parenthesized
-    # comm field ($2) can itself contain spaces and parentheses, so we anchor
-    # on the LAST ") " in the line: ${state##*) } strips everything up to it.
-    state=${state##*) }
-    [ "$state" != "Z" ]
+  kill -0 "$1" 2>/dev/null || return 1
+  [ -r "/proc/$1/stat" ] || return 0
+  # The state field follows the ")" that closes the command name.
+  # ${state##*) } strips the longest match, so it anchors on the LAST
+  # ") " on the line: a ") " inside the command name cannot mislead it.
+  read -r state < "/proc/$1/stat" 2>/dev/null || return 0
+  state=${state##*) }
+  case "$state" in
+    Z*|X*) return 1 ;;
+  esac
+  return 0
 }
 
-# wait_reap blocks until the child is actually reaped, so a new process can
-# reuse the PID slot safely.
-wait_reap() {
-    local pid=$1
-    while [ -e "/proc/$pid" ]; do
-        sleep 0.1
-    done
+# TERM a child, wait up to $2 seconds for it to exit, then KILL it. Polling
+# (instead of a watchdog subshell) means an already-dead child costs no wait.
+stop_child() {
+  pid=$1
+  ticks=$(($2 * 5))
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$ticks" -gt 0 ] && is_alive "$pid"; do
+    sleep 0.2
+    ticks=$((ticks - 1))
+  done
+  if is_alive "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  # Reap it so no zombie is left behind.
+  wait "$pid" 2>/dev/null || true
 }
 
-start_gateway() {
-    log "starting gateway: $GATEWAY_BIN $GATEWAY_ARGS"
-    "$GATEWAY_BIN" $GATEWAY_ARGS &
-    GATEWAY_PID=$!
-    log "gateway pid $GATEWAY_PID"
+terminate_children() {
+  if [ -n "$GATEWAY_PID" ]; then
+    stop_child "$GATEWAY_PID" "$GATEWAY_SHUTDOWN_GRACE"
+  fi
+  if [ -n "$MOSDNS_PID" ]; then
+    stop_child "$MOSDNS_PID" "$MOSDNS_SHUTDOWN_GRACE"
+  fi
 }
 
-start_mosdns() {
-    log "starting mosdns: $MOSDNS_BIN run -d -c $CONFIG"
-    "$MOSDNS_BIN" run -d -c "$CONFIG" &
-    MOSDNS_PID=$!
-    log "mosdns pid $MOSDNS_PID"
+on_signal() {
+  trap - TERM INT HUP
+  terminate_children
+  exit 0
 }
 
-cleanup() {
-    log "received shutdown signal, stopping children"
-    trap - TERM INT
-    [ -n "${GATEWAY_PID:-}" ] && kill "$GATEWAY_PID" 2>/dev/null
-    [ -n "${MOSDNS_PID:-}" ] && kill "$MOSDNS_PID" 2>/dev/null
-    wait
-    log "all children stopped, exiting"
-    exit 0
-}
-trap cleanup TERM INT
+trap on_signal TERM INT HUP
 
-start_gateway
-start_mosdns
+mkdir -p "$MOSDNS_DIR"
 
-log "supervising gateway=$GATEWAY_PID mosdns=$MOSDNS_PID"
+"$MOSDNS_BIN" start -c "$MOSDNS_CONFIG" -d "$MOSDNS_DIR" &
+MOSDNS_PID=$!
 
-while true; do
-    if wait -n 2>/dev/null; then
-        STATUS=$?
-    else
-        # BusyBox ash lacks `wait -n`; poll instead.
-        STATUS=""
-        if ! is_alive "$GATEWAY_PID"; then
-            wait "$GATEWAY_PID"
-            STATUS=$?
-            EXITED=gateway
-        elif ! is_alive "$MOSDNS_PID"; then
-            wait "$MOSDNS_PID"
-            STATUS=$?
-            EXITED=mosdns
-        else
-            sleep 1
-            continue
-        fi
-    fi
+"$GATEWAY_BIN" &
+GATEWAY_PID=$!
 
-    if [ -z "$EXITED" ]; then
-        if [ "$GATEWAY_PID" = "$!" ] 2>/dev/null; then
-            EXITED=gateway
-        elif [ "$MOSDNS_PID" = "$!" ] 2>/dev/null; then
-            EXITED=mosdns
-        else
-            # Ambiguous exit (should not happen): determine from /proc.
-            if is_alive "$GATEWAY_PID"; then
-                EXITED=mosdns
-            else
-                EXITED=gateway
-            fi
-        fi
-    fi
-
-    log "$EXITED exited with status ${STATUS:-unknown}"
-
-    case "$EXITED" in
-        gateway)
-            wait_reap "$GATEWAY_PID"
-            log "restarting gateway"
-            start_gateway
-            ;;
-        mosdns)
-            wait_reap "$MOSDNS_PID"
-            if [ "$MOSDNS_REQUIRED" = "true" ]; then
-                log "mosdns is required; stopping container"
-                kill "$GATEWAY_PID" 2>/dev/null
-                wait
-                exit 1
-            fi
-            log "restarting mosdns"
-            start_mosdns
-            ;;
-    esac
-    EXITED=""
+# Supervision: poll once per second until either child is gone. `wait -n` is
+# not used because BusyBox ash does not return from it when a child is killed
+# by a signal (OOM kill, SIGSEGV, SIGKILL), which left the container running
+# with a single process. The sleep runs in the background and is waited on so
+# a trapped TERM/INT/HUP interrupts it immediately.
+while :; do
+  if ! is_alive "$MOSDNS_PID" || ! is_alive "$GATEWAY_PID"; then
+    # Already tearing down because a child died: a TERM arriving now must
+    # not re-run the shutdown and turn this exit 1 into exit 0.
+    trap '' TERM INT HUP
+    terminate_children
+    exit 1
+  fi
+  sleep 1 &
+  wait $! 2>/dev/null || true
 done
