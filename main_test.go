@@ -396,7 +396,8 @@ func TestResponseConnectionHeaderTokensAreStripped(t *testing.T) {
 func TestKoyebClientIPUsesLastXForwardedFor(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
 	r.Header.Set("X-Forwarded-For", "198.51.100.10, 203.0.113.10")
-	got := extractClientIP(r, "X-Forwarded-For").String()
+	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
+	got := g.clientIP(r).String()
 	if got != "203.0.113.10" {
 		t.Fatalf("got %q, want last X-Forwarded-For address", got)
 	}
@@ -484,10 +485,14 @@ func TestMetricsEndpoint(t *testing.T) {
 		"doh_gateway_queue_wait_samples_total 2",
 		"doh_gateway_backend_latency_samples_total 5",
 		"doh_gateway_build_info{version=",
+		`doh_gateway_responses_total{class="2xx"}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q in %s", want, body)
 		}
+	}
+	if strings.Contains(body, "3xx") {
+		t.Fatal("metrics still expose the always-zero 3xx series")
 	}
 }
 func TestMaxSizeResponseAccepted(t *testing.T) {
@@ -688,7 +693,10 @@ func TestClientIPHeaderTrust(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
 	r.Header.Set("X-Forwarded-For", "203.0.113.9")
 	r.Header.Set("X-Real-IP", "203.0.113.8")
-	if got := extractClientIP(r, "").String(); got != "192.0.2.1" {
+	// With no CLIENT_IP_HEADER configured, the header is never consulted.
+	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
+	g.trustedIPHeader = ""
+	if got := g.clientIP(r).String(); got != "192.0.2.1" {
 		t.Fatalf("with header trust disabled got %q, want the socket peer", got)
 	}
 	// Only the configured header is trusted: X-Real-IP is client-controlled
@@ -700,9 +708,68 @@ func TestClientIPHeaderTrust(t *testing.T) {
 			r.Header.Set("X-Forwarded-For", xff)
 		}
 		r.Header.Set("X-Real-IP", "203.0.113.8")
-		if got := extractClientIP(r, "X-Forwarded-For").String(); got != "192.0.2.1" {
+		if got := g.clientIP(r).String(); got != "192.0.2.1" {
 			t.Fatalf("XFF=%q: got %q, want the socket peer (X-Real-IP must not be trusted)", xff, got)
 		}
+	}
+}
+
+// The trusted header is honored only when the socket peer is inside one of
+// the trusted proxy ranges; a direct client with a spoofed header falls back
+// to its own address.
+func TestClientIPRequiresTrustedProxy(t *testing.T) {
+	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
+	trusted, err := netip.ParsePrefix("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.trustProxyCIDRs = []netip.Prefix{trusted.Masked()}
+	g.trustedIPHeader = "X-Forwarded-For"
+
+	r := httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
+	r.Header.Set("X-Forwarded-For", "203.0.113.7")
+	if got := g.clientIP(r).String(); got != "192.0.2.1" {
+		t.Fatalf("direct client with spoofed header got %q, want its socket peer", got)
+	}
+
+	r = httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
+	r.RemoteAddr = "10.1.2.3:5555"
+	r.Header.Set("X-Forwarded-For", "203.0.113.7")
+	if got := g.clientIP(r).String(); got != "203.0.113.7" {
+		t.Fatalf("trusted proxy peer got %q, want the header address", got)
+	}
+
+	// An invalid header value from a trusted peer still falls back.
+	r = httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
+	r.RemoteAddr = "10.1.2.3:5555"
+	r.Header.Set("X-Forwarded-For", "not-an-ip")
+	if got := g.clientIP(r).String(); got != "10.1.2.3" {
+		t.Fatalf("invalid header value got %q, want the proxy's own address", got)
+	}
+
+	// IPv6 proxies are matched with an IPv6 prefix.
+	g.trustProxyCIDRs = []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")}
+	r = httptest.NewRequest(http.MethodGet, "/dns-query?dns=AA", nil)
+	r.RemoteAddr = "[2001:db8:1::1]:5555"
+	r.Header.Set("X-Forwarded-For", "203.0.113.7")
+	if got := g.clientIP(r).String(); got != "203.0.113.7" {
+		t.Fatalf("IPv6 trusted proxy got %q, want the header address", got)
+	}
+}
+
+func TestParseTrustedProxyPrefixes(t *testing.T) {
+	if prefixes, err := parseTrustedProxyPrefixes(""); err != nil || prefixes != nil {
+		t.Fatalf("empty list: %v %v", prefixes, err)
+	}
+	prefixes, err := parseTrustedProxyPrefixes(" 10.0.0.0/8, 2001:db8::/32 ,")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixes) != 2 || prefixes[0].String() != "10.0.0.0/8" || prefixes[1].String() != "2001:db8::/32" {
+		t.Fatalf("got %v", prefixes)
+	}
+	if _, err := parseTrustedProxyPrefixes("10.0.0.0/8,bogus"); err == nil {
+		t.Fatal("invalid CIDR accepted")
 	}
 }
 func TestReadyEndpointCachesResult(t *testing.T) {
@@ -1135,9 +1202,11 @@ func TestBackendNosniffHeaderIsNotDuplicated(t *testing.T) {
 	}
 }
 func TestIPv4MappedClientIsUnmapped(t *testing.T) {
+	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
 	r := httptest.NewRequest(http.MethodGet, "/dns-query", nil)
 	r.Header.Set("X-Forwarded-For", "::ffff:198.51.100.9")
-	if got := extractClientIP(r, "X-Forwarded-For"); got.String() != "198.51.100.9" || rateLimitKey(got) != "198.51.100.9" {
+	got := g.clientIP(r)
+	if got.String() != "198.51.100.9" || rateLimitKey(got) != "198.51.100.9" {
 		t.Fatalf("got %s / %s", got, rateLimitKey(got))
 	}
 }
