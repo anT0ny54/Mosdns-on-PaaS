@@ -286,13 +286,20 @@ if dockerfile_text:
     match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", dockerfile_text)
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
-    backend = urlsplit(match.group(1).rstrip("\\"))
+    try:
+        backend = urlsplit(match.group(1).rstrip("\\"))
+        backend_host = backend.hostname
+        backend_port = backend.port
+    except ValueError:
+        fail("Dockerfile MOSDNS_DOH_URL must be a valid URL")
     listener_host = listen_host(listener["addr"])
     listener_port = urlsplit("//" + listener["addr"]).port
-    if backend.hostname != listener_host:
-        fail(f"Dockerfile MOSDNS_DOH_URL host {backend.hostname} does not match listener host {listener_host}")
-    if backend.port != listener_port:
-        fail(f"Dockerfile MOSDNS_DOH_URL port {backend.port} does not match listener port {listener_port}")
+    if backend.scheme.lower() != protocol:
+        fail(f"Dockerfile MOSDNS_DOH_URL scheme {backend.scheme or '<none>'} does not match listener protocol {protocol}")
+    if backend_host != listener_host:
+        fail(f"Dockerfile MOSDNS_DOH_URL host {backend_host} does not match listener host {listener_host}")
+    if backend_port != listener_port:
+        fail(f"Dockerfile MOSDNS_DOH_URL port {backend_port} does not match listener port {listener_port}")
     if backend.path != listener["url_path"]:
         fail(f"Dockerfile MOSDNS_DOH_URL path {backend.path!r} does not match listener url_path {listener['url_path']!r}")
 gateway_timeout_ms = None
@@ -337,5 +344,17 @@ if go_mod.is_file():
             go_versions[f"ci.yml go-version #{n}"] = m.group(1)
     if len({major_minor(v) for v in go_versions.values()}) > 1:
         fail("Go versions disagree (keep them in sync): " + ", ".join(f"{k}={v}" for k, v in go_versions.items()))
+
+# --- Dockerfile ARG GATEWAY_VERSION default must mirror the VERSION file ---
+# Without this, a plain `docker build` (no build-arg) labels the image with an
+# empty version even though the binary was built from VERSION.
+version_file = project_dir / "VERSION"
+if dockerfile_text and version_file.is_file():
+    image_version = version_file.read_text(encoding="utf-8").strip()
+    m = re.search(r"^ARG[ \t]+GATEWAY_VERSION=([^\s]+)[ \t]*$", dockerfile_text, re.MULTILINE)
+    if m is None:
+        fail("Dockerfile has no literal 'ARG GATEWAY_VERSION=<version>' default")
+    if m.group(1) != image_version:
+        fail(f"Dockerfile ARG GATEWAY_VERSION default ({m.group(1)}) must equal the VERSION file ({image_version})")
 print("YAML parsed successfully; MosDNS project schema checks: OK")
 PYTHON

@@ -12,6 +12,10 @@ ARG MOSDNS_VERSION=v4.5.3
 # resolve to; the build fails if the tag ever moves. Re-resolve with:
 #   git ls-remote https://github.com/IrineSistiana/mosdns.git 'refs/tags/v4.5.3^{}'
 ARG MOSDNS_COMMIT=760a660192fdf996463b024d1d0e19bd66b6ed31
+# Mirrors the VERSION file so a plain `docker build` (Koyeb, CI) labels the
+# image correctly without a build-arg. check-config.sh verifies this default
+# still equals VERSION; --build-arg GATEWAY_VERSION overrides it.
+ARG GATEWAY_VERSION=0.5.15
 
 # Builders run on the build host and cross-compile for TARGETARCH, so
 # multi-arch builds (docker buildx --platform ...) do not run Go under QEMU.
@@ -44,9 +48,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # The gateway is our own code and internet-facing, so it builds with a
 # currently supported Go release (same major.minor as go.mod and ci.yml).
 FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS gateway-builder
-# Optional override; by default the version comes from the VERSION file, so it
-# has a single source of truth and plain `docker build` (e.g. Koyeb) gets it.
-ARG GATEWAY_VERSION=
+# Optional override. The inherited top-level default mirrors the VERSION file
+# (check-config.sh verifies that they agree), so plain `docker build` (e.g.
+# Koyeb) gets the correct version without a build-arg.
+ARG GATEWAY_VERSION
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -100,7 +105,7 @@ USER app
 # BUILD_DATE does not bust the layer cache.
 ARG BUILD_DATE=unknown
 ARG MOSDNS_VERSION
-ARG GATEWAY_VERSION=
+ARG GATEWAY_VERSION
 
 LABEL org.opencontainers.image.title="MosDNS ${MOSDNS_VERSION} + DoH Gateway" \
       org.opencontainers.image.description="Koyeb-optimized DoH gateway with MosDNS ${MOSDNS_VERSION} and HaGeZi upstream failover" \

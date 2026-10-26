@@ -34,7 +34,7 @@ build:
 	CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-s -w -buildid= -X main.version=$(VERSION)' -o doh-gateway .
 
 docker-build:
-	docker build --build-arg GATEWAY_VERSION=$(VERSION) --build-arg BUILD_DATE=$(BUILD_DATE) -t $(IMAGE) .
+	docker build --build-arg BUILD_DATE=$(BUILD_DATE) -t $(IMAGE) .
 
 run: build
 	./doh-gateway

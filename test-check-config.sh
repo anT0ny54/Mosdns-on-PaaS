@@ -20,7 +20,7 @@ trap 'exit 1' HUP INT TERM
 
 # Keep the cross-file checks active: check-config.sh discovers these files
 # beside the config being tested.
-cp "$ROOT/check-config.sh" "$ROOT/mosdns.yaml" "$ROOT/main.go" "$ROOT/Dockerfile" "$ROOT/go.mod" "$TMP/"
+cp "$ROOT/check-config.sh" "$ROOT/mosdns.yaml" "$ROOT/main.go" "$ROOT/Dockerfile" "$ROOT/go.mod" "$ROOT/VERSION" "$TMP/"
 mkdir -p "$TMP/.github/workflows"
 cp "$ROOT/.github/workflows/ci.yml" "$TMP/.github/workflows/ci.yml"
 
@@ -89,3 +89,37 @@ expect_fail string-stat-length
 expect_fail string-threshold
 expect_fail string-cache-boolean
 expect_fail extra-sequence-step
+
+cp "$TMP/Dockerfile" "$TMP/Dockerfile.orig"
+
+cp "$TMP/Dockerfile.orig" "$TMP/Dockerfile"
+sed 's#MOSDNS_DOH_URL=http://#MOSDNS_DOH_URL=https://#' \
+    "$TMP/Dockerfile" > "$TMP/Dockerfile.scheme"
+mv "$TMP/Dockerfile.scheme" "$TMP/Dockerfile"
+if sh "$TMP/check-config.sh" "$TMP/mosdns.yaml" > "$TMP/scheme.log" 2>&1; then
+    echo "test-check-config: expected an HTTPS backend to fail, but it passed" >&2
+    exit 1
+fi
+echo "PASS config validator rejects an HTTPS backend for the plain-HTTP MosDNS listener"
+
+cp "$TMP/Dockerfile.orig" "$TMP/Dockerfile"
+sed 's#MOSDNS_DOH_URL=http://127.0.0.1:8081#MOSDNS_DOH_URL=http://127.0.0.1:bad#' \
+    "$TMP/Dockerfile" > "$TMP/Dockerfile.bad-port"
+mv "$TMP/Dockerfile.bad-port" "$TMP/Dockerfile"
+if sh "$TMP/check-config.sh" "$TMP/mosdns.yaml" > "$TMP/bad-port.log" 2>&1; then
+    echo "test-check-config: expected an invalid backend port to fail, but it passed" >&2
+    exit 1
+fi
+echo "PASS config validator reports an invalid backend port cleanly"
+
+mv "$TMP/Dockerfile.orig" "$TMP/Dockerfile"
+
+# The Dockerfile's literal ARG GATEWAY_VERSION default must mirror VERSION;
+# otherwise a plain `docker build` labels the image with an empty version.
+sed 's/^ARG GATEWAY_VERSION=.*/ARG GATEWAY_VERSION=9.9.9/' "$TMP/Dockerfile" > "$TMP/Dockerfile.mismatch"
+mv "$TMP/Dockerfile.mismatch" "$TMP/Dockerfile"
+if sh "$TMP/check-config.sh" "$TMP/mosdns.yaml" > "$TMP/version.log" 2>&1; then
+    echo "test-check-config: expected a mismatched Dockerfile version to fail, but it passed" >&2
+    exit 1
+fi
+echo "PASS config validator rejects a Dockerfile version that differs from VERSION"

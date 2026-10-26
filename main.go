@@ -63,6 +63,12 @@ const (
 	readinessProbeName = "ready.doh-gateway.invalid"
 )
 
+// maxIntValue is the largest representable int as int64, computed once so
+// secondsToWindowEnd need not rebuild it on every rate-limited request. It is
+// used to clamp Retry-After on platforms where int is 32 bits (linux/arm/v7)
+// when a valid, very long RATE_WINDOW exceeds the largest representable int.
+var maxIntValue = int64(int(^uint(0) >> 1))
+
 var version = "dev"
 var dnsMessageBufferPool = sync.Pool{
 	New: func() any {
@@ -148,11 +154,8 @@ func secondsToWindowEnd(nowNanos, windowNanos int64) int {
 	if remaining%int64(time.Second) != 0 {
 		seconds++
 	}
-	// int is 32-bit on linux/arm/v7; clamp instead of overflowing when a
-	// valid, very long RATE_WINDOW exceeds the largest representable int.
-	maxInt := int64(int(^uint(0) >> 1))
-	if seconds > maxInt {
-		return int(maxInt)
+	if seconds > maxIntValue {
+		return int(maxIntValue)
 	}
 	if seconds < 1 {
 		return 1
@@ -279,9 +282,13 @@ type statusRecorder struct {
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
-	if s.status == 0 {
-		s.status = code
+	if s.status != 0 {
+		// The first status wins. Forwarding duplicates would make net/http
+		// log "superfluous response.WriteHeader" for every relayed upstream
+		// error response (headers copied, then the gateway's own status).
+		return
 	}
+	s.status = code
 	s.ResponseWriter.WriteHeader(code)
 }
 

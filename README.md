@@ -106,7 +106,7 @@ Gateway:
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8080` | Listen address (plain number 1-65535, or a Go address such as `127.0.0.1:8080`). An out-of-range number falls back to `8080`; any other value is passed to the listener as-is and is fatal at startup if it is not a valid address. |
-| `MOSDNS_DOH_URL` | `http://127.0.0.1:8081/dns-query` | Backend; must be absolute http(s). Fatal at startup if malformed. Keep it in sync with the listener in `mosdns.yaml`. |
+| `MOSDNS_DOH_URL` | `http://127.0.0.1:8081/dns-query` | Backend; must be an absolute URL. For the bundled MosDNS listener (plain HTTP), use an `http://` URL; `check-config.sh` rejects scheme mismatches. Fatal at startup if malformed. Keep it in sync with the listener in `mosdns.yaml`. |
 | `RATE_LIMIT` | `100` | `/dns-query` requests per client per window. Every GET/POST counts, including ones later rejected with `400`/`413`/`415`. |
 | `RATE_WINDOW` | `60s` | Rate-limit window (fixed, clock-aligned windows). |
 | `RATE_LIMIT_CLIENTS` | `65536` | Max distinct client keys per window; new clients are denied beyond this until the window rolls over. IPv6 clients are grouped by /64. |
@@ -198,7 +198,8 @@ cache in under 1 ms (measured end to end through the gateway).
 - exactly one server with exactly one listener, which must use the `http`
   protocol and bind to loopback (an `api.http` listener, if present, must also
   be loopback);
-- the Dockerfile's `MOSDNS_DOH_URL` host, port and path match that listener;
+- the Dockerfile's `MOSDNS_DOH_URL` scheme, host, port and path match that
+  listener (the listener is plain HTTP, so an `https://` backend is rejected);
 - the timeout chain `fast_fallback < servers[0].timeout < UPSTREAM_TIMEOUT`,
   using `UPSTREAM_TIMEOUT` from the Dockerfile (`<number>ms`, `<number>s`,
   `<number>m` or `<number>h`) or, if unset there, `defaultUpstreamTO` from
@@ -285,10 +286,11 @@ together.
 |---|---|---|
 | `MOSDNS_VERSION` | `v4.5.3` | MosDNS tag to build. |
 | `MOSDNS_COMMIT` | commit of `v4.5.3` | Mandatory full SHA; the build fails if it is empty or the tag resolves to a different commit. |
-| `GATEWAY_VERSION` | empty: the build reads `VERSION` | Optional override for `main.version`; also sets the image `version` label (empty unless passed). |
+| `GATEWAY_VERSION` | the `VERSION` file (mirrored as the Dockerfile's literal `ARG GATEWAY_VERSION` default) | Optional override for `main.version` and the image `version` label. The literal default keeps plain `docker build` (Koyeb, CI) labels correct; `check-config.sh` fails if it drifts from `VERSION`. |
 | `BUILD_DATE` | `unknown` | Image `created` label. |
 
-`make docker-build` passes `GATEWAY_VERSION` (from `VERSION`) and `BUILD_DATE`.
+`make docker-build` passes `BUILD_DATE`; the checked Dockerfile
+`GATEWAY_VERSION` default supplies the gateway and image version.
 
 ## Deployment
 
@@ -319,13 +321,22 @@ together.
 
 ## Version
 
-The gateway version lives only in `VERSION` (currently 0.5.14); the Dockerfile
+The gateway version lives in `VERSION` (currently 0.5.15); the Dockerfile
 reads it during the build (plain `docker build`, as Koyeb does, gets it too)
-and injects it with `-ldflags -X main.version=...`. The MosDNS version and its
+and injects it with `-ldflags -X main.version=...`. The top-level
+`ARG GATEWAY_VERSION` default mirrors `VERSION` so the image's
+`org.opencontainers.image.version` label is correct even without a build-arg;
+`check-config.sh` fails if the two ever disagree. The MosDNS version and its
 commit pin are set in the Dockerfile (`ARG MOSDNS_VERSION`, `ARG
-MOSDNS_COMMIT`). To bump the gateway version, edit `VERSION` only. Release notes are in [`CHANGELOG.md`](CHANGELOG.md).
+MOSDNS_COMMIT`). To bump the gateway version, update `VERSION` and the
+Dockerfile's top-level `ARG GATEWAY_VERSION` default together;
+`check-config.sh` fails if the two disagree. Release notes are in [`CHANGELOG.md`](CHANGELOG.md).
 
-## 🌐 Free DNS Services
+## 🔗 Related projects (not part of this repository)
+
+The services below are maintained separately and are **not** part of this repository, its build pipeline, or its release cycle. They are listed here for convenience only.
+
+### 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
@@ -338,7 +349,7 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
 | Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
-## ⚡ Bandwidth Hero Server
+### ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 
