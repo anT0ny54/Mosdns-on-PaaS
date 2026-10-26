@@ -1,3 +1,15 @@
-.DS_Store
+.git
+.github
+.gitignore
+.gitattributes
+.dockerignore
+README.md
+CHANGELOG.md
+keep-alive.txt
+*_test.go
+Makefile
+check-config.sh
+test-entrypoint.sh
+doh-gateway
 .env
-/doh-gateway
+test-check-config.sh
