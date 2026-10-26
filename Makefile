@@ -2,11 +2,11 @@ IMAGE ?= mosdns-on-paas:local
 VERSION := $(shell cat VERSION)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: test fmt-check check-config entrypoint-test entrypoint-test-busybox vet build docker-build run clean
+.PHONY: test fmt-check check-config check-config-test entrypoint-test entrypoint-test-busybox vet build docker-build run clean
 
 # Unit tests always run with the race detector: the gateway is heavily
 # concurrent (slots, limiter, shared readiness probe).
-test: fmt-check check-config entrypoint-test vet
+test: fmt-check check-config check-config-test entrypoint-test vet
 	go test -race ./...
 
 fmt-check:
@@ -14,6 +14,9 @@ fmt-check:
 
 check-config:
 	sh ./check-config.sh mosdns.yaml
+
+check-config-test:
+	sh ./test-check-config.sh
 
 entrypoint-test:
 	sh ./test-entrypoint.sh

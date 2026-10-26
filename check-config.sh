@@ -192,19 +192,28 @@ if exact_int(cache.get("lazy_cache_ttl"), f"plugins[{cache_tag}].args.lazy_cache
     fail(f"plugins[{cache_tag}].args.lazy_cache_ttl must not be negative")
 if exact_int(cache.get("lazy_cache_reply_ttl"), f"plugins[{cache_tag}].args.lazy_cache_reply_ttl") < 0:
     fail(f"plugins[{cache_tag}].args.lazy_cache_reply_ttl must not be negative")
-if not exact_bool(cache.get("cache_everything"), f"plugins[{cache_tag}].args.cache_everything") and "_edns0_filter_no_edns0" not in edns_filters:
+cache_everything = exact_bool(cache.get("cache_everything"), f"plugins[{cache_tag}].args.cache_everything")
+if not cache_everything and "_edns0_filter_no_edns0" not in edns_filters:
     fail(f"plugins[{cache_tag}].args.cache_everything must be true: MosDNS v4 skips the cache for every query with an EDNS0 record, which nearly all DoH clients send")
-if cache.get("cache_everything") and not edns_filters:
+if cache_everything and not edns_filters:
     fail(f"{seq_path}: with cache_everything an _edns0_filter_* entry must precede {cache_tag}, or EDNS padding/cookies fragment the cache keys")
 if cache.get("when_hit") != "_return":
     fail(f"plugins[{cache_tag}].args.when_hit must be _return")
-fallback = None
-for item in exec_chain[position + 1:]:
-    if isinstance(item, dict) and "primary" in item:
-        fallback = item
-        break
-if fallback is None:
-    fail(f"{seq_path} must contain a primary/secondary fallback entry after {cache_tag}")
+if position + 2 != len(exec_chain):
+    fail(f"{seq_path} must contain exactly one primary/secondary fallback after {cache_tag}; extra or unvalidated sequence entries are not allowed")
+fallback = exec_chain[position + 1]
+if not isinstance(fallback, dict) or "primary" not in fallback or "secondary" not in fallback:
+    fail(f"{seq_path} must contain a primary/secondary fallback entry immediately after {cache_tag}")
+unknown_fallback_keys = set(fallback) - {"primary", "secondary", "stat_length", "threshold", "fast_fallback", "always_standby"}
+if unknown_fallback_keys:
+    fail(f"{seq_path} fallback contains unsupported key(s): {', '.join(sorted(str(k) for k in unknown_fallback_keys))}")
+# These optional fields are part of MosDNS v4.5.3's FallbackConfig.
+# stat_length=0 disables normal fallback; negative values are almost certainly
+# a config mistake. threshold is clamped to stat_length by MosDNS when enabled.
+if "stat_length" in fallback and exact_int(fallback.get("stat_length"), f"{seq_path}[].stat_length") < 0:
+    fail("main sequence stat_length must not be negative")
+if "threshold" in fallback and exact_int(fallback.get("threshold"), f"{seq_path}[].threshold") < 0:
+    fail("main sequence threshold must not be negative")
 for side in ("primary", "secondary"):
     tags = expect_list(fallback.get(side), f"{seq_path}[].{side}")
     if not tags:

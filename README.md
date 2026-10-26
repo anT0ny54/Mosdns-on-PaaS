@@ -19,7 +19,11 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
   so the 8 s floor applies; raised timeouts raise the deadline with them. The
   body read is included because the write deadline starts when the request
   headers arrive, so a slow POST upload still ends in a `503`/`504` instead of
-  a dropped connection. A startup warning is logged if `UPSTREAM_TIMEOUT` is
+  a dropped connection. Once a request has been fully read (the POST body, or
+  the request itself for a GET) the gateway clears the connection's read
+  deadline, so the 5 s whole-request limit cannot cancel a request that is only
+  waiting in the queue or on MosDNS under a raised `QUEUE_WAIT` or
+  `UPSTREAM_TIMEOUT`. A startup warning is logged if `UPSTREAM_TIMEOUT` is
   not above the MosDNS server timeout (2 s).
 - **MosDNS v4.5.3** (built from upstream in the Dockerfile): listens on
   `127.0.0.1:8081` (`/dns-query`), answers the readiness probe name locally,
@@ -39,10 +43,12 @@ then `KILL` if it is still alive after a 6 s grace period) so the gateway can
 drain while MosDNS is still available, then stops MosDNS the same way (3 s
 grace). Together that is 9 s, inside Docker's default 10 s stop timeout. A
 signal that arrives while the entrypoint is already tearing down after a child
-crash is ignored, so the exit status stays 1. Exit is polled every 0.2 s, so a child that stops quickly costs no
-extra wait (this needs a `sleep` that accepts fractions; BusyBox in Alpine
-does). Supervision is process-level only: it detects an *exit*, not a wedge. If
-MosDNS hangs without exiting, point the platform health check at the gateway's
+crash is ignored, so the exit status stays 1. The supervision loop checks for a
+child exit once per second; during shutdown, each child is polled every 0.2 s so
+an already-stopped child does not consume its full grace period (BusyBox `sleep`
+supports fractional seconds). Supervision is process-level only: it detects
+an *exit*, not a wedge. If MosDNS hangs without exiting, point the platform
+health check at the gateway's
 `/readyz` (HTTP, not just TCP). The entrypoint honours these optional
 variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 (default `/etc/mosdns`), and `MOSDNS_BIN` / `GATEWAY_BIN` (default
@@ -160,8 +166,9 @@ from the others, which would reduce the race to `root.hagezi.org` for those
 answers. The server timeout is 2 s (mirrored by `mosdnsServerTimeout` in
 `main.go`). `enable_pipeline` has no effect on DoH upstreams in MosDNS v4.5.3
 (it only applies to TCP/DoT) and `max_conns` already defaults to 2 for DoH, so
-the file sets neither; `check-config.sh` validates these and other optional
-keys (`idle_timeout`, `always_standby`) only when present.
+the file sets neither. `check-config.sh` validates optional upstream keys such
+as `idle_timeout` and optional fallback fields `stat_length`, `threshold`, and
+`always_standby` when present.
 
 Why the EDNS filter and `cache_everything`: MosDNS v4.5.3 only caches "simple"
 queries unless `cache_everything` is true, and any EDNS0 OPT record (sent by
@@ -181,7 +188,8 @@ cache in under 1 ms (measured end to end through the gateway).
   then a `primary`/`secondary` fallback whose tags are `fast_forward` plugins
   with at least one upstream each (tag names are free); in a `fast_forward`
   with several upstreams, every upstream after the first must be
-  `trusted: true`;
+  `trusted: true`; fallback keys are restricted to the MosDNS v4.5.3 schema,
+  and optional `stat_length`/`threshold` values must be nonnegative integers;
 - `cache_everything` is true (unless `_edns0_filter_no_edns0` is used) and an
   `_edns0_filter_*` entry precedes the cache;
 - an `arbitrary` plugin before the cache answers the gateway's
@@ -212,15 +220,17 @@ compatibility with the selected MosDNS release.
 ## Build and test
 
 ```sh
-make test            # gofmt check + check-config + entrypoint-test + go vet + go test -race (needs Python 3.8+/PyYAML)
-make check-config    # validate mosdns.yaml and cross-file consistency only
-make entrypoint-test # run test-entrypoint.sh (supervision test with fake children)
-make entrypoint-test-busybox # the same under BusyBox ash, the shell of the image
-make vet             # go vet only
-make build           # local binary ./doh-gateway
-make docker-build    # multi-stage image (MosDNS + gateway)
-make run             # local gateway on :8080 (needs a backend on :8081)
-make clean           # remove ./doh-gateway
+make test                    # gofmt + config checks/tests + entrypoint-test + vet + race tests
+                             # requires Python 3.8+ and PyYAML for config checks
+make check-config            # validate mosdns.yaml and cross-file consistency only
+make check-config-test       # regression tests for the config validator
+make entrypoint-test         # supervision test with fake children
+make entrypoint-test-busybox # the same under BusyBox ash, the image's shell
+make vet                     # go vet only
+make build                   # local binary ./doh-gateway
+make docker-build            # multi-stage image (MosDNS + gateway)
+make run                     # local gateway on :8080 (needs a backend on :8081)
+make clean                   # remove ./doh-gateway
 ```
 
 The local image tag defaults to `mosdns-on-paas:local` (Docker image repository
@@ -262,8 +272,8 @@ Docker build arguments (all have defaults in the Dockerfile). The builder
 stages run on `$BUILDPLATFORM` and cross-compile for `TARGETARCH` (GOARM is
 set only for 32-bit arm), so `docker buildx build --platform
 linux/amd64,linux/arm64 .` does not run Go under emulation. The base images
-(`golang:1.19.13-bookworm` for MosDNS, `golang:1.27-bookworm` for the gateway,
-`alpine:3.24.2` for the runtime) are written literally in the `FROM` lines,
+(`golang:1.19.13-bookworm` for MosDNS, `golang:1.27.3-bookworm` for the gateway,
+`alpine:3.24.3` for the runtime) are written literally in the `FROM` lines,
 each pinned by multi-arch digest. They are not build arguments because
 Dependabot cannot read ARG-templated `FROM` lines. `.github/dependabot.yml`
 proposes digest and patch updates weekly; for `golang` it ignores minor and

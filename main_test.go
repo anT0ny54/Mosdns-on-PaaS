@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +47,9 @@ func okBackend() *httptest.Server {
 		_, _ = w.Write([]byte(testDNSBody))
 	}))
 }
+
+// testAddr parses a literal address for limiter keys.
+func testAddr(s string) netip.Addr { return netip.MustParseAddr(s) }
 
 func testGateway(t testing.TB, backend string, limit int, concurrency int) *gateway {
 	t.Helper()
@@ -108,16 +110,16 @@ func TestRateLimitPerClient(t *testing.T) {
 func TestRateLimiterClientCap(t *testing.T) {
 	l := newFixedWindowLimiterWithMaxKeys(10, time.Minute, 2)
 	l.now = func() time.Time { return time.Unix(120, 0) }
-	if l.admit("198.51.100.1") != 0 {
+	if l.admit(testAddr("198.51.100.1")) != 0 {
 		t.Fatal("first client denied")
 	}
-	if l.admit("198.51.100.2") != 0 {
+	if l.admit(testAddr("198.51.100.2")) != 0 {
 		t.Fatal("second client denied")
 	}
-	if l.admit("198.51.100.3") == 0 {
+	if l.admit(testAddr("198.51.100.3")) == 0 {
 		t.Fatal("third client exceeded key cap but was allowed")
 	}
-	if l.admit("198.51.100.1") != 0 {
+	if l.admit(testAddr("198.51.100.1")) != 0 {
 		t.Fatal("existing client denied after key cap reached")
 	}
 }
@@ -163,6 +165,12 @@ func TestDoHGETParameterValidation(t *testing.T) {
 	}
 	if isValidDoHGetParameter(strings.Repeat("A", 15)+"=") || isValidDoHGetParameter("AAAAAAAAAAAAAAA!") {
 		t.Fatal("invalid alphabet accepted")
+	}
+	if isValidDoHGetParameter(strings.Repeat("A", 17)+"B") || isValidDoHGetParameter(strings.Repeat("A", 18)+"B") {
+		t.Fatal("non-zero unused Base64URL trailing bits accepted")
+	}
+	if !isValidDoHGetParameter(strings.Repeat("A", 18)) || !isValidDoHGetParameter(strings.Repeat("A", 19)) {
+		t.Fatal("canonical Base64URL values with two- or three-character final groups rejected")
 	}
 	if !isValidDoHGetParameter(base64.RawURLEncoding.EncodeToString(make([]byte, maxDNSMessageBytes))) {
 		t.Fatal("max-size payload rejected")
@@ -554,38 +562,54 @@ func TestGETValidBase64URL(t *testing.T) {
 func TestFixedWindowResets(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(120, 0) }
-	if l.admit("198.51.100.1") != 0 {
+	if l.admit(testAddr("198.51.100.1")) != 0 {
 		t.Fatal("first request denied")
 	}
-	if l.admit("198.51.100.1") == 0 {
+	if l.admit(testAddr("198.51.100.1")) == 0 {
 		t.Fatal("second request allowed in same window")
 	}
 	l.now = func() time.Time { return time.Unix(180, 0) }
-	if l.admit("198.51.100.1") != 0 {
+	if l.admit(testAddr("198.51.100.1")) != 0 {
 		t.Fatal("request denied after window reset")
 	}
 }
 func TestFixedWindowRetryAfter(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(125, 0) }
-	if got := l.admit("198.51.100.20"); got != 0 {
+	if got := l.admit(testAddr("198.51.100.20")); got != 0 {
 		t.Fatalf("first request denied (retry-after=%d)", got)
 	}
-	if got := l.admit("198.51.100.20"); got != 55 {
+	if got := l.admit(testAddr("198.51.100.20")); got != 55 {
 		t.Fatalf("retry-after=%d, want 55", got)
 	}
 	l.now = func() time.Time { return time.Unix(179, 0) }
-	if got := l.admit("198.51.100.20"); got != 1 {
+	if got := l.admit(testAddr("198.51.100.20")); got != 1 {
 		t.Fatalf("retry-after=%d, want 1", got)
 	}
 	// A new client rejected by the key cap gets the same window-based value.
 	capped := newFixedWindowLimiterWithMaxKeys(10, time.Minute, 1)
 	capped.now = func() time.Time { return time.Unix(125, 0) }
-	capped.admit("198.51.100.1")
-	if got := capped.admit("198.51.100.2"); got != 55 {
+	capped.admit(testAddr("198.51.100.1"))
+	if got := capped.admit(testAddr("198.51.100.2")); got != 55 {
 		t.Fatalf("key-cap retry-after=%d, want 55", got)
 	}
 }
+func TestFixedWindowRetryAfterDoesNotOverflowForLargeWindows(t *testing.T) {
+	const maxDurationNanos int64 = 1<<63 - 1
+	remaining := maxDurationNanos
+	want := remaining / int64(time.Second)
+	if remaining%int64(time.Second) != 0 {
+		want++
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if want > maxInt {
+		want = maxInt
+	}
+	if got := secondsToWindowEnd(0, maxDurationNanos); int64(got) != want {
+		t.Fatalf("large-window Retry-After=%d, want %d", got, want)
+	}
+}
+
 func TestSlowBodyDoesNotHoldProcessingSlot(t *testing.T) {
 	backend := okBackend()
 	defer backend.Close()
@@ -675,18 +699,18 @@ func TestClientHeadersAreNotForwarded(t *testing.T) {
 	}
 }
 func TestRateLimitKeyGroupsIPv6By64(t *testing.T) {
-	key := func(s string) string { return rateLimitKey(netip.MustParseAddr(s)) }
+	key := func(s string) netip.Addr { return rateLimitKey(netip.MustParseAddr(s)) }
 	if a, b := key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"); a != b {
-		t.Fatalf("same /64 produced different keys: %q vs %q", a, b)
+		t.Fatalf("same /64 produced different keys: %v vs %v", a, b)
 	}
 	if key("2001:db8:1:2::1") == key("2001:db8:1:3::1") {
 		t.Fatal("different /64 networks share a key")
 	}
-	if got := key("198.51.100.7"); got != "198.51.100.7" {
-		t.Fatalf("IPv4 key changed: %q", got)
+	if got := key("198.51.100.7"); got != testAddr("198.51.100.7") {
+		t.Fatalf("IPv4 key changed: %v", got)
 	}
-	if got := rateLimitKey(netip.Addr{}); got != "unknown" {
-		t.Fatalf("fallback key changed: %q", got)
+	if got := rateLimitKey(netip.Addr{}); got.IsValid() {
+		t.Fatalf("undeterminable client got key %v, want the zero Addr", got)
 	}
 }
 func TestClientIPHeaderTrust(t *testing.T) {
@@ -1004,7 +1028,7 @@ func TestLimiterReadsClockUnderLock(t *testing.T) {
 		}
 		return time.Unix(120, 0)
 	}
-	if l.admit("198.51.100.1") != 0 {
+	if l.admit(testAddr("198.51.100.1")) != 0 {
 		t.Fatal("first request denied")
 	}
 }
@@ -1235,16 +1259,17 @@ func TestLimiterReleasesMemoryAfterSpike(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(120, 0) }
 	for i := 0; i <= limiterShrinkThreshold; i++ {
-		l.admit("k" + strconv.Itoa(i))
+		l.admit(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}))
 	}
 	before := l.counts
 	l.now = func() time.Time { return time.Unix(180, 0) }
-	l.admit("fresh")
+	l.admit(testAddr("203.0.113.1"))
 	if len(l.counts) != 1 {
 		t.Fatalf("counts after rollover=%d, want 1", len(l.counts))
 	}
-	before["probe"] = 1
-	if _, shared := l.counts["probe"]; shared {
+	probe := testAddr("203.0.113.2")
+	before[probe] = 1
+	if _, shared := l.counts[probe]; shared {
 		t.Fatal("limiter kept the oversized map after a spike")
 	}
 }
@@ -1264,7 +1289,7 @@ func TestIPv4MappedClientIsUnmapped(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/dns-query", nil)
 	r.Header.Set("X-Forwarded-For", "::ffff:198.51.100.9")
 	got := g.clientIP(r)
-	if got.String() != "198.51.100.9" || rateLimitKey(got) != "198.51.100.9" {
+	if got.String() != "198.51.100.9" || rateLimitKey(got) != testAddr("198.51.100.9") {
 		t.Fatalf("got %s / %s", got, rateLimitKey(got))
 	}
 }

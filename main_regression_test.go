@@ -550,3 +550,41 @@ func TestBodyDeadlineDoesNotCancelSlowBackend(t *testing.T) {
 		}
 	}
 }
+
+// A GET has no body to clear the connection's read deadline with, so the
+// server's ReadTimeout would stay armed during the handler; its background read
+// would then cancel the request context and a slow-but-allowed upstream wait
+// would end in an empty response. The upstream here answers after the
+// ReadTimeout but well within UPSTREAM_TIMEOUT.
+func TestGETUpstreamWaitOutlivesServerReadTimeout(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(make([]byte, 32))
+	}))
+	defer backend.Close()
+	g := regGateway(t, backend.URL+"/dns-query", nil)
+	server := &http.Server{
+		Handler:           g,
+		ReadHeaderTimeout: 200 * time.Millisecond,
+		ReadTimeout:       300 * time.Millisecond,
+		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, g.queueWait, g.upstreamTimeout),
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	go func() { _ = server.Serve(ln) }()
+	client := &http.Client{Timeout: 5 * time.Second}
+	// 12 zero bytes as raw base64url: the smallest valid DNS message.
+	resp, err := client.Get("http://" + ln.Addr().String() + "/dns-query?dns=AAAAAAAAAAAAAAAA")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || len(body) != 32 {
+		t.Fatalf("status = %d, body = %d bytes; want 200 with the 32-byte answer", resp.StatusCode, len(body))
+	}
+}

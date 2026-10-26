@@ -70,19 +70,23 @@ var dnsMessageBufferPool = sync.Pool{
 		return &b
 	},
 }
-var isBase64URLChar = func() [256]bool {
-	var table [256]bool
+
+// base64URLCharValue stores each Base64URL alphabet index plus one, leaving
+// zero as the invalid-character sentinel. The values also let GET validation
+// reject non-zero unused trailing bits without decoding or allocating.
+var base64URLCharValue = func() [256]uint8 {
+	var table [256]uint8
 	for c := 'A'; c <= 'Z'; c++ {
-		table[c] = true
+		table[c] = uint8(c-'A') + 1
 	}
 	for c := 'a'; c <= 'z'; c++ {
-		table[c] = true
+		table[c] = uint8(c-'a') + 27
 	}
 	for c := '0'; c <= '9'; c++ {
-		table[c] = true
+		table[c] = uint8(c-'0') + 53
 	}
-	table['-'] = true
-	table['_'] = true
+	table['-'] = 63
+	table['_'] = 64
 	return table
 }()
 
@@ -94,7 +98,7 @@ type fixedWindowLimiter struct {
 	window   time.Duration
 	maxKeys  int
 	windowID int64
-	counts   map[string]int
+	counts   map[netip.Addr]int
 	now      func() time.Time
 }
 
@@ -103,7 +107,7 @@ func newFixedWindowLimiterWithMaxKeys(limit int, window time.Duration, maxKeys i
 		limit:   limit,
 		window:  window,
 		maxKeys: maxKeys,
-		counts:  make(map[string]int),
+		counts:  make(map[netip.Addr]int),
 		now:     time.Now,
 	}
 }
@@ -111,7 +115,7 @@ func newFixedWindowLimiterWithMaxKeys(limit int, window time.Duration, maxKeys i
 // admit counts one request for key and returns 0 if it is allowed, or else
 // the seconds until the current window ends (for Retry-After). The decision
 // and the Retry-After value come from the same clock reading, under the lock.
-func (l *fixedWindowLimiter) admit(key string) (retryAfter int) {
+func (l *fixedWindowLimiter) admit(key netip.Addr) (retryAfter int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	nowNanos := l.now().UnixNano()
@@ -120,7 +124,7 @@ func (l *fixedWindowLimiter) admit(key string) (retryAfter int) {
 	if windowID != l.windowID {
 		l.windowID = windowID
 		if len(l.counts) > limiterShrinkThreshold {
-			l.counts = make(map[string]int)
+			l.counts = make(map[netip.Addr]int)
 		} else {
 			clear(l.counts)
 		}
@@ -139,11 +143,21 @@ func secondsToWindowEnd(nowNanos, windowNanos int64) int {
 	if elapsed < 0 {
 		elapsed += windowNanos
 	}
-	seconds := int((windowNanos - elapsed + int64(time.Second) - 1) / int64(time.Second))
+	remaining := windowNanos - elapsed
+	seconds := remaining / int64(time.Second)
+	if remaining%int64(time.Second) != 0 {
+		seconds++
+	}
+	// int is 32-bit on linux/arm/v7; clamp instead of overflowing when a
+	// valid, very long RATE_WINDOW exceeds the largest representable int.
+	maxInt := int64(int(^uint(0) >> 1))
+	if seconds > maxInt {
+		return int(maxInt)
+	}
 	if seconds < 1 {
 		return 1
 	}
-	return seconds
+	return int(seconds)
 }
 
 type gatewayMetrics struct {
@@ -476,6 +490,13 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		// A GET has no body, so the request is already fully read. As for POST
+		// above, clear the connection's read deadline: otherwise the server's
+		// ReadTimeout stays armed, its background read fails when it expires and
+		// cancels the request context, and a raised QUEUE_WAIT/UPSTREAM_TIMEOUT
+		// would end without any gateway response. The server sets fresh
+		// deadlines for the next request on this connection.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 	}
 	queueStart := time.Now()
 	select {
@@ -537,6 +558,10 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// One pooled buffer serves both the optional error body and the 2xx answer.
+	respBuf := dnsMessageBufferPool.Get().(*[]byte)
+	defer dnsMessageBufferPool.Put(respBuf)
+
 	// Classify non-2xx status codes before reading their bodies. A redirect is
 	// rejected immediately (its body may never finish), and an upstream 4xx/5xx
 	// keeps its status even if its optional, bounded body is oversized or
@@ -551,8 +576,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		respBuf := dnsMessageBufferPool.Get().(*[]byte)
-		defer dnsMessageBufferPool.Put(respBuf)
 		respBody, readErr := readDNSMessage(resp.Body, respBuf)
 		if r.Context().Err() != nil {
 			return
@@ -575,8 +598,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBuf := dnsMessageBufferPool.Get().(*[]byte)
-	defer dnsMessageBufferPool.Put(respBuf)
 	respBody, err := readDNSMessage(resp.Body, respBuf)
 	if err != nil {
 		g.failBackend(w, r, err)
@@ -674,9 +695,17 @@ func isValidDoHGetParameter(value string) bool {
 		return false
 	}
 	for i := 0; i < len(value); i++ {
-		if !isBase64URLChar[value[i]] {
+		if base64URLCharValue[value[i]] == 0 {
 			return false
 		}
+	}
+	// Raw Base64URL omits padding, but unused low bits in its final
+	// character must still be zero. Reject alternate spellings of the same
+	// byte sequence while keeping this hot-path check allocation-free.
+	lastValue := base64URLCharValue[value[len(value)-1]] - 1
+	if (remainder == 2 && lastValue&0x0f != 0) ||
+		(remainder == 3 && lastValue&0x03 != 0) {
+		return false
 	}
 	return true
 }
@@ -911,19 +940,19 @@ func (g *gateway) peerIsTrustedProxy(peer netip.Addr) bool {
 	return false
 }
 
-// rateLimitKey keys IPv4 clients by address and IPv6 clients by /64.
-func rateLimitKey(ip netip.Addr) string {
-	if !ip.IsValid() {
-		return "unknown"
-	}
-	if ip.Is4() {
-		return ip.String()
+// rateLimitKey keys IPv4 clients by address and IPv6 clients by /64. An
+// address that could not be determined stays the zero Addr, so all such
+// clients share one bucket. netip.Addr is comparable and is used as the map key
+// directly, so no string is built per request.
+func rateLimitKey(ip netip.Addr) netip.Addr {
+	if !ip.IsValid() || ip.Is4() {
+		return ip
 	}
 	p, err := ip.WithZone("").Prefix(64)
 	if err != nil {
-		return ip.String()
+		return ip.WithZone("")
 	}
-	return p.Addr().String()
+	return p.Addr()
 }
 
 func methodNotAllowed(w http.ResponseWriter, allow string) {
@@ -942,7 +971,7 @@ func writeText(w http.ResponseWriter, status int, body string) {
 func copyResponseHeaders(dst, src http.Header) {
 	connectionTokens := connectionHeaderTokens(src)
 	for k, values := range src {
-		if isHopByHopHeader(k) || connectionTokens[strings.ToLower(k)] ||
+		if isHopByHopHeader(k) || (connectionTokens != nil && connectionTokens[http.CanonicalHeaderKey(k)]) ||
 			strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "X-Content-Type-Options") {
 			continue
 		}
@@ -982,20 +1011,27 @@ func connectionHeaderTokens(h http.Header) map[string]bool {
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
 			if token != "" {
-				tokens[strings.ToLower(token)] = true
+				// Canonical form, so the relay loop can look header names up
+				// directly (backend header names are already canonical).
+				tokens[http.CanonicalHeaderKey(token)] = true
 			}
 		}
 	}
 	return tokens
 }
 
+// hopByHopHeaders are never relayed to the client (RFC 9110 section 7.6.1).
+var hopByHopHeaders = [...]string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+
+// isHopByHopHeader compares case-insensitively without allocating, because it
+// runs for every relayed response header.
 func isHopByHopHeader(name string) bool {
-	switch strings.ToLower(name) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
+	for _, h := range hopByHopHeaders {
+		if len(name) == len(h) && strings.EqualFold(name, h) {
+			return true
+		}
 	}
+	return false
 }
 
 func isTimeoutError(err error) bool {

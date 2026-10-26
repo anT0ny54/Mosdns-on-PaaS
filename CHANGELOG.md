@@ -13,7 +13,13 @@ code, made the metrics templates compile-time constants, and hardened the
 throughput harness against false 503s. A last read-everything pass (every
 source, test, script and workflow file) corrected a changelog claim that did
 not match the repository, removed a single-use helper and aligned the CI image
-tag. The project version remains 0.5.14.
+tag. This pass also made GET Base64URL validation canonical without allocations,
+made large-window Retry-After rounding overflow-safe, tightened sequence/cache
+configuration checks, corrected the README's supervision-poll interval, and
+refreshed the pinned Go gateway and Alpine runtime images. A further
+full-project pass (every file read in full) fixed a GET read-deadline conflict
+with raised timeouts and removed avoidable per-request and per-header
+allocations. The project version remains 0.5.14.
 
 ### Fixed
 - **An upstream error status could be replaced by a gateway error.** The
@@ -56,6 +62,9 @@ tag. The project version remains 0.5.14.
   headers such as `Content-Type`, `Content-Encoding` and `Content-Range` are
   also removed while useful headers such as `Retry-After` are preserved.
 - **The sustained-load benchmark could measure rejection and connection churn instead of gateway throughput.** It now uses a fixed worker count within the active-request ceiling, an effectively non-limiting test rate limit, and drains response bodies to preserve keep-alive reuse. The opt-in 5,000-RPS test also drains its responses. Its harness also sets a 5 s `QueueWait`: the 16 workers share 8 processing slots, and the 100 ms default could turn ordinary queueing on a slow or heavily loaded host into `503` responses and a false failure.
+- **A canonical raw Base64URL GET value could be represented by malformed trailing bits.** GET validation now rejects non-zero unused low bits in the final character without decoding or adding allocations.
+- **Very large but valid `RATE_WINDOW` durations could overflow `Retry-After` rounding.** The calculation now rounds without overflowing and clamps to the largest `int` on 32-bit targets.
+- **A `GET /dns-query` could lose its answer when `QUEUE_WAIT` or `UPSTREAM_TIMEOUT` was raised.** Only the POST path cleared the connection's read deadline after reading the request. For a GET the server's 5 s `ReadTimeout` stayed armed while the handler ran; when it expired the server's background read canceled the request context, so a request still waiting on MosDNS (queue wait + upstream time above about 5 s) was abandoned and the gateway returned without writing the answer, contradicting the documented behavior that the write deadline and timeouts scale together. A GET now clears the read deadline once its parameter is validated, exactly as a POST does after its body. Covered by `TestGETUpstreamWaitOutlivesServerReadTimeout`.
 
 ### Removed (dead code)
 - The always-zero `3xx` response-status series (`responses3xxTotal` and its
@@ -85,3 +94,28 @@ tag. The project version remains 0.5.14.
   (same `502` "bad upstream request" response and `backend_error` count), and
   the buffer pool's constructor uses `any` instead of `interface{}`. No
   behavior change.
+- The MosDNS sequence checker now requires exactly one fallback immediately
+  after the cache, rejects unsupported fallback keys and non-boolean
+  `cache_everything` values, and validates optional `stat_length` and
+  `threshold` types/ranges. The allowlist includes all v4.5.3 fallback fields,
+  so valid `stat_length` and `threshold` settings are not falsely rejected.
+- Added config-checker regression tests for valid optional fallback settings,
+  unsupported keys, non-boolean cache settings, negative or mistyped fallback
+  fields, and extra sequence steps; these run as part of `make test`.
+- The gateway builder now pins Go 1.27.3 and the runtime pins Alpine 3.24.3,
+  both by their multi-architecture index digests.
+- README supervision timing now distinguishes the once-per-second crash check
+  from the 0.2-second polling used while stopping a child.
+- The rate limiter is keyed by `netip.Addr` instead of a formatted string, so
+  admitting a request no longer allocates a key string. Grouping is unchanged
+  (IPv4 by address, IPv6 by /64, clients whose address cannot be determined
+  share one bucket); the limiter tests use `netip.Addr` keys.
+- Relaying backend response headers no longer lowercases every header name
+  (two allocations per header on every response): hop-by-hop headers are
+  matched case-insensitively without allocating, and `Connection` tokens are
+  stored and looked up in canonical form. Which headers are dropped is
+  unchanged.
+- `serveDNS` takes one pooled buffer for both the upstream error-body path and
+  the 2xx answer instead of acquiring it separately in each branch.
+- `test-check-config.sh` falls back to `python` when `python3` is absent, like
+  `check-config.sh` does, so the two scripts accept the same interpreters.
