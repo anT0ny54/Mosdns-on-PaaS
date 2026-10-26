@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -19,26 +20,42 @@ func BenchmarkGatewayParallelPOST(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var next uint64
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			i := atomic.AddUint64(&next, 1)
-			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", strings.NewReader(testDNSBody))
-			req.Header.Set("Content-Type", "application/dns-message")
-			req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(int(i%250)+1))
-			resp, err := client.Do(req)
-			if err != nil {
-				b.Error(err)
-				return
+	var wg sync.WaitGroup
+	// Keep concurrency within the gateway's admission ceiling even on CI
+	// hosts where GOMAXPROCS exceeds defaultMaxActiveRequests.
+	workers := defaultMaxActiveRequests
+	wg.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			defer wg.Done()
+			for {
+				i := atomic.AddUint64(&next, 1)
+				if i > uint64(b.N) {
+					return
+				}
+				req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", strings.NewReader(testDNSBody))
+				req.Header.Set("Content-Type", "application/dns-message")
+				req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(int(i%250)+1))
+				resp, err := client.Do(req)
+				if err != nil {
+					b.Error(err)
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					b.Errorf("status=%d", resp.StatusCode)
+				}
+				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+					b.Error(err)
+				}
+				if err := resp.Body.Close(); err != nil {
+					b.Error(err)
+				}
 			}
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
-				b.Errorf("status=%d", resp.StatusCode)
-				return
-			}
-			resp.Body.Close()
-		}
-	})
+		}()
+	}
+	wg.Wait()
 }
+
 func TestFiveThousandRPSTarget(t *testing.T) {
 	if testing.Short() || !getenvBool("REQUIRE_5000_RPS") {
 		t.Skip("set REQUIRE_5000_RPS=1 to enforce the 5,000 RPS throughput gate")
@@ -70,7 +87,12 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 						atomic.AddInt64(&failures, 1)
 					}
 					if resp != nil {
-						resp.Body.Close()
+						if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+							atomic.AddInt64(&failures, 1)
+						}
+						if err := resp.Body.Close(); err != nil {
+							atomic.AddInt64(&failures, 1)
+						}
 					}
 				}
 			}()
@@ -101,10 +123,14 @@ func throughputHarness(tb testing.TB) (*httptest.Server, *http.Client, func()) {
 		w.Header().Set("Content-Type", "application/dns-message")
 		_, _ = w.Write([]byte(testDNSBody))
 	}))
+	// 16 workers share 8 processing slots; the long QueueWait keeps a slow or
+	// heavily loaded host from turning normal queueing into 503s.
 	g := newTestGateway(tb, gatewayOptions{
-		BackendURL:      backend.URL,
-		RateLimit:       100000,
-		TrustedIPHeader: "X-Forwarded-For",
+		BackendURL:       backend.URL,
+		RateLimit:        int(^uint(0) >> 1),
+		RateLimitClients: 256, // 250 synthetic client IPs are used below.
+		QueueWait:        5 * time.Second,
+		TrustedIPHeader:  "X-Forwarded-For",
 	})
 	server := httptest.NewServer(g)
 	client := &http.Client{Transport: &http.Transport{

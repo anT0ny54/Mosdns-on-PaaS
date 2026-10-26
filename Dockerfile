@@ -77,9 +77,10 @@ COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=0644 LICENSE /usr/share/licenses/doh-gateway/LICENSE
 COPY --from=mosdns-builder --chmod=0644 /src/LICENSE /usr/share/licenses/mosdns/LICENSE
 
-# Only values that differ from the gateway's built-in defaults (see main.go) or
-# that couple the two processes are set here. MOSDNS_CONFIG, MOSDNS_DOH_URL and
-# UPSTREAM_TIMEOUT repeat built-in defaults on purpose: they make the coupling
+# Only values that differ from the built-in defaults (main.go and entrypoint.sh)
+# or that couple the two processes are set here. MOSDNS_CONFIG (the entrypoint
+# default), MOSDNS_DOH_URL and UPSTREAM_TIMEOUT (gateway defaults) repeat
+# built-in defaults on purpose: they make the coupling
 # explicit, and `make check-config` verifies that MOSDNS_DOH_URL matches the
 # listener in mosdns.yaml and that UPSTREAM_TIMEOUT stays above the MosDNS
 # server timeout. Every other gateway setting

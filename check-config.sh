@@ -258,10 +258,11 @@ if main_text:
         rrs = expect_list(expect_mapping(plugin_by_tag[tag].get("args"), f"plugins[{tag}].args").get("rr"), f"plugins[{tag}].args.rr")
         for rr in rrs:
             fields = non_empty_string(rr, f"plugins[{tag}].args.rr[]").split()
-            if fields and fields[0].lower() == probe and "A" in fields[1:4]:
+            if (len(fields) >= 5 and fields[0].lower() == probe
+                    and fields[3].upper() == "A" and fields[4] == "127.0.0.1"):
                 answered = True
     if not answered:
-        fail(f"no arbitrary plugin before {cache_tag} answers 'A {probe}' (main.go readinessProbeName); /readyz would depend on the public upstreams")
+        fail(f"no arbitrary plugin before {cache_tag} answers 'A {probe} 127.0.0.1' (main.go readinessProbeName); /readyz would depend on the public upstreams")
     m = re.search(r"mosdnsServerTimeout\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_text)
     if m is None:
         fail("could not read mosdnsServerTimeout from main.go (expected '<n> * time.Millisecond|Second|Minute|Hour')")

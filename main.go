@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -64,7 +65,7 @@ const (
 
 var version = "dev"
 var dnsMessageBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		b := make([]byte, maxDNSMessageBytes+1)
 		return &b
 	},
@@ -296,6 +297,9 @@ func (g *gateway) countStatus(status int) {
 // aborted by its caller's cancellation is not cached, and the waiters retry.
 func (g *gateway) ready(ctx context.Context) bool {
 	for {
+		if ctx.Err() != nil {
+			return false
+		}
 		g.readyMu.Lock()
 		if g.readyCacheTTL > 0 && !g.readyAt.IsZero() {
 			ttl := g.readyCacheTTL
@@ -313,10 +317,22 @@ func (g *gateway) ready(ctx context.Context) bool {
 			g.readyInflight = probe
 			g.readyMu.Unlock()
 			ok := g.backendReady(ctx)
+			if ctx.Err() != nil {
+				// A successful backend read must not turn a disconnected
+				// caller's request into a response that should still be written.
+				ok = false
+			}
 			g.readyMu.Lock()
 			probe.valid = ctx.Err() == nil
 			probe.ok = ok
 			if probe.valid {
+				// Count only completed probes. In particular, a successful backend
+				// read whose owner has disconnected is not a readiness verdict.
+				if ok {
+					g.metrics.readyPassTotal.Add(1)
+				} else {
+					g.metrics.readyFailTotal.Add(1)
+				}
 				g.readyAt = time.Now()
 				g.readyOK = ok
 			}
@@ -329,6 +345,9 @@ func (g *gateway) ready(ctx context.Context) bool {
 		g.readyMu.Unlock()
 		select {
 		case <-probe.done:
+			if ctx.Err() != nil {
+				return false
+			}
 			if probe.valid {
 				// Share the verdict even when the cache is disabled.
 				return probe.ok
@@ -357,11 +376,12 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, "GET, HEAD")
 			return
 		}
-		if !g.ready(r.Context()) {
-			if r.Context().Err() != nil {
-				// The client is gone: nobody to answer, nothing to count.
-				return
-			}
+		ready := g.ready(r.Context())
+		if r.Context().Err() != nil {
+			// The client is gone: nobody to answer, nothing to count.
+			return
+		}
+		if !ready {
 			writeText(w, http.StatusServiceUnavailable, "not ready\n")
 			return
 		}
@@ -498,7 +518,8 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, g.backendRequestURL(dnsParam), reqBody)
 	if err != nil {
-		g.badUpstreamRequest(w)
+		g.metrics.backendErrorTotal.Add(1)
+		writeText(w, http.StatusBadGateway, "bad upstream request\n")
 		return
 	}
 	// No X-Forwarded-For: mosdns.yaml does not use the client address
@@ -515,6 +536,45 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// Classify non-2xx status codes before reading their bodies. A redirect is
+	// rejected immediately (its body may never finish), and an upstream 4xx/5xx
+	// keeps its status even if its optional, bounded body is oversized or
+	// truncated. Otherwise a body read error could incorrectly turn a 503 into
+	// 502/504, contrary to the gateway's status-relay contract.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if r.Context().Err() != nil {
+			return
+		}
+		if resp.StatusCode < 400 {
+			g.metrics.backendErrorTotal.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		respBuf := dnsMessageBufferPool.Get().(*[]byte)
+		defer dnsMessageBufferPool.Put(respBuf)
+		respBody, readErr := readDNSMessage(resp.Body, respBuf)
+		if r.Context().Err() != nil {
+			return
+		}
+		g.metrics.backendErrorTotal.Add(1)
+		if readErr != nil || len(respBody) > maxDNSMessageBytes {
+			// Preserve useful status headers (such as Retry-After), but not
+			// representation metadata for a body we deliberately discard.
+			respBody = nil
+			copyResponseHeaders(w.Header(), resp.Header)
+			stripRepresentationHeaders(w.Header())
+		} else {
+			copyResponseHeaders(w.Header(), resp.Header)
+		}
+		_ = resp.Body.Close()
+		releaseSlot()
+		w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(respBody)
+		return
+	}
+
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
 	respBody, err := readDNSMessage(resp.Body, respBuf)
@@ -524,32 +584,20 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	}
 	// Take the elapsed time as soon as the body has been read, but only
 	// record it once the response has passed every check below: a timeout,
-	// an oversize body or an invalid/non-2xx answer must not feed the
-	// backend-latency metrics.
+	// an oversize body or an invalid answer must not feed backend-latency metrics.
 	backendElapsed := time.Since(backendStart)
-	if len(respBody) > maxDNSMessageBytes {
+	// A 2xx answer must be a plausible DNS message: at most 4 KiB, at least the
+	// same 12-byte minimum as on the request side, and the DoH content type.
+	if len(respBody) > maxDNSMessageBytes || len(respBody) < minDNSMessageBytes ||
+		!isStrictDoHContentType(resp.Header.Get("Content-Type")) {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		// A 2xx answer must be a plausible DNS message: enforce the same
-		// 12-byte minimum as on the request side, not just the content type.
-		if !isStrictDoHContentType(resp.Header.Get("Content-Type")) || len(respBody) < minDNSMessageBytes {
-			g.metrics.backendErrorTotal.Add(1)
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		g.metrics.backendLatencySamples.Add(1)
-		g.metrics.backendLatencyNanos.Add(uint64(backendElapsed))
-	} else {
-		g.metrics.backendErrorTotal.Add(1)
-		if resp.StatusCode < 400 {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-	}
-	// Answer fully read: free the processing slot before writing to the
+	g.metrics.backendLatencySamples.Add(1)
+	g.metrics.backendLatencyNanos.Add(uint64(backendElapsed))
+
+	// Answer fully read: free the processing slot before writing it to the
 	// client. The deferred Close stays as the safety net for early returns.
 	_ = resp.Body.Close()
 	releaseSlot()
@@ -557,13 +605,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
-}
-
-// badUpstreamRequest answers a request the gateway could not turn into a valid
-// backend request: a backend error and a 502 with a short text body.
-func (g *gateway) badUpstreamRequest(w http.ResponseWriter) {
-	g.metrics.backendErrorTotal.Add(1)
-	writeText(w, http.StatusBadGateway, "bad upstream request\n")
 }
 
 func (g *gateway) failBackend(w http.ResponseWriter, r *http.Request, err error) {
@@ -644,16 +685,8 @@ func isStrictDoHContentType(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(value), "application/dns-message")
 }
 
-// probeFailed records a failed readiness probe and returns false. A probe
-// aborted because the caller went away (parent canceled) says nothing about
-// backend health, so it is not counted.
-func (g *gateway) probeFailed(parent context.Context) bool {
-	if parent.Err() == nil {
-		g.metrics.readyFailTotal.Add(1)
-	}
-	return false
-}
-
+// backendReady performs a readiness check. The owner in ready records the
+// result only after confirming the caller's context is still live.
 func (g *gateway) backendReady(parent context.Context) bool {
 	ctx, cancel := context.WithTimeout(parent, defaultReadyProbeTimeout)
 	defer cancel()
@@ -662,24 +695,23 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	probeURL := g.backendRequestURL(base64.RawURLEncoding.EncodeToString(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		return g.probeFailed(parent)
+		return false
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	resp, err := g.readyClient.Do(req)
 	if err != nil {
-		return g.probeFailed(parent)
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
-		return g.probeFailed(parent)
+		return false
 	}
 	pooled := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(pooled)
 	buf, err := readDNSMessage(resp.Body, pooled)
 	if err != nil || len(buf) > maxDNSMessageBytes || !isUsableDNSProbeResponse(buf, wantID, question) {
-		return g.probeFailed(parent)
+		return false
 	}
-	g.metrics.readyPassTotal.Add(1)
 	return true
 }
 
@@ -687,54 +719,119 @@ func (g *gateway) backendReady(parent context.Context) bool {
 func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
 	id := uint16(seq)
 	query := make([]byte, 12, 64)
-	query[0] = byte(id)
-	query[1] = byte(id >> 8)
+	query[0] = byte(id >> 8)
+	query[1] = byte(id)
 	query[2] = 0x01
 	query[5] = 0x01
 	for _, part := range strings.Split(readinessProbeName, ".") {
 		query = append(query, byte(len(part)))
 		query = append(query, part...)
 	}
-	query = append(query, 0)
-	query = append(query, 0, 1)
-	query = append(query, 0, 1)
+	// Root label, then QTYPE A (1) and QCLASS IN (1).
+	query = append(query, 0, 0, 1, 0, 1)
 	return query, id
 }
 
-// isUsableDNSProbeResponse accepts only the local answer: matching ID, QR set,
-// NOERROR, one echoed question and at least one answer record. NXDOMAIN means
-// the readiness rule is missing and the query leaked to the upstreams.
+// isUsableDNSProbeResponse accepts only the expected local A answer: matching
+// ID, QR set, NOERROR, one echoed question, and a complete A 127.0.0.1 record
+// for readinessProbeName. A positive ANCOUNT alone is not sufficient: a
+// truncated or malformed answer must not make /readyz report healthy.
 func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if len(msg) < 12+len(question) {
 		return false
 	}
-	gotID := uint16(msg[0]) | uint16(msg[1])<<8
-	if gotID != wantID {
+	if binary.BigEndian.Uint16(msg[:2]) != wantID {
 		return false
 	}
-	if msg[2]&0x80 == 0 {
+	if msg[2]&0x80 == 0 || msg[3]&0x0f != 0 {
 		return false
 	}
-	if msg[3]&0x0f != 0 {
+	if binary.BigEndian.Uint16(msg[4:6]) != 1 || binary.BigEndian.Uint16(msg[6:8]) == 0 {
 		return false
 	}
-	if msg[4] != 0 || msg[5] != 1 {
+	questionEnd := 12 + len(question)
+	if !bytes.Equal(msg[12:questionEnd], question) {
 		return false
 	}
-	if msg[6] == 0 && msg[7] == 0 {
+
+	answerName, rrStart, ok := decodeDNSName(msg, questionEnd)
+	if !ok || !strings.EqualFold(answerName, readinessProbeName) || rrStart+10 > len(msg) {
 		return false
 	}
-	return bytes.Equal(msg[12:12+len(question)], question)
+	if binary.BigEndian.Uint16(msg[rrStart:rrStart+2]) != 1 || // A
+		binary.BigEndian.Uint16(msg[rrStart+2:rrStart+4]) != 1 { // IN
+		return false
+	}
+	rdataLen := int(binary.BigEndian.Uint16(msg[rrStart+8 : rrStart+10]))
+	rdataStart := rrStart + 10
+	if rdataLen != 4 || rdataStart+rdataLen > len(msg) {
+		return false
+	}
+	return bytes.Equal(msg[rdataStart:rdataStart+rdataLen], []byte{127, 0, 0, 1})
 }
 
-var metricsResponsesTemplate = `# HELP doh_gateway_responses_total Responses grouped by status class.
+// decodeDNSName decodes a DNS wire-format name, following safe backward
+// compression pointers and returning the offset immediately after the encoded
+// name at its original location. The response is bounded to 4 KiB, and the
+// step limit prevents malformed pointer chains from looping forever.
+func decodeDNSName(msg []byte, offset int) (string, int, bool) {
+	if offset < 0 || offset >= len(msg) {
+		return "", 0, false
+	}
+	labels := make([]string, 0, 4)
+	cursor := offset
+	end := 0
+	jumped := false
+	for steps := 0; steps < len(msg); steps++ {
+		if cursor >= len(msg) {
+			return "", 0, false
+		}
+		length := int(msg[cursor])
+		switch length & 0xc0 {
+		case 0x00:
+			cursor++
+			if length == 0 {
+				if !jumped {
+					end = cursor
+				}
+				return strings.Join(labels, "."), end, true
+			}
+			if cursor+length > len(msg) {
+				return "", 0, false
+			}
+			labels = append(labels, string(msg[cursor:cursor+length]))
+			cursor += length
+			if !jumped {
+				end = cursor
+			}
+		case 0xc0:
+			if cursor+1 >= len(msg) {
+				return "", 0, false
+			}
+			pointer := ((length & 0x3f) << 8) | int(msg[cursor+1])
+			if pointer >= cursor || pointer >= len(msg) {
+				return "", 0, false
+			}
+			if !jumped {
+				end = cursor + 2
+				jumped = true
+			}
+			cursor = pointer
+		default:
+			return "", 0, false
+		}
+	}
+	return "", 0, false
+}
+
+const metricsResponsesTemplate = `# HELP doh_gateway_responses_total Responses grouped by status class.
 # TYPE doh_gateway_responses_total counter
 doh_gateway_responses_total{class="2xx"} %d
 doh_gateway_responses_total{class="4xx"} %d
 doh_gateway_responses_total{class="5xx"} %d
 `
 
-var metricsReadyTemplate = `# HELP doh_gateway_ready_probe_total Readiness probes by result.
+const metricsReadyTemplate = `# HELP doh_gateway_ready_probe_total Readiness probes by result.
 # TYPE doh_gateway_ready_probe_total counter
 doh_gateway_ready_probe_total{result="ready"} %d
 doh_gateway_ready_probe_total{result="not_ready"} %d
@@ -855,6 +952,26 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
+// stripRepresentationHeaders removes metadata that would describe a body
+// deliberately omitted from a relayed upstream error response.
+func stripRepresentationHeaders(h http.Header) {
+	for _, name := range []string{
+		"Accept-Ranges",
+		"Content-Disposition",
+		"Content-Encoding",
+		"Content-Language",
+		"Content-Location",
+		"Content-MD5",
+		"Content-Range",
+		"Content-Type",
+		"Digest",
+		"ETag",
+		"Last-Modified",
+	} {
+		h.Del(name)
+	}
+}
+
 func connectionHeaderTokens(h http.Header) map[string]bool {
 	values := h.Values("Connection")
 	if len(values) == 0 {
@@ -970,6 +1087,9 @@ func serverWriteTimeout(bodyReadTimeout, queueWait, upstreamTimeout time.Duratio
 // peers allowed to set the trusted client-IP header. An empty list means
 // every peer is trusted.
 func parseTrustedProxyPrefixes(value string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
 	var prefixes []netip.Prefix
 	for _, part := range strings.Split(value, ",") {
 		part = strings.TrimSpace(part)
@@ -981,6 +1101,9 @@ func parseTrustedProxyPrefixes(value string) ([]netip.Prefix, error) {
 			return nil, fmt.Errorf("invalid CIDR %q", part)
 		}
 		prefixes = append(prefixes, p.Masked())
+	}
+	if len(prefixes) == 0 {
+		return nil, fmt.Errorf("at least one CIDR is required")
 	}
 	return prefixes, nil
 }

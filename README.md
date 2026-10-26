@@ -55,7 +55,7 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 |---|---|
 | `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes; a backend 2xx answer shorter than 12 bytes is rejected with `502`. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
-| `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then transaction ID, QR bit, RCODE 0 (NOERROR), QDCOUNT 1, echoed question, at least one answer). An NXDOMAIN or empty answer means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted in `doh_gateway_ready_probe_total{result="not_ready"}`, and no response is written or counted for that client. |
+| `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP 2xx with `Content-Type: application/dns-message`, then the network-order transaction ID, QR bit, RCODE 0 (NOERROR), QDCOUNT 1, echoed question, and a complete `A 127.0.0.1` answer for the probe name). An NXDOMAIN, absent/malformed answer record, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
 | `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns a backend 1xx/3xx into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a 2xx `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and non-2xx answers add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Concurrent `/readyz` callers share one in-flight probe even when the result cache is disabled. Block or restrict `/metrics` at the platform edge if you do not want it public.
@@ -73,14 +73,19 @@ Anything else returns `404`; a wrong method returns `405` with an `Allow` header
 | `429` | Per-client rate limit exceeded (`Retry-After` = seconds to the end of the window). |
 | `502` | Backend unreachable, truncated/oversize/non-DoH response, a 2xx body shorter than the 12-byte DNS header, or 1xx/3xx from the backend. |
 | `503` | Active-request ceiling reached, or no processing slot within `QUEUE_WAIT` (both with `Retry-After: 1`). |
-| `504` | Backend did not answer (response headers or body) within `UPSTREAM_TIMEOUT`. |
+| `504` | Backend response headers did not arrive within `UPSTREAM_TIMEOUT`, or a successful `2xx` response body timed out. If a `4xx`/`5xx` status was already received, that status is preserved even when its optional body times out. |
 
-A 4xx/5xx from MosDNS itself is relayed to the client with its status. If the
-gateway observes client cancellation before writing a response—while waiting
-for MosDNS or while reading its answer—it returns without writing a response
-and does not increment a response-status class. Once a response status has
-been written, that status remains counted even if a subsequent body write
-fails because the client disconnected.
+A 4xx/5xx from MosDNS itself is relayed to the client with its status. Its
+response body is relayed only when it can be read completely within the
+upstream deadline and is at most 4096 bytes; otherwise the status is preserved,
+the body and its representation headers are omitted, and non-representation
+headers such as `Retry-After` remain available. Backend 1xx/3xx responses become `502` immediately,
+without waiting for a redirect body. If the gateway observes client
+cancellation before writing a response—while waiting for MosDNS or while
+reading its answer—it returns without writing a response and does not
+increment a response-status class. Once a response status has been written,
+that status remains counted even if a subsequent body write fails because the
+client disconnected.
 
 Gateway-generated `429`, `503`, the `400` for a bad POST body and the `502`
 "bad upstream request" carry a short `text/plain` body. The other
@@ -102,9 +107,9 @@ Gateway:
 | `MAX_ACTIVE_REQUESTS` | `16` | Hard ceiling on concurrently admitted requests (extra get `503` + `Retry-After: 1`). |
 | `MAX_CONCURRENT_REQUESTS` | `8` | Requests actually executing against MosDNS at once (also the size of the backend connection pool, idle and total); the rest queue up to `QUEUE_WAIT`. A slot is released as soon as MosDNS's answer has been read, before it is written to the client, so a slow-reading client does not hold one. If it is set higher than `MAX_ACTIVE_REQUESTS`, a warning is logged at startup: requests are then rejected before they can queue, so `QUEUE_WAIT` never applies. |
 | `QUEUE_WAIT` | `100ms` | Max wait for a processing slot, then `503`. |
-| `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` on timeout, `502` otherwise). Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it — it always covers the body-read + queue + upstream budget plus a 2 s margin, so even a slow POST upload followed by a full queue wait and an upstream timeout still ends in the intended `503`/`504` (see Architecture). |
+| `UPSTREAM_TIMEOUT` | `2.5s` | Per-request backend timeout (`504` if response headers do not arrive or a successful `2xx` body times out; `502` for other invalid upstream responses). A received `4xx`/`5xx` status is preserved if its optional body cannot be read completely. Must stay above MosDNS `servers[0].timeout` (2 s). The server write deadline grows with it — it always covers the body-read + queue + upstream budget plus a 2 s margin, so even a slow POST upload followed by a full queue wait and an upstream timeout still ends in the intended `503`/`504` (see Architecture). |
 | `CLIENT_IP_HEADER` | `none` (`X-Forwarded-For` in the shipped Dockerfile) | Set to e.g. `X-Forwarded-For` to trust a reverse proxy's client-IP header: the last entry of the last header value is used; if it is missing or not a valid IP, the socket peer is used. No other header (such as `X-Real-IP`, which clients can set themselves) is trusted. IPv4-mapped IPv6 addresses are normalised to IPv4, and IPv6 clients are rate-limited per /64. Default keys rate limits on the socket peer only (see the note below). |
-| `TRUSTED_PROXY_CIDRS` | empty (every peer may set the header) | Comma-separated CIDR list of the proxy peers allowed to set `CLIENT_IP_HEADER`. When set, a header arriving from any other socket peer is ignored and that peer is rate-limited by its own address, so a client that can reach the container directly cannot rotate spoofed addresses to get fresh rate-limit buckets or exhaust the per-window client cap. Example: `TRUSTED_PROXY_CIDRS=10.0.0.0/8,2001:db8::/32`. Fatal at startup if a CIDR is malformed; a warning is logged if it is set while `CLIENT_IP_HEADER` is `none`. |
+| `TRUSTED_PROXY_CIDRS` | empty (every peer may set the header) | Comma-separated CIDR list of the proxy peers allowed to set `CLIENT_IP_HEADER`. When set, a header arriving from any other socket peer is ignored and that peer is rate-limited by its own address, so a client that can reach the container directly cannot rotate spoofed addresses to get fresh rate-limit buckets or exhaust the per-window client cap. Example: `TRUSTED_PROXY_CIDRS=10.0.0.0/8,2001:db8::/32`. A non-blank value is fatal at startup if any CIDR is malformed or it contains no actual CIDRs (for example, only commas); a blank value is equivalent to the empty default. A warning is logged if it is set while `CLIENT_IP_HEADER` is `none`. |
 
 **Behind a PaaS proxy, set `CLIENT_IP_HEADER`.** With the default (`none`) the
 rate limiter sees only the socket peer, which on Koyeb and similar platforms is
@@ -121,7 +126,7 @@ Integer variables must be >= 1 and duration variables must be positive Go
 durations (`100ms`, `2.5s`). An invalid value is ignored: the default is used
 and a warning is logged at startup.
 
-The Dockerfile sets only `MOSDNS_CONFIG`, `MOSDNS_DOH_URL`, `UPSTREAM_TIMEOUT=2.5s`
+The Dockerfile sets only `MOSDNS_CONFIG` (the entrypoint's own default, repeated for clarity), `MOSDNS_DOH_URL`, `UPSTREAM_TIMEOUT=2.5s`
 (pinned because `check-config.sh` ties it to the MosDNS timeout), `CLIENT_IP_HEADER=X-Forwarded-For`
 and the runtime tuning values `GOMAXPROCS=1` and `GOMEMLIMIT=160MiB`; everything
 else, including `PORT`, `RATE_LIMIT`, `RATE_WINDOW`, `MAX_CONCURRENT_REQUESTS`,
@@ -218,6 +223,9 @@ make run             # local gateway on :8080 (needs a backend on :8081)
 make clean           # remove ./doh-gateway
 ```
 
+The local image tag defaults to `mosdns-on-paas:local` (Docker image repository
+names must be lowercase). Override it with `make docker-build IMAGE=your-name:tag`.
+
 `test-entrypoint.sh` runs the real `entrypoint.sh` against fake MosDNS and
 gateway processes and checks, for each scenario, both the exit code and that
 neither fake child is still running afterwards: TERM shutdown exits 0; a
@@ -236,8 +244,8 @@ newer (see `go.mod`).
 concurrency-sensitive paths (POST buffer pool, per-client limiter, processing
 queue, shared readiness probe). CI (`.github/workflows/ci.yml`) runs `make
 test`, the entrypoint test again under BusyBox ash, and a full Buildx image
-build (GitHub Actions layer cache, no push) followed by a smoke test of the
-built image: it starts the container, waits for `/readyz`, checks `/healthz`,
+build (GitHub Actions layer cache, no push, image tag `mosdns-on-paas:ci`)
+followed by a smoke test of the built image: it starts the container, waits for `/readyz`, checks `/healthz`,
 a DoH query for the local readiness name, a `404`, the `build_info` version,
 and that `docker stop` finishes within 10 s (no public upstream is contacted).
 It runs on every push to `main` and every pull request, has read-only
@@ -248,7 +256,7 @@ Optional hard throughput gate: `REQUIRE_5000_RPS=1 go test -run TestFiveThousand
 (it drives the gateway with as many concurrent workers as the default
 `MAX_ACTIVE_REQUESTS`, because more in-flight requests than that are rejected
 with `503` by design).
-Sustained-load benchmark: `go test -run ^$ -bench BenchmarkGatewayParallelPOST -benchmem` (reports ns/op and allocations; it is not a rate gate).
+Sustained-load benchmark: `go test -run ^$ -bench BenchmarkGatewayParallelPOST -benchmem` (reports ns/op and allocations; it is not a rate gate). The benchmark uses a fixed worker count no larger than the gateway's active-request limit and drains each response body so HTTP keep-alive reuse is measured rather than accidentally disabled. Its test-only rate limit is set above practical benchmark volume, and its `QueueWait` is raised to 5 s so the 16 workers (sharing 8 processing slots) queue instead of being rejected with `503` on a slow host.
 
 Docker build arguments (all have defaults in the Dockerfile). The builder
 stages run on `$BUILDPLATFORM` and cross-compile for `TARGETARCH` (GOARM is
@@ -296,6 +304,8 @@ together.
 - `.github/dependabot.yml` — weekly update PRs for the Dockerfile base images
   (digests and patch releases; no golang minor/major bumps) and the GitHub
   Actions versions.
+- `.github/workflows/Keep-Alive.yml` — twice-monthly keep-alive commits, guarded
+  so the job only writes to `anT0ny54/Mosdns-on-PaaS`, including on manual runs.
 
 ## Version
 

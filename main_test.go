@@ -771,6 +771,11 @@ func TestParseTrustedProxyPrefixes(t *testing.T) {
 	if _, err := parseTrustedProxyPrefixes("10.0.0.0/8,bogus"); err == nil {
 		t.Fatal("invalid CIDR accepted")
 	}
+	for _, empty := range []string{",", ", ,", " , , "} {
+		if prefixes, err := parseTrustedProxyPrefixes(empty); err == nil || prefixes != nil {
+			t.Fatalf("effectively empty CIDR list %q was not rejected: prefixes=%v err=%v", empty, prefixes, err)
+		}
+	}
 }
 func TestReadyEndpointCachesResult(t *testing.T) {
 	var hits int32
@@ -1112,6 +1117,18 @@ func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 			resp[7] = 0
 			return resp
 		}},
+		{"answer count without an answer record", func(t *testing.T, r *http.Request) []byte {
+			query, err := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return probeResponse(t, r, 0)[:len(query)]
+		}},
+		{"wrong local A answer", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[len(resp)-1] = 2
+			return resp
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1130,8 +1147,8 @@ func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 }
 func TestReadinessQueryAsksForTheLocalName(t *testing.T) {
 	q, id := buildReadinessDNSQuery(0x1234)
-	if id != 0x1234 || q[0] != 0x34 || q[1] != 0x12 {
-		t.Fatalf("id not encoded: %x", q[:2])
+	if id != 0x1234 || q[0] != 0x12 || q[1] != 0x34 {
+		t.Fatalf("DNS transaction ID is not network byte order: %x", q[:2])
 	}
 	var labels []string
 	for i := 12; q[i] != 0; i += int(q[i]) + 1 {
@@ -1173,6 +1190,47 @@ func TestConcurrentReadyzShareOneProbe(t *testing.T) {
 		t.Fatalf("backend probed %d times, want 1 shared probe", got)
 	}
 }
+func TestConcurrentReadyzShareOneProbeWithCacheDisabled(t *testing.T) {
+	var hits atomic.Int32
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		<-release
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(probeResponse(t, r, 0))
+	}))
+	defer backend.Close()
+	g := testGateway(t, backend.URL, 100, 10)
+	g.readyCacheTTL = 0
+	const n = 8
+	codes := make(chan int, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			w := httptest.NewRecorder()
+			g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			codes <- w.Code
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := hits.Load(); got != 1 {
+		close(release)
+		t.Fatalf("initial shared probe count = %d, want 1", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for i := 0; i < n; i++ {
+		if c := <-codes; c != http.StatusOK {
+			t.Fatalf("readyz got %d, want %d", c, http.StatusOK)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("backend probed %d times with cache disabled, want one shared probe", got)
+	}
+}
+
 func TestLimiterReleasesMemoryAfterSpike(t *testing.T) {
 	l := newFixedWindowLimiter(1, time.Minute)
 	l.now = func() time.Time { return time.Unix(120, 0) }

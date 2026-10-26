@@ -1,5 +1,4 @@
-PROJECT := Mosdns-on-PaaS
-IMAGE ?= $(PROJECT):local
+IMAGE ?= mosdns-on-paas:local
 VERSION := $(shell cat VERSION)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
