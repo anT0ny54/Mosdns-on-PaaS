@@ -50,7 +50,7 @@ jobs:
           context: .
           push: false
           load: true
-          tags: mosdns-koyeb-doh-gateway:ci
+          tags: mosdns-on-paas:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # Start the real image and check it end to end without touching the
@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker run -d --name smoke -p 127.0.0.1:8080:8080 mosdns-koyeb-doh-gateway:ci
+          docker run -d --name smoke -p 127.0.0.1:8080:8080 mosdns-on-paas:ci
           trap 'docker logs smoke || true; docker rm -f smoke >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1; then break; fi

@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   keep-alive:
+    if: github.repository == 'anT0ny54/Mosdns-on-PaaS'
     name: Create keep-alive commit
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -52,4 +53,3 @@ jobs:
             -m "chore: update repository keep-alive [skip ci]"
 
           git push origin "HEAD:${GITHUB_REF_NAME}"
-          
