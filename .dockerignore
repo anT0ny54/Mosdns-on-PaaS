@@ -10,5 +10,6 @@ keep-alive.txt
 Makefile
 check-config.sh
 test-entrypoint.sh
+test-check-config.sh
 doh-gateway
 .env
