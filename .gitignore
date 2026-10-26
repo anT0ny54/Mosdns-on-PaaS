@@ -1,15 +1,5 @@
-.git
-.github
-.gitignore
-.gitattributes
-.dockerignore
-README.md
-CHANGELOG.md
-keep-alive.txt
-*_test.go
-Makefile
-check-config.sh
-test-entrypoint.sh
-doh-gateway
+# Local build artifact
+/doh-gateway
+
+# Local environment overrides
 .env
-test-check-config.sh
