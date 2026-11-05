@@ -53,6 +53,14 @@ def exact_bool(value, path: str) -> bool:
     if not isinstance(value, bool):
         fail(f"{path} must be true or false")
     return value
+def no_raw_whitespace_or_control(value: str, path: str) -> str:
+    has_invalid_char = any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f
+        for char in value
+    )
+    if has_invalid_char:
+        fail(f"{path} must not contain whitespace or control characters")
+    return value
 def strip_comments(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 DURATION_UNIT_MS = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000,
@@ -65,12 +73,14 @@ def check_ip(value, path: str) -> None:
     except ValueError:
         fail(f"{path} must be a valid IP address")
 def check_listen_addr(value, path: str) -> None:
-    value = non_empty_string(value, path)
+    value = no_raw_whitespace_or_control(non_empty_string(value, path), path)
     try:
         parsed = urlsplit("//" + value)
         port = parsed.port
     except ValueError:
         fail(f"{path} must be a valid host:port address")
+    if parsed.username is not None or parsed.password is not None:
+        fail(f"{path} must be a host:port address without user-info")
     if port is None or not 1 <= port <= 65535:
         fail(f"{path} must include a valid port from 1 to 65535")
     if parsed.path or parsed.query or parsed.fragment:
@@ -89,7 +99,7 @@ def check_loopback(value: str, path: str) -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         fail(f"{path} must bind to loopback, not {host}")
 def check_upstream_addr(value, path: str) -> None:
-    value = non_empty_string(value, path)
+    value = no_raw_whitespace_or_control(non_empty_string(value, path), path)
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname
@@ -125,8 +135,11 @@ if level not in {"debug", "info", "warn", "error"}:
 api = root.get("api")
 if api is not None:
     api = expect_mapping(api, "api")
-    check_listen_addr(api.get("http"), "api.http")
-    check_loopback(api["http"], "api.http")
+    # The HTTP API listener is optional; when configured, it must be a
+    # loopback-only host:port just like the DNS listener.
+    if "http" in api:
+        check_listen_addr(api["http"], "api.http")
+        check_loopback(api["http"], "api.http")
 
 # --- plugins -----------------------------------------------------------------
 plugins = expect_list(root.get("plugins"), "plugins")

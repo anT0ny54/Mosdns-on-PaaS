@@ -65,6 +65,16 @@ func TestTransportBodyIsNotAliasedToPool(t *testing.T) {
 	}
 }
 
+func TestShutdownTimeoutCoversDefaultRequestBudget(t *testing.T) {
+	requestBudget := defaultBodyReadTimeout + defaultQueueWait + defaultUpstreamTO
+	if defaultShutdownTimeout <= requestBudget {
+		t.Fatalf("shutdown timeout=%s does not cover default request budget=%s", defaultShutdownTimeout, requestBudget)
+	}
+	if defaultShutdownTimeout >= 6*time.Second {
+		t.Fatalf("shutdown timeout=%s exceeds the entrypoint's 6 s gateway grace period", defaultShutdownTimeout)
+	}
+}
+
 func TestServerWriteTimeoutIncludesReadBudget(t *testing.T) {
 	// Shipped defaults: 2s body read + 0.1s queue + 2.5s upstream + 2s margin
 	// = 6.6s, below the 8s floor, so the floor applies.
@@ -204,6 +214,56 @@ func (tr responseTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}, nil
 }
 
+type closeCountingBody struct {
+	reader io.Reader
+	closed int
+}
+
+func (b *closeCountingBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
+func (b *closeCountingBody) Close() error {
+	b.closed++
+	return nil
+}
+
+type closeCountingTransport struct {
+	status      int
+	contentType string
+	body        *closeCountingBody
+}
+
+func (tr closeCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: tr.status,
+		Header:     http.Header{"Content-Type": []string{tr.contentType}},
+		Body:       tr.body,
+		Request:    req,
+	}, nil
+}
+
+func TestBackendResponseBodyClosedOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		contentType string
+	}{
+		{name: "success", status: http.StatusOK, contentType: "application/dns-message"},
+		{name: "relayed error", status: http.StatusServiceUnavailable, contentType: "text/plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &closeCountingBody{reader: bytes.NewReader(make([]byte, minDNSMessageBytes))}
+			client := &http.Client{Transport: closeCountingTransport{
+				status: tc.status, contentType: tc.contentType, body: body,
+			}}
+			g := regGateway(t, "http://127.0.0.1:9/dns-query", client)
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
+			if body.closed != 1 {
+				t.Fatalf("backend body closed %d times, want exactly once", body.closed)
+			}
+		})
+	}
+}
+
 func TestBackendErrorStatusSurvivesBadBody(t *testing.T) {
 	tests := []struct {
 		name string
@@ -247,6 +307,53 @@ func TestBackendErrorStatusSurvivesBadBody(t *testing.T) {
 				t.Fatalf("backendLatencySamples = %d, want 0", got)
 			}
 		})
+	}
+}
+
+func TestNon200SuccessDoesNotWaitForBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer backend.Close()
+	g := regGateway(t, backend.URL, nil)
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("gateway waited for non-200 2xx body for %s", elapsed)
+	}
+}
+
+func TestNonStandardHTTPStatusIsRejected(t *testing.T) {
+	body := &closeCountingBody{reader: bytes.NewReader([]byte("ignored"))}
+	client := &http.Client{Transport: closeCountingTransport{
+		status: 600, contentType: "text/plain", body: body,
+	}}
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", client)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for a non-standard 6xx backend status", rec.Code)
+	}
+	if body.closed != 1 {
+		t.Fatalf("backend body closed %d times, want exactly once", body.closed)
+	}
+	if got := g.metrics.backendErrorTotal.Load(); got != 1 {
+		t.Fatalf("backendErrorTotal = %d, want 1", got)
+	}
+	if got := g.metrics.responses5xxTotal.Load(); got != 1 {
+		t.Fatalf("responses5xxTotal = %d, want only the gateway's 502 counted", got)
+	}
+	g.countStatus(600)
+	if got := g.metrics.responses5xxTotal.Load(); got != 1 {
+		t.Fatalf("a non-standard 6xx response was counted as 5xx: total=%d", got)
 	}
 }
 

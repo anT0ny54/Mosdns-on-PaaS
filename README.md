@@ -9,7 +9,7 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
 
 - **doh-gateway** (this repo, `main.go`): an HTTP front door that validates,
   rate-limits, queues, and forwards DoH requests to MosDNS. Runs as an
-  unprivileged user (`app`), drains gracefully on SIGTERM/SIGINT (4 s). HTTP
+  unprivileged user (`app`), drains gracefully on SIGTERM/SIGINT (5 s). HTTP
   server limits: 5 s to read request headers, 5 s to read the whole request,
   2 s to receive a POST body (a DNS message is at most 4 KiB; a slower upload
   gets `400` and frees its slot), 20 s keep-alive idle timeout, 8 KiB of
@@ -61,10 +61,10 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 
 | Path | Behavior |
 |---|---|
-| `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes; a backend answer that is not `200` with an `application/dns-message` body of 12-4096 bytes is rejected with `502`. |
+| `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes. A DNS answer must be `200 OK` with an `application/dns-message` body of 12-4096 bytes; statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
 | `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with `Content-Type: application/dns-message`, then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, echoed question, and a complete `A 127.0.0.1` answer for the probe name). An NXDOMAIN, truncated response, absent/malformed answer record, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
-| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns a backend 1xx/3xx into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a `200` `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
+| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns backend statuses other than `200` and `400`-`599` into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a `200` `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Concurrent `/readyz` callers share one in-flight probe even when the result cache is disabled. Block or restrict `/metrics` at the platform edge if you do not want it public.
 
@@ -79,7 +79,7 @@ Anything else returns `404`; a wrong method returns `405` with an `Allow` header
 | `413` | POST body larger than 4096 bytes. |
 | `415` | POST without exactly `application/dns-message`. |
 | `429` | Per-client rate limit exceeded (`Retry-After` = seconds to the end of the window). |
-| `502` | Backend unreachable, truncated/oversize/non-DoH response, a non-200 2xx status, or a body shorter than the 12-byte DNS header, or 1xx/3xx from the backend. |
+| `502` | Backend unreachable, truncated/oversize/non-DoH response, a status other than `200` or `400`-`599`, or a body shorter than the 12-byte DNS header. |
 | `503` | Active-request ceiling reached, or no processing slot within `QUEUE_WAIT` (both with `Retry-After: 1`). |
 | `504` | Backend response headers did not arrive within `UPSTREAM_TIMEOUT`, or a successful `200` response body timed out. If a `4xx`/`5xx` status was already received, that status is preserved even when its optional body times out. |
 
@@ -87,8 +87,8 @@ A 4xx/5xx from MosDNS itself is relayed to the client with its status. Its
 response body is relayed only when it can be read completely within the
 upstream deadline and is at most 4096 bytes; otherwise the status is preserved,
 the body and its representation headers are omitted, and non-representation
-headers such as `Retry-After` remain available. Backend 1xx/3xx responses become `502` immediately,
-without waiting for a redirect body. If the gateway observes client
+headers such as `Retry-After` remain available. Backend statuses other than `200` and standard `400`-`599` responses become
+`502` immediately, without waiting for their bodies. If the gateway observes client
 cancellation before writing a response—while waiting for MosDNS or while
 reading its answer—it returns without writing a response and does not
 increment a response-status class. Once a response status has been written,
@@ -185,6 +185,8 @@ cache in under 1 ms (measured end to end through the gateway).
 `make check-config`) validates it:
 
 - YAML structure, plugin tags/types, and upstream URL authorities and ports;
+  listener addresses and upstream URLs containing raw whitespace or control
+  characters are rejected instead of being normalized by the URL parser;
 - the entry sequence (`servers[0].exec`) layout: optional local-answer
   (`arbitrary`/`hosts`) and the two pre-initialized EDNS filters
   (`_edns0_filter_no_edns0` or `_edns0_filter_ecs_only`), then a `cache` plugin,

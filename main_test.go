@@ -431,6 +431,7 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 		t.Fatal("backend was called after request body read failure")
 	}
 }
+
 // A POST body that fails because the client went away gets no response and is
 // not counted: nobody can read it (README, /dns-query).
 func TestPOSTBodyErrorAfterDisconnectIsNotCounted(t *testing.T) {

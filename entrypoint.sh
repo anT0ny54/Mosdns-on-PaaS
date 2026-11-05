@@ -9,7 +9,7 @@ MOSDNS_PID=""
 GATEWAY_PID=""
 SLEEP_PID=""
 # Shutdown grace periods in seconds. The gateway drains in-flight requests for
-# up to its own shutdown timeout (4s), so it gets the larger budget; MosDNS
+# up to its own shutdown timeout (5s), so it gets the larger budget; MosDNS
 # stops fast, so it gets a short one. Together (9s) they fit inside Docker's
 # default 10s stop timeout. A child still alive after its grace period is
 # KILLed so a wedged child cannot hang the container.

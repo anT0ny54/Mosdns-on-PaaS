@@ -79,6 +79,28 @@ def set_readiness_wrong_class(config, cache, sequence, fallback):
     readiness["args"]["rr"] = ["ready.doh-gateway.invalid. 0 CH A 127.0.0.1"]
 
 write_case("readiness-wrong-class", set_readiness_wrong_class)
+write_case("valid-api-without-http", lambda c, cache, seq, fb: c.update(api={}))
+
+def set_listener_userinfo(config, cache, sequence, fallback):
+    config["servers"][0]["listeners"][0]["addr"] = "user:pass@127.0.0.1:8081"
+
+write_case("listener-userinfo", set_listener_userinfo)
+
+def set_listener_whitespace(config, cache, sequence, fallback):
+    config["servers"][0]["listeners"][0]["addr"] = "127.0.0.1:\t8081"
+
+write_case("listener-whitespace", set_listener_whitespace)
+
+def set_upstream_whitespace(config, cache, sequence, fallback):
+    upstream = next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"]
+    upstream[0]["addr"] = "https://root.hagezi.org\n/dns-query"
+
+write_case("upstream-whitespace", set_upstream_whitespace)
+
+def set_api_non_loopback(config, cache, sequence, fallback):
+    config["api"] = {"http": "0.0.0.0:9091"}
+
+write_case("api-non-loopback", set_api_non_loopback)
 PYTHON
 
 expect_ok() {
@@ -112,6 +134,11 @@ expect_ok valid-fallback-options
 expect_ok valid-disabled-normal-fallback
 expect_ok valid-no-edns-filter
 expect_ok valid-threshold-clamped-by-mosdns
+expect_ok valid-api-without-http
+expect_fail listener-userinfo "must be a host:port address without user-info"
+expect_fail listener-whitespace "must not contain whitespace or control characters"
+expect_fail upstream-whitespace "must not contain whitespace or control characters"
+expect_fail api-non-loopback "api.http must bind to loopback, not 0.0.0.0"
 expect_fail unknown-fallback-key "fallback contains unsupported key"
 expect_fail negative-stat-length "stat_length must not be negative"
 expect_fail string-stat-length "stat_length must be an integer"

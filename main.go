@@ -47,9 +47,10 @@ const (
 	defaultBodyReadTimeout = 2 * time.Second
 	defaultWriteTimeout    = 8 * time.Second
 	defaultIdleTimeout     = 20 * time.Second
-	// Requests are bounded by body read + QUEUE_WAIT + UPSTREAM_TIMEOUT, so a
-	// short drain is enough and stays inside common 10 s stop timeouts.
-	defaultShutdownTimeout = 4 * time.Second
+	// The default POST budget is 2 s body read + 100 ms queue + 2.5 s
+	// upstream. Five seconds covers that 4.6 s path with a small margin and
+	// stays inside entrypoint.sh's 6 s gateway grace period.
+	defaultShutdownTimeout = 5 * time.Second
 	// limiterShrinkThreshold: above this many keys the limiter map is
 	// reallocated at window rollover, because a cleared Go map keeps its memory.
 	limiterShrinkThreshold = 4096
@@ -308,7 +309,7 @@ func (g *gateway) countStatus(status int) {
 		g.metrics.responses2xxTotal.Add(1)
 	case status >= 400 && status < 500:
 		g.metrics.responses4xxTotal.Add(1)
-	case status >= 500:
+	case status >= 500 && status < 600:
 		g.metrics.responses5xxTotal.Add(1)
 	}
 }
@@ -569,22 +570,31 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		g.failBackend(w, r, err)
 		return
 	}
-	defer resp.Body.Close()
+	bodyClosed := false
+	closeBody := func() {
+		if !bodyClosed {
+			bodyClosed = true
+			_ = resp.Body.Close()
+		}
+	}
+	defer closeBody()
 
 	// One pooled buffer serves both the optional error body and the 2xx answer.
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(respBuf)
 
-	// Classify non-2xx status codes before reading their bodies. A redirect is
-	// rejected immediately (its body may never finish), and an upstream 4xx/5xx
-	// keeps its status even if its optional, bounded body is oversized or
-	// truncated. Otherwise a body read error could incorrectly turn a 503 into
-	// 502/504, contrary to the gateway's status-relay contract.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	// Classify every non-200 status before reading its body. Only 200 is a
+	// successful DoH response; other statuses outside the standard 4xx/5xx
+	// range become 502 without waiting for a body that may never finish. An
+	// upstream 4xx/5xx keeps its status even if its optional, bounded body is
+	// oversized or truncated.
+	// Otherwise a body read error could incorrectly turn a 503 into 502/504,
+	// contrary to the gateway's status-relay contract.
+	if resp.StatusCode != http.StatusOK {
 		if r.Context().Err() != nil {
 			return
 		}
-		if resp.StatusCode < 400 {
+		if resp.StatusCode < 400 || resp.StatusCode >= 600 {
 			g.metrics.backendErrorTotal.Add(1)
 			w.WriteHeader(http.StatusBadGateway)
 			return
@@ -603,7 +613,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		} else {
 			copyResponseHeaders(w.Header(), resp.Header)
 		}
-		_ = resp.Body.Close()
+		closeBody()
 		releaseSlot()
 		w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 		w.WriteHeader(resp.StatusCode)
@@ -620,11 +630,10 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	// record it once the response has passed every check below: a timeout,
 	// an oversize body or an invalid answer must not feed backend-latency metrics.
 	backendElapsed := time.Since(backendStart)
-	// A DoH answer is 200 OK with a plausible DNS message: at most 4 KiB, at least
-	// the same 12-byte minimum as on the request side, and the DoH content type.
-	// Other 2xx statuses are not DoH answers (RFC 8484) and are rejected as 502.
-	if resp.StatusCode != http.StatusOK || len(respBody) > maxDNSMessageBytes ||
-		len(respBody) < minDNSMessageBytes || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
+	// The status is now known to be 200. A DoH answer must also contain a
+	// plausible DNS message (12-4096 bytes) and the strict DoH content type.
+	if len(respBody) > maxDNSMessageBytes || len(respBody) < minDNSMessageBytes ||
+		!isStrictDoHContentType(resp.Header.Get("Content-Type")) {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -634,7 +643,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 
 	// Answer fully read: free the processing slot before writing it to the
 	// client. The deferred Close stays as the safety net for early returns.
-	_ = resp.Body.Close()
+	closeBody()
 	releaseSlot()
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
