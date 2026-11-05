@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,31 @@ import (
 	"testing"
 	"time"
 )
+
+// postDNSQuery sends one DoH POST from a synthetic client address (client i
+// of 250) and drains the response. It fails on a transport error, a non-200
+// status, or a body that cannot be read or closed.
+func postDNSQuery(client *http.Client, target string, i int) error {
+	req, err := http.NewRequest(http.MethodPost, target, strings.NewReader(testDNSBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(i%250+1))
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(io.Discard, resp.Body)
+	closeErr := resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status=%d", resp.StatusCode)
+	}
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
 
 func BenchmarkGatewayParallelPOST(b *testing.B) {
 	srv, client, cleanup := throughputHarness(b)
@@ -33,21 +59,7 @@ func BenchmarkGatewayParallelPOST(b *testing.B) {
 				if i > uint64(b.N) {
 					return
 				}
-				req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", strings.NewReader(testDNSBody))
-				req.Header.Set("Content-Type", "application/dns-message")
-				req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(int(i%250)+1))
-				resp, err := client.Do(req)
-				if err != nil {
-					b.Error(err)
-					continue
-				}
-				if resp.StatusCode != http.StatusOK {
-					b.Errorf("status=%d", resp.StatusCode)
-				}
-				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-					b.Error(err)
-				}
-				if err := resp.Body.Close(); err != nil {
+				if err := postDNSQuery(client, srv.URL+"/dns-query", int(i)); err != nil {
 					b.Error(err)
 				}
 			}
@@ -79,20 +91,8 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					req, _ := http.NewRequest(http.MethodPost, srv.URL+"/dns-query", strings.NewReader(testDNSBody))
-					req.Header.Set("Content-Type", "application/dns-message")
-					req.Header.Set("X-Forwarded-For", "198.51.100."+strconv.Itoa(i%250+1))
-					resp, err := client.Do(req)
-					if err != nil || resp.StatusCode != http.StatusOK {
+					if err := postDNSQuery(client, srv.URL+"/dns-query", i); err != nil {
 						atomic.AddInt64(&failures, 1)
-					}
-					if resp != nil {
-						if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-							atomic.AddInt64(&failures, 1)
-						}
-						if err := resp.Body.Close(); err != nil {
-							atomic.AddInt64(&failures, 1)
-						}
 					}
 				}
 			}()
@@ -118,11 +118,9 @@ func TestFiveThousandRPSTarget(t *testing.T) {
 		t.Fatalf("throughput %.0f RPS is below target %.0f RPS", rps, target)
 	}
 }
+
 func throughputHarness(tb testing.TB) (*httptest.Server, *http.Client, func()) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		_, _ = w.Write([]byte(testDNSBody))
-	}))
+	backend := okBackend()
 	// 16 workers share 8 processing slots; the long QueueWait keeps a slow or
 	// heavily loaded host from turning normal queueing into 503s.
 	g := newTestGateway(tb, gatewayOptions{
@@ -141,6 +139,7 @@ func throughputHarness(tb testing.TB) (*httptest.Server, *http.Client, func()) {
 	}, Timeout: 5 * time.Second}
 	return server, client, backend.Close
 }
+
 func getenvBool(key string) bool {
 	v := envString(key, "")
 	return v == "1" || v == "true"

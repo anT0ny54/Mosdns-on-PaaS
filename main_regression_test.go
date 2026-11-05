@@ -52,9 +52,7 @@ func TestTransportBodyIsNotAliasedToPool(t *testing.T) {
 	// Churn the pool with different bytes while the transport still holds the body.
 	for i := 0; i < 64; i++ {
 		b := dnsMessageBufferPool.Get().(*[]byte)
-		for j := range (*b)[:cap(*b)] {
-			(*b)[:cap(*b)][j] = 0x00
-		}
+		clear((*b)[:cap(*b)])
 		dnsMessageBufferPool.Put(b)
 	}
 	select {
@@ -77,6 +75,12 @@ func TestServerWriteTimeoutIncludesReadBudget(t *testing.T) {
 	// 5s + 5s + 5s + 2s = 17s.
 	if got, want := serverWriteTimeout(5*time.Second, 5*time.Second, 5*time.Second), 17*time.Second; got != want {
 		t.Fatalf("raised budget: got %v, want %v", got, want)
+	}
+	// Large but individually valid durations must saturate instead of
+	// overflowing into a deadline shorter than the default floor.
+	maxDuration := time.Duration(1<<63 - 1)
+	if got := serverWriteTimeout(maxDuration, time.Second, time.Second); got != maxDuration {
+		t.Fatalf("overflowing budget: got %v, want saturated %v", got, maxDuration)
 	}
 }
 
@@ -140,26 +144,11 @@ func TestWriteTimeoutCoversSlowBodyAndRaisedTimeouts(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	queueWait := 100 * time.Millisecond
-	upstreamTimeout := 2 * time.Second
 	g := regGateway(t, backend.URL+"/dns-query", backend.Client())
-	g.upstreamTimeout = upstreamTimeout
-	g.queueWait = queueWait
+	g.upstreamTimeout = 2 * time.Second
+	g.queueWait = 100 * time.Millisecond
 	g.bodyReadTimeout = 3 * time.Second // the trickled upload below takes ~2.5s
-
-	server := &http.Server{
-		Addr:              "127.0.0.1:0",
-		Handler:           g,
-		ReadHeaderTimeout: defaultReadHeaderTimeout,
-		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, queueWait, upstreamTimeout),
-	}
-	ln, err := net.Listen("tcp", server.Addr)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer server.Close()
-	go func() { _ = server.Serve(ln) }()
+	ln := startRegServer(t, g)
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
@@ -299,6 +288,7 @@ func TestBackendLatencyNotRecordedForRejectedResponses(t *testing.T) {
 		{"wrong content type", http.StatusOK, "text/plain", 32, http.StatusBadGateway},
 		{"body shorter than DNS header", http.StatusOK, "application/dns-message", 4, http.StatusBadGateway},
 		{"backend 5xx", http.StatusServiceUnavailable, "application/dns-message", 32, http.StatusServiceUnavailable},
+		{"non-200 success status", http.StatusPartialContent, "application/dns-message", 32, http.StatusBadGateway},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -475,12 +465,17 @@ func TestReadyProbeCanceledByClientIsNotCounted(t *testing.T) {
 
 func startRegServer(t *testing.T, g *gateway) net.Listener {
 	t.Helper()
-	server := &http.Server{
+	return serveOnLoopback(t, &http.Server{
 		Handler:           g,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		ReadTimeout:       defaultReadTimeout,
 		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, g.queueWait, g.upstreamTimeout),
-	}
+	})
+}
+
+// serveOnLoopback serves server on an ephemeral loopback port until the test ends.
+func serveOnLoopback(t *testing.T, server *http.Server) net.Listener {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -564,18 +559,12 @@ func TestGETUpstreamWaitOutlivesServerReadTimeout(t *testing.T) {
 	}))
 	defer backend.Close()
 	g := regGateway(t, backend.URL+"/dns-query", nil)
-	server := &http.Server{
+	ln := serveOnLoopback(t, &http.Server{
 		Handler:           g,
 		ReadHeaderTimeout: 200 * time.Millisecond,
 		ReadTimeout:       300 * time.Millisecond,
 		WriteTimeout:      serverWriteTimeout(g.bodyReadTimeout, g.queueWait, g.upstreamTimeout),
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { _ = server.Close() })
-	go func() { _ = server.Serve(ln) }()
+	})
 	client := &http.Client{Timeout: 5 * time.Second}
 	// 12 zero bytes as raw base64url: the smallest valid DNS message.
 	resp, err := client.Get("http://" + ln.Addr().String() + "/dns-query?dns=AAAAAAAAAAAAAAAA")

@@ -477,7 +477,13 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			_ = rc.SetReadDeadline(time.Time{})
 		}
 		if err != nil {
-			if isTimeoutError(err) {
+			timedOut := isTimeoutError(err)
+			if !timedOut && r.Context().Err() != nil {
+				// The client disconnected mid-upload: no response can reach it,
+				// so none is written and none is counted (see README).
+				return
+			}
+			if timedOut {
 				w.Header().Set("Connection", "close")
 			}
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
@@ -614,10 +620,11 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	// record it once the response has passed every check below: a timeout,
 	// an oversize body or an invalid answer must not feed backend-latency metrics.
 	backendElapsed := time.Since(backendStart)
-	// A 2xx answer must be a plausible DNS message: at most 4 KiB, at least the
-	// same 12-byte minimum as on the request side, and the DoH content type.
-	if len(respBody) > maxDNSMessageBytes || len(respBody) < minDNSMessageBytes ||
-		!isStrictDoHContentType(resp.Header.Get("Content-Type")) {
+	// A DoH answer is 200 OK with a plausible DNS message: at most 4 KiB, at least
+	// the same 12-byte minimum as on the request side, and the DoH content type.
+	// Other 2xx statuses are not DoH answers (RFC 8484) and are rejected as 502.
+	if resp.StatusCode != http.StatusOK || len(respBody) > maxDNSMessageBytes ||
+		len(respBody) < minDNSMessageBytes || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -739,7 +746,7 @@ func (g *gateway) backendReady(parent context.Context) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
+	if resp.StatusCode != http.StatusOK || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
 		return false
 	}
 	pooled := dnsMessageBufferPool.Get().(*[]byte)
@@ -768,10 +775,14 @@ func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
 	return query, id
 }
 
+// loopbackAddr is the only address a readiness answer may carry.
+var loopbackAddr = []byte{127, 0, 0, 1}
+
 // isUsableDNSProbeResponse accepts only the expected local A answer: matching
-// ID, QR set, NOERROR, one echoed question, and a complete A 127.0.0.1 record
-// for readinessProbeName. A positive ANCOUNT alone is not sufficient: a
-// truncated or malformed answer must not make /readyz report healthy.
+// ID, QR set, TC clear, NOERROR, one echoed question, and a complete A
+// 127.0.0.1 record for readinessProbeName. A positive ANCOUNT alone is not
+// sufficient: a truncated or malformed answer must not make /readyz report
+// healthy.
 func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if len(msg) < 12+len(question) {
 		return false
@@ -779,7 +790,7 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if binary.BigEndian.Uint16(msg[:2]) != wantID {
 		return false
 	}
-	if msg[2]&0x80 == 0 || msg[3]&0x0f != 0 {
+	if msg[2]&0x80 == 0 || msg[2]&0x02 != 0 || msg[3]&0x0f != 0 {
 		return false
 	}
 	if binary.BigEndian.Uint16(msg[4:6]) != 1 || binary.BigEndian.Uint16(msg[6:8]) == 0 {
@@ -803,7 +814,7 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if rdataLen != 4 || rdataStart+rdataLen > len(msg) {
 		return false
 	}
-	return bytes.Equal(msg[rdataStart:rdataStart+rdataLen], []byte{127, 0, 0, 1})
+	return bytes.Equal(msg[rdataStart:rdataStart+rdataLen], loopbackAddr)
 }
 
 // decodeDNSName decodes a DNS wire-format name, following safe backward
@@ -1120,7 +1131,18 @@ func newHTTPClient(maxConns int) *http.Client {
 // waiting for MosDNS. The body-read budget is included explicitly because the
 // write deadline starts when the request headers are read.
 func serverWriteTimeout(bodyReadTimeout, queueWait, upstreamTimeout time.Duration) time.Duration {
-	if need := bodyReadTimeout + queueWait + upstreamTimeout + 2*time.Second; need > defaultWriteTimeout {
+	// Add from the fixed margin upward and saturate instead of allowing a
+	// collection of individually valid, large timeout settings to wrap around
+	// time.Duration and accidentally select the much shorter default.
+	const maxDuration = time.Duration(1<<63 - 1)
+	need := 2 * time.Second
+	for _, budget := range [...]time.Duration{bodyReadTimeout, queueWait, upstreamTimeout} {
+		if budget > maxDuration-need {
+			return maxDuration
+		}
+		need += budget
+	}
+	if need > defaultWriteTimeout {
 		return need
 	}
 	return defaultWriteTimeout

@@ -7,7 +7,9 @@ set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
 SHELL_UNDER_TEST="${TEST_SHELL:-sh}"
 TMP=$(mktemp -d)
-trap 'kill $(cat "$TMP"/*.pid 2>/dev/null) 2>/dev/null; rm -rf "$TMP"' EXIT
+# KILL, not TERM: the "stubborn" fake child ignores TERM, and a failed run must
+# not leave it behind.
+trap 'kill -KILL $(cat "$TMP"/*.pid 2>/dev/null) 2>/dev/null; rm -rf "$TMP"' EXIT
 fail=0
 
 # Fake children record their PID, then behave as requested via $MODE files.
@@ -105,7 +107,10 @@ check_gone "exiting gateway detected"
 # 5. A child that ignores TERM is KILLed after the grace period.
 run_entry stubborn run
 sleep 0.5
-kill -TERM "$ENTRY"; wait_exit 15
+kill -TERM "$ENTRY"
+sleep 1
+kill -TERM "$ENTRY" 2>/dev/null || true
+wait_exit 15
 check "stubborn child escalated to KILL" 0
 check_gone "stubborn child escalated to KILL"
 

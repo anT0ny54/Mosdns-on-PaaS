@@ -90,8 +90,14 @@ def check_loopback(value: str, path: str) -> None:
         fail(f"{path} must bind to loopback, not {host}")
 def check_upstream_addr(value, path: str) -> None:
     value = non_empty_string(value, path)
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.netloc or not parsed.hostname:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError:
+        # urlsplit can raise for malformed bracketed IPv6 authorities before
+        # returning a ParseResult (for example, "https://[invalid/path").
+        fail(f"{path} must be a valid upstream URL")
+    if not parsed.scheme or not parsed.netloc or not hostname:
         fail(f"{path} must be a valid upstream URL")
     try:
         port = parsed.port
@@ -170,13 +176,17 @@ sequence = plugin_of_type(entry, "sequence", "servers[0].exec")
 seq_path = f"plugins[{entry}].args.exec"
 exec_chain = expect_list(expect_mapping(sequence.get("args"), f"plugins[{entry}].args").get("exec"), seq_path)
 LOCAL_TYPES = {"arbitrary", "hosts"}
+EDNS_FILTER_TAGS = {"_edns0_filter_no_edns0", "_edns0_filter_ecs_only"}
 position = 0
 local_tags = []
 edns_filters = []
 while position < len(exec_chain):
     item = exec_chain[position]
-    if isinstance(item, str) and item.startswith("_edns0_filter_"):
+    if isinstance(item, str) and item in EDNS_FILTER_TAGS:
         edns_filters.append(item)
+    elif isinstance(item, str) and item.startswith("_edns0_filter_"):
+        supported = ", ".join(sorted(EDNS_FILTER_TAGS))
+        fail(f"{seq_path}[{position}] uses unsupported EDNS filter {item!r}; supported filters: {supported}")
     elif isinstance(item, str) and item in plugin_by_tag and plugin_by_tag[item]["type"] in LOCAL_TYPES:
         local_tags.append(item)
     else:
@@ -267,11 +277,14 @@ if main_text:
         rrs = expect_list(expect_mapping(plugin_by_tag[tag].get("args"), f"plugins[{tag}].args").get("rr"), f"plugins[{tag}].args.rr")
         for rr in rrs:
             fields = non_empty_string(rr, f"plugins[{tag}].args.rr[]").split()
+            # The gateway probe is an IN query, so a record in another class
+            # (CH, HS, ...) would never answer it: require class IN.
             if (len(fields) >= 5 and fields[0].lower() == probe
-                    and fields[3].upper() == "A" and fields[4] == "127.0.0.1"):
+                    and fields[2].upper() == "IN" and fields[3].upper() == "A"
+                    and fields[4] == "127.0.0.1"):
                 answered = True
     if not answered:
-        fail(f"no arbitrary plugin before {cache_tag} answers 'A {probe} 127.0.0.1' (main.go readinessProbeName); /readyz would depend on the public upstreams")
+        fail(f"no arbitrary plugin before {cache_tag} answers '{probe} IN A 127.0.0.1' (main.go readinessProbeName); /readyz would depend on the public upstreams")
     m = re.search(r"mosdnsServerTimeout\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_text)
     if m is None:
         fail("could not read mosdnsServerTimeout from main.go (expected '<n> * time.Millisecond|Second|Minute|Hour')")

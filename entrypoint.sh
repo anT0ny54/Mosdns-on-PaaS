@@ -7,6 +7,7 @@ MOSDNS_BIN="${MOSDNS_BIN:-/usr/local/bin/mosdns}"
 GATEWAY_BIN="${GATEWAY_BIN:-/usr/local/bin/doh-gateway}"
 MOSDNS_PID=""
 GATEWAY_PID=""
+SLEEP_PID=""
 # Shutdown grace periods in seconds. The gateway drains in-flight requests for
 # up to its own shutdown timeout (4s), so it gets the larger budget; MosDNS
 # stops fast, so it gets a short one. Together (9s) they fit inside Docker's
@@ -52,6 +53,12 @@ stop_child() {
 }
 
 terminate_children() {
+  # Cancel the supervision sleep so it cannot outlive the entrypoint. SLEEP_PID is
+  # cleared after every normal wait, so a stale (already reaped) PID is never signalled.
+  if [ -n "$SLEEP_PID" ]; then
+    kill "$SLEEP_PID" 2>/dev/null || true
+    wait "$SLEEP_PID" 2>/dev/null || true
+  fi
   if [ -n "$GATEWAY_PID" ]; then
     stop_child "$GATEWAY_PID" "$GATEWAY_SHUTDOWN_GRACE"
   fi
@@ -61,7 +68,9 @@ terminate_children() {
 }
 
 on_signal() {
-  trap - TERM INT HUP
+  # Keep later TERM/INT/HUP signals from interrupting child cleanup. The
+  # children still get their full grace periods and are KILLed/reaped if needed.
+  trap '' TERM INT HUP
   terminate_children
   exit 0
 }
@@ -80,7 +89,7 @@ GATEWAY_PID=$!
 # not used because BusyBox ash does not return from it when a child is killed
 # by a signal (OOM kill, SIGSEGV, SIGKILL), which left the container running
 # with a single process. The sleep runs in the background and is waited on so
-# a trapped TERM/INT/HUP interrupts it immediately.
+# a trapped TERM/INT/HUP interrupts it immediately; teardown then cancels it.
 while :; do
   if ! is_alive "$MOSDNS_PID" || ! is_alive "$GATEWAY_PID"; then
     # Already tearing down because a child died: a TERM arriving now must
@@ -90,5 +99,7 @@ while :; do
     exit 1
   fi
   sleep 1 &
-  wait $! 2>/dev/null || true
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null || true
+  SLEEP_PID=""
 done

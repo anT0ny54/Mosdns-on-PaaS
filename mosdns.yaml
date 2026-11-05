@@ -1,5 +1,5 @@
 # MosDNS v4.5.3
-# Readiness: "ready.doh-gateway.invalid A" is answered locally (never cached,
+# Readiness: "ready.doh-gateway.invalid IN A" is answered locally (never cached,
 # never sent upstream), so the gateway's /readyz checks MosDNS itself and an
 # upstream outage cannot make the platform restart the container.
 # EDNS: every option except ECS is stripped before the cache key is built, so

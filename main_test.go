@@ -431,6 +431,22 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 		t.Fatal("backend was called after request body read failure")
 	}
 }
+// A POST body that fails because the client went away gets no response and is
+// not counted: nobody can read it (README, /dns-query).
+func TestPOSTBodyErrorAfterDisconnectIsNotCounted(t *testing.T) {
+	g := testGateway(t, "http://127.0.0.1:1/dns-query", 100, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := postReq(failingReader{readErr: errors.New("synthetic disconnect")}).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, r)
+	if rec.Body.Len() != 0 {
+		t.Fatalf("response body written for a disconnected client: %q", rec.Body.String())
+	}
+	if got := g.metrics.responses4xxTotal.Load(); got != 0 {
+		t.Fatalf("disconnected client counted as %d 4xx responses, want 0", got)
+	}
+}
 func probeResponse(t *testing.T, r *http.Request, rcode byte) []byte {
 	dns := r.URL.Query().Get("dns")
 	if dns == "" {
@@ -1122,6 +1138,11 @@ func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 		// leaked to the public upstreams.
 		{"nxdomain", func(t *testing.T, r *http.Request) []byte { return probeResponse(t, r, 3) }},
 		{"servfail", func(t *testing.T, r *http.Request) []byte { return probeResponse(t, r, 2) }},
+		{"truncated response flag", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[2] |= 0x02 // DNS TC bit: the response is not complete.
+			return resp
+		}},
 		{"bare header without question", func(t *testing.T, r *http.Request) []byte {
 			resp := probeResponse(t, r, 0)
 			if len(resp) >= 12 {
