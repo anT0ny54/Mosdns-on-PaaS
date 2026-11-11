@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # The gateway is our own code and internet-facing, so it builds with a
 # currently supported Go release (same major.minor as go.mod and ci.yml).
-FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9 AS gateway-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS gateway-builder
 # Optional override. The inherited top-level default mirrors the VERSION file
 # (check-config.sh verifies that they agree), so plain `docker build` (e.g.
 # Koyeb) gets the correct version without a build-arg.
