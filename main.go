@@ -416,14 +416,12 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() { g.countStatus(rec.status) }()
 	switch r.URL.Path {
 	case "/healthz":
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			methodNotAllowed(w, "GET, HEAD")
+		if !allowGetHead(w, r) {
 			return
 		}
 		writeText(w, http.StatusOK, "ok\n")
 	case "/readyz":
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			methodNotAllowed(w, "GET, HEAD")
+		if !allowGetHead(w, r) {
 			return
 		}
 		ready := g.ready(r.Context())
@@ -437,8 +435,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeText(w, http.StatusOK, "ok\n")
 	case "/metrics":
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			methodNotAllowed(w, "GET, HEAD")
+		if !allowGetHead(w, r) {
 			return
 		}
 		g.serveMetrics(w)
@@ -472,6 +469,8 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		writeText(w, http.StatusServiceUnavailable, "active request limit reached\n")
 		return
 	}
+	// One controller serves the POST and GET deadline resets below.
+	rc := http.NewResponseController(w)
 	var body []byte
 	var dnsParam string
 	if r.Method == http.MethodPost {
@@ -486,7 +485,6 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		// A DNS message is at most 4 KiB: do not let a slow upload hold the
 		// active slot for the whole server ReadTimeout. Not every
 		// ResponseWriter supports deadlines (tests), so the error is ignored.
-		rc := http.NewResponseController(w)
 		_ = rc.SetReadDeadline(time.Now().Add(g.bodyReadTimeout))
 		// Read into a pooled buffer, then keep an exact-size copy (DNS queries
 		// are typically < 100 bytes) and recycle the buffer at once, so the
@@ -538,7 +536,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		// cancels the request context, and a raised QUEUE_WAIT/UPSTREAM_TIMEOUT
 		// would end without any gateway response. The server sets fresh
 		// deadlines for the next request on this connection.
-		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+		_ = rc.SetReadDeadline(time.Time{})
 	}
 	queueStart := time.Now()
 	select {
@@ -1043,6 +1041,16 @@ func rateLimitKey(ip netip.Addr) netip.Addr {
 		return ip.WithZone("")
 	}
 	return p.Addr()
+}
+
+// allowGetHead reports whether r may use a read-only endpoint. Otherwise it
+// writes the 405 response and returns false.
+func allowGetHead(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	methodNotAllowed(w, "GET, HEAD")
+	return false
 }
 
 func methodNotAllowed(w http.ResponseWriter, allow string) {

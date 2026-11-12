@@ -9,7 +9,21 @@ SHELL_UNDER_TEST="${TEST_SHELL:-sh}"
 TMP=$(mktemp -d)
 # KILL, not TERM: the "stubborn" fake child ignores TERM, and a failed run must
 # not leave it behind.
-trap 'kill -KILL $(cat "$TMP"/*.pid 2>/dev/null) 2>/dev/null; rm -rf "$TMP"' EXIT
+# Cleanup kills only fakes that still belong to this run. A recorded PID may
+# have been reused by an unrelated process, so each candidate must still carry
+# this run's FAKE_DIR in its environment (exec keeps the environment).
+kill_leftover_fakes() {
+  for f in "$TMP"/*.pid; do
+    [ -f "$f" ] || continue
+    p=$(cat "$f" 2>/dev/null) || continue
+    [ -n "$p" ] || continue
+    if [ -r "/proc/$p/environ" ] &&
+       tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qxF "FAKE_DIR=$TMP"; then
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+}
+trap 'kill_leftover_fakes; rm -rf "$TMP"' EXIT
 fail=0
 
 # Fake children record their PID, then behave as requested via $MODE files.

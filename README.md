@@ -48,7 +48,8 @@ status at 1. The supervision loop checks for a child exit once per second;
 during shutdown, each child is polled every 0.2 s so
 an already-stopped child does not consume its full grace period (BusyBox `sleep`
 supports fractional seconds). Teardown also cancels the one-second supervision
-sleep, so no process outlives the entrypoint. Supervision is process-level only: it detects
+sleep. If the entrypoint exits, PID 1 (tini) exits with it and the container's
+remaining processes are killed. Supervision is process-level only: it detects
 an *exit*, not a wedge. If MosDNS hangs without exiting, point the platform
 health check at the gateway's
 `/readyz` (HTTP, not just TCP). The entrypoint honours these optional
@@ -257,7 +258,7 @@ The local image tag defaults to `mosdns-on-paas:local` (Docker image repository
 names must be lowercase). Override it with `make docker-build IMAGE=your-name:tag`.
 
 `test-entrypoint.sh` runs the real `entrypoint.sh` against fake MosDNS and
-gateway processes and checks, for each scenario, both the exit code and that
+gateway processes (its cleanup signals only fakes still started by that run) and checks, for each scenario, both the exit code and that
 neither fake child is still running afterwards: TERM shutdown exits 0; a
 SIGKILLed MosDNS or gateway and a child that exits on its own are detected
 (exit 1, the other child stopped); a child that ignores TERM is KILLed after its
@@ -318,8 +319,8 @@ together.
   serves plain HTTP.
 - Use `GET /readyz` as the HTTP health check: it checks the gateway and
   MosDNS but not the public upstreams, so an upstream outage does not make
-  the platform restart the instance (Koyeb restarts after 3 consecutive
-  failed checks). `/healthz` only shows that the gateway process is up.
+  the platform restart the instance (platforms such as Koyeb restart an
+  instance after repeated failed checks). `/healthz` only shows that the gateway process is up.
 - Keep `CLIENT_IP_HEADER=X-Forwarded-For` (the image default) only when the
   container is reachable solely through your trusted proxy; otherwise set it to
   `none`. If the container can be reached both through the proxy and directly,
