@@ -197,6 +197,10 @@ type immediateReadError struct{}
 
 func (immediateReadError) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
 type responseTransport struct {
 	status int
 	body   io.ReadCloser
@@ -215,29 +219,65 @@ func (tr responseTransport) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 type closeCountingBody struct {
-	reader io.Reader
-	closed int
+	reader    io.Reader
+	readCount int
+	closed    int
 }
 
-func (b *closeCountingBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
+func (b *closeCountingBody) Read(p []byte) (int, error) {
+	b.readCount++
+	return b.reader.Read(p)
+}
 func (b *closeCountingBody) Close() error {
 	b.closed++
 	return nil
 }
 
 type closeCountingTransport struct {
-	status      int
-	contentType string
-	body        *closeCountingBody
+	status        int
+	contentType   string
+	contentLength int64
+	retryAfter    string
+	location      string
+	body          *closeCountingBody
 }
 
 func (tr closeCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	header := make(http.Header)
+	if tr.contentType != "" {
+		header.Set("Content-Type", tr.contentType)
+	}
+	if tr.retryAfter != "" {
+		header.Set("Retry-After", tr.retryAfter)
+	}
+	if tr.location != "" {
+		header.Set("Location", tr.location)
+	}
 	return &http.Response{
-		StatusCode: tr.status,
-		Header:     http.Header{"Content-Type": []string{tr.contentType}},
-		Body:       tr.body,
-		Request:    req,
+		StatusCode:    tr.status,
+		Header:        header,
+		ContentLength: tr.contentLength,
+		Body:          tr.body,
+		Request:       req,
 	}, nil
+}
+
+func TestReadinessRejectsDeclaredOversizeWithoutReading(t *testing.T) {
+	body := &closeCountingBody{reader: bytes.NewReader(bytes.Repeat([]byte{'x'}, maxDNSMessageBytes+1))}
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", nil)
+	g.readyClient = &http.Client{Transport: closeCountingTransport{
+		status: http.StatusOK, contentType: "application/dns-message",
+		contentLength: maxDNSMessageBytes + 1, body: body,
+	}}
+	if g.backendReady(context.Background()) {
+		t.Fatal("readiness accepted a declared oversized DNS response")
+	}
+	if body.readCount != 0 {
+		t.Fatalf("readiness read the oversized body %d times, want no reads", body.readCount)
+	}
+	if body.closed != 1 {
+		t.Fatalf("readiness body closed %d times, want exactly once", body.closed)
+	}
 }
 
 func TestBackendResponseBodyClosedOnce(t *testing.T) {
@@ -310,24 +350,21 @@ func TestBackendErrorStatusSurvivesBadBody(t *testing.T) {
 	}
 }
 
-func TestNon200SuccessDoesNotWaitForBody(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusPartialContent)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		<-r.Context().Done()
-	}))
-	defer backend.Close()
-	g := regGateway(t, backend.URL, nil)
-	start := time.Now()
+func TestNon200SuccessDoesNotReadBody(t *testing.T) {
+	body := &closeCountingBody{reader: bytes.NewReader([]byte("body must be discarded"))}
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{
+		Transport: responseTransport{status: http.StatusPartialContent, body: body},
+	})
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("gateway waited for non-200 2xx body for %s", elapsed)
+	if body.readCount != 0 {
+		t.Fatalf("gateway read a non-200 2xx body %d times; it must reject the status before reading", body.readCount)
+	}
+	if body.closed != 1 {
+		t.Fatalf("backend body closed %d times, want exactly once", body.closed)
 	}
 }
 
@@ -357,26 +394,72 @@ func TestNonStandardHTTPStatusIsRejected(t *testing.T) {
 	}
 }
 
-func TestBackendRedirectDoesNotWaitForBody(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "http://example.invalid/redirect-target")
-		w.WriteHeader(http.StatusTemporaryRedirect)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		<-r.Context().Done()
-	}))
-	defer backend.Close()
-	g := regGateway(t, backend.URL, nil)
-	g.upstreamTimeout = 2 * time.Second
-	start := time.Now()
+func TestDeclaredOversizedBackendBodiesAreRejectedWithoutReading(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantStatus int
+	}{
+		{"success answer", http.StatusOK, http.StatusBadGateway},
+		{"upstream error", http.StatusServiceUnavailable, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &closeCountingBody{reader: bytes.NewReader([]byte("oversized body must not be read"))}
+			client := &http.Client{Transport: closeCountingTransport{
+				status: tc.status, contentType: "application/dns-message",
+				contentLength: maxDNSMessageBytes + 1, retryAfter: "7", body: body,
+			}}
+			g := regGateway(t, "http://127.0.0.1:9/dns-query", client)
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if body.readCount != 0 {
+				t.Fatalf("gateway read the declared oversized body %d times, want no reads", body.readCount)
+			}
+			if body.closed != 1 {
+				t.Fatalf("backend body closed %d times, want exactly once", body.closed)
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("response body length = %d, want 0", rec.Body.Len())
+			}
+			if tc.status != http.StatusOK {
+				if got := rec.Header().Get("Retry-After"); got != "7" {
+					t.Fatalf("Retry-After = %q, want 7", got)
+				}
+				if got := rec.Header().Get("Content-Type"); got != "" {
+					t.Fatalf("Content-Type = %q, want absent", got)
+				}
+				if got := rec.Header().Get("Content-Length"); got != "0" {
+					t.Fatalf("Content-Length = %q, want 0", got)
+				}
+			}
+			if got := g.metrics.backendErrorTotal.Load(); got != 1 {
+				t.Fatalf("backendErrorTotal = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestBackendRedirectDoesNotReadBody(t *testing.T) {
+	body := &closeCountingBody{reader: bytes.NewReader([]byte("redirect body must not be read"))}
+	client := newHTTPClient(1)
+	client.Transport = closeCountingTransport{
+		status: http.StatusTemporaryRedirect, contentType: "text/plain",
+		location: "http://example.invalid/redirect-target", body: body,
+	}
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", client)
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("gateway waited for redirect body for %s", elapsed)
+	if body.readCount != 0 {
+		t.Fatalf("gateway read the redirect body %d times, want no reads", body.readCount)
+	}
+	if body.closed != 1 {
+		t.Fatalf("redirect body closed %d times, want exactly once", body.closed)
 	}
 	if rec.Header().Get("Location") != "" {
 		t.Fatal("redirect Location header was relayed")
@@ -499,6 +582,35 @@ func (tr cancelAtEOFTransport) RoundTrip(req *http.Request) (*http.Response, err
 		Body:       &cancelAtEOFBody{data: probeResponse(tr.t, req, 0), cancel: tr.cancel},
 		Request:    req,
 	}, nil
+}
+
+func TestDNSAnswerCanceledAtSuccessfulBodyEndIsNotCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/dns-message"}},
+				Body:       &cancelAtEOFBody{data: make([]byte, minDNSMessageBytes), cancel: cancel},
+				Request:    req,
+			}, nil
+		}),
+	})
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))).WithContext(ctx))
+	if rec.Body.Len() != 0 {
+		t.Fatalf("canceled client received a body: %q", rec.Body.String())
+	}
+	if got := g.metrics.responses2xxTotal.Load(); got != 0 {
+		t.Fatalf("canceled backend answer counted as %d 2xx responses", got)
+	}
+	if got := g.metrics.backendLatencySamples.Load(); got != 0 {
+		t.Fatalf("canceled backend answer counted as %d latency samples", got)
+	}
+	if got := g.metrics.backendErrorTotal.Load(); got != 0 {
+		t.Fatalf("canceled backend answer counted as %d backend errors", got)
+	}
 }
 
 func TestReadyProbeCanceledAtSuccessfulBodyEndWritesNothing(t *testing.T) {

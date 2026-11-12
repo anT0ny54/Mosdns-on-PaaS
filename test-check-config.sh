@@ -67,6 +67,13 @@ write_case("string-threshold", lambda c, cache, seq, fb: fb.update(threshold="5"
 write_case("string-cache-boolean", lambda c, cache, seq, fb: cache.update(cache_everything="true"))
 write_case("extra-sequence-step", lambda c, cache, seq, fb: seq.append("fallback_hagezi"))
 write_case("unknown-edns-filter", lambda c, cache, seq, fb: seq.insert(1, "_edns0_filter_typo"))
+write_case("duplicate-fallback-plugin", lambda c, cache, seq, fb: fb["primary"].append(fb["primary"][0]))
+write_case("unhashable-fallback-tag", lambda c, cache, seq, fb: fb["primary"].__setitem__(0, []))
+write_case("unused-plugin", lambda c, cache, seq, fb: c["plugins"].append({"tag": "unused_probe", "type": "arbitrary", "args": {"rr": []}}))
+write_case("duplicate-local-plugin", lambda c, cache, seq, fb: seq.insert(1, seq[0]))
+write_case("duplicate-edns-filter", lambda c, cache, seq, fb: seq.insert(2, seq[1]))
+write_case("readiness-extra-token", lambda c, cache, seq, fb: next(p for p in c["plugins"] if p["tag"] == "readiness")["args"].update(rr=["ready.doh-gateway.invalid. 0 IN A 127.0.0.1 EXTRA"]))
+write_case("readiness-duplicate-a", lambda c, cache, seq, fb: next(p for p in c["plugins"] if p["tag"] == "readiness")["args"].update(rr=["ready.doh-gateway.invalid. 0 IN A 127.0.0.1", "ready.doh-gateway.invalid. 0 IN A 127.0.0.1"]))
 
 def set_malformed_upstream_url(config, cache, sequence, fallback):
     upstream = next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"]
@@ -81,6 +88,16 @@ def set_readiness_wrong_class(config, cache, sequence, fallback):
 write_case("readiness-wrong-class", set_readiness_wrong_class)
 write_case("valid-api-without-http", lambda c, cache, seq, fb: c.update(api={}))
 
+# Preserve a duplicated key in the original YAML text; safe_dump would erase it.
+base_yaml_text = (tmp / "mosdns.yaml").read_text(encoding="utf-8")
+timeout_line = "    timeout: 2\n"
+if timeout_line not in base_yaml_text:
+    raise SystemExit("test-check-config: could not find server timeout line for duplicate-key case")
+(tmp / "duplicate-yaml-key.yaml").write_text(
+    base_yaml_text.replace(timeout_line, timeout_line + "    timeout: 3\n", 1),
+    encoding="utf-8",
+)
+
 def set_listener_userinfo(config, cache, sequence, fallback):
     config["servers"][0]["listeners"][0]["addr"] = "user:pass@127.0.0.1:8081"
 
@@ -91,16 +108,26 @@ def set_listener_whitespace(config, cache, sequence, fallback):
 
 write_case("listener-whitespace", set_listener_whitespace)
 
-def set_upstream_whitespace(config, cache, sequence, fallback):
-    upstream = next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"]
-    upstream[0]["addr"] = "https://root.hagezi.org\n/dns-query"
+def set_primary_upstream_url(value):
+    def edit(config, cache, sequence, fallback):
+        upstream = next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"]
+        upstream[0]["addr"] = value
+    return edit
 
-write_case("upstream-whitespace", set_upstream_whitespace)
+write_case("upstream-whitespace", set_primary_upstream_url("https://root.hagezi.org\n/dns-query"))
+write_case("upstream-control-character", set_primary_upstream_url("https://root.hagezi.org/\u0090dns-query"))
+write_case("upstream-userinfo", set_primary_upstream_url("https://user:pass@root.hagezi.org/dns-query"))
+write_case("upstream-fragment", set_primary_upstream_url("https://root.hagezi.org/dns-query#fragment"))
+write_case("upstream-empty-fragment", set_primary_upstream_url("https://root.hagezi.org/dns-query#"))
+write_case("upstream-empty-port", set_primary_upstream_url("https://root.hagezi.org:/dns-query"))
+write_case("upstream-invalid-port", set_primary_upstream_url("https://root.hagezi.org:not-a-port/dns-query"))
+write_case("upstream-out-of-range-port", set_primary_upstream_url("https://root.hagezi.org:65536/dns-query"))
 
 def set_api_non_loopback(config, cache, sequence, fallback):
     config["api"] = {"http": "0.0.0.0:9091"}
 
 write_case("api-non-loopback", set_api_non_loopback)
+(tmp / "invalid-utf8.yaml").write_bytes(b"log:\n  level: error\n# invalid byte: \xff\n")
 PYTHON
 
 expect_ok() {
@@ -138,6 +165,14 @@ expect_ok valid-api-without-http
 expect_fail listener-userinfo "must be a host:port address without user-info"
 expect_fail listener-whitespace "must not contain whitespace or control characters"
 expect_fail upstream-whitespace "must not contain whitespace or control characters"
+expect_fail upstream-control-character "must not contain whitespace or control characters"
+expect_fail invalid-utf8 "must be valid UTF-8"
+expect_fail upstream-userinfo "must not contain user-info"
+expect_fail upstream-fragment "must not contain fragments"
+expect_fail upstream-empty-fragment "must not contain fragments"
+expect_fail upstream-empty-port "must not use an empty port"
+expect_fail upstream-invalid-port "must contain a valid port"
+expect_fail upstream-out-of-range-port "must contain a valid port"
 expect_fail api-non-loopback "api.http must bind to loopback, not 0.0.0.0"
 expect_fail unknown-fallback-key "fallback contains unsupported key"
 expect_fail negative-stat-length "stat_length must not be negative"
@@ -146,6 +181,14 @@ expect_fail string-threshold "threshold must be an integer"
 expect_fail string-cache-boolean "cache_everything must be true or false"
 expect_fail extra-sequence-step "must contain exactly one primary/secondary fallback"
 expect_fail unknown-edns-filter "uses unsupported EDNS filter"
+expect_fail duplicate-fallback-plugin "references plugin .* more than once"
+expect_fail unhashable-fallback-tag "primary\[1\] must be a non-empty string"
+expect_fail unused-plugin "unused plugin definition"
+expect_fail duplicate-local-plugin "local-answer plugin .* more than once"
+expect_fail duplicate-edns-filter "EDNS filter .* is repeated"
+expect_fail readiness-extra-token "IN A 127.0.0.1"
+expect_fail readiness-duplicate-a "exactly one arbitrary IN A record"
+expect_fail duplicate-yaml-key "duplicate mapping key 'timeout'"
 expect_fail malformed-upstream-url "must be a valid upstream URL"
 expect_fail readiness-wrong-class "IN A 127.0.0.1"
 
@@ -168,6 +211,43 @@ reject_dockerfile() { # $1 = case name, $2 = sed script, $3 = expected diagnosti
     echo "PASS config validator rejects $1"
 }
 
+# URI schemes are case-insensitive and must be treated the same by the
+# static checker and Go startup validation.
+sed 's#MOSDNS_DOH_URL=http://#MOSDNS_DOH_URL=HTTP://#' "$TMP/Dockerfile.orig" > "$TMP/Dockerfile"
+if ! sh "$TMP/check-config.sh" "$TMP/mosdns.yaml" > "$TMP/uppercase-backend-scheme.log" 2>&1; then
+    cat "$TMP/uppercase-backend-scheme.log" >&2
+    echo "test-check-config: uppercase HTTP backend scheme should be accepted" >&2
+    exit 1
+fi
+echo "PASS config validator accepts uppercase HTTP backend scheme"
+
 reject_dockerfile https-backend 's#MOSDNS_DOH_URL=http://#MOSDNS_DOH_URL=https://#' "does not match listener protocol"
 reject_dockerfile invalid-backend-port 's#MOSDNS_DOH_URL=http://127.0.0.1:8081#MOSDNS_DOH_URL=http://127.0.0.1:bad#' "must be a valid URL"
+reject_dockerfile backend-userinfo 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://user:pass@127.0.0.1:8081/dns-query|' "must not contain user-info"
+reject_dockerfile backend-fragment 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query#fragment|' "must not contain fragments"
+reject_dockerfile backend-empty-fragment 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query#|' "must not contain fragments"
+reject_dockerfile backend-empty-port 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:/dns-query|' "must not use an empty port"
+# A non-whitespace C1 control character is not matched by Python's \S
+# class, so ensure the explicit raw-character check catches it too.
+"$PYTHON" - "$TMP" <<'PYTHON'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+text = (root / "Dockerfile.orig").read_text(encoding="utf-8")
+needle = "MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query"
+if needle not in text:
+    raise SystemExit("test-check-config: could not find backend URL in Dockerfile")
+(root / "Dockerfile").write_text(text.replace(needle, needle + "\u0090", 1), encoding="utf-8")
+PYTHON
+if sh "$TMP/check-config.sh" "$TMP/mosdns.yaml" > "$TMP/backend-control-character.log" 2>&1; then
+    echo "test-check-config: Dockerfile backend control character was accepted" >&2
+    exit 1
+fi
+if grep -q "Traceback" "$TMP/backend-control-character.log" || ! grep -q "must not contain whitespace or control characters" "$TMP/backend-control-character.log"; then
+    cat "$TMP/backend-control-character.log" >&2
+    echo "test-check-config: Dockerfile backend control character was rejected for the wrong reason" >&2
+    exit 1
+fi
+echo "PASS config validator rejects Dockerfile backend control character"
+
 reject_dockerfile mismatched-version 's/^ARG GATEWAY_VERSION=.*/ARG GATEWAY_VERSION=9.9.9/' "must equal the VERSION file"

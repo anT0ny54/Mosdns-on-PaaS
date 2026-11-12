@@ -1068,10 +1068,69 @@ func TestBackendRequestURL(t *testing.T) {
 			}
 		})
 	}
-	for _, bad := range []string{"", "127.0.0.1:8081", "ftp://127.0.0.1/dns-query", "http:///dns-query"} {
+	for _, bad := range []string{
+		"",
+		"127.0.0.1:8081",
+		"ftp://127.0.0.1/dns-query",
+		"http:///dns-query",
+		"http://user:pass@127.0.0.1:8081/dns-query",
+		"http://127.0.0.1:8081/dns-query#fragment",
+		"http://127.0.0.1:8081/dns-query#",
+		"http://127.0.0.1:0/dns-query",
+		"http://127.0.0.1:/dns-query",
+		"http://127.0.0.1:65536/dns-query",
+		"http://127.0.0.1:8081/dns query",
+		"http://127.0.0.1:8081/dns\u00a0query",
+		"http://127.0.0.1:8081/dns\u0090query",
+	} {
 		if _, err := newGateway(gatewayOptions{BackendURL: bad}); err == nil {
 			t.Errorf("newGateway accepted invalid backend %q", bad)
 		}
+	}
+}
+
+func TestBackendURLSchemeIsCaseInsensitive(t *testing.T) {
+	g, err := newGateway(gatewayOptions{BackendURL: "HTTP://127.0.0.1:8081/dns-query"})
+	if err != nil {
+		t.Fatalf("newGateway rejected a case-insensitive HTTP scheme: %v", err)
+	}
+	if got := g.backendBase.Scheme; got != "http" {
+		t.Fatalf("normalized scheme = %q, want http", got)
+	}
+	if got := g.backendPlain; got != "http://127.0.0.1:8081/dns-query" {
+		t.Fatalf("normalized backend URL = %q", got)
+	}
+}
+
+func TestBackendURLErrorsDoNotLeakCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"http://user:secret-password@example.test/dns-query?token=query-secret",
+		"http://127.0.0.1:8081/dns-query?token=query-secret#fragment-secret",
+	} {
+		_, err := newGateway(gatewayOptions{BackendURL: raw})
+		if err == nil {
+			t.Fatalf("newGateway accepted invalid backend URL %q", raw)
+		}
+		for _, secret := range []string{"secret-password", "query-secret", "fragment-secret"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("backend validation error leaked %q: %v", secret, err)
+			}
+		}
+	}
+}
+
+func TestBackendURLFromEnvPreservesInvalidWhitespace(t *testing.T) {
+	t.Setenv("MOSDNS_DOH_URL", "  http://127.0.0.1:8081/dns-query  ")
+	got := backendURLFromEnv()
+	if got != "  http://127.0.0.1:8081/dns-query  " {
+		t.Fatalf("backendURLFromEnv trimmed malformed input: %q", got)
+	}
+	if _, err := newGateway(gatewayOptions{BackendURL: got}); err == nil {
+		t.Fatal("newGateway accepted whitespace from MOSDNS_DOH_URL")
+	}
+	t.Setenv("MOSDNS_DOH_URL", "")
+	if got := backendURLFromEnv(); got != defaultBackend {
+		t.Fatalf("empty environment value = %q, want default %q", got, defaultBackend)
 	}
 }
 
@@ -1139,9 +1198,19 @@ func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 		// leaked to the public upstreams.
 		{"nxdomain", func(t *testing.T, r *http.Request) []byte { return probeResponse(t, r, 3) }},
 		{"servfail", func(t *testing.T, r *http.Request) []byte { return probeResponse(t, r, 2) }},
+		{"non-query opcode", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[2] |= 0x08 // A response to a QUERY must echo opcode zero.
+			return resp
+		}},
 		{"truncated response flag", func(t *testing.T, r *http.Request) []byte {
 			resp := probeResponse(t, r, 0)
 			resp[2] |= 0x02 // DNS TC bit: the response is not complete.
+			return resp
+		}},
+		{"reserved Z flag", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[3] |= 0x40 // The reserved DNS header Z bit must be zero.
 			return resp
 		}},
 		{"bare header without question", func(t *testing.T, r *http.Request) []byte {
@@ -1169,6 +1238,24 @@ func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 				t.Fatal(err)
 			}
 			return probeResponse(t, r, 0)[:len(query)]
+		}},
+		{"answer count includes a missing second record", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[7] = 2 // ANCOUNT says two records, but only one is present.
+			return resp
+		}},
+		{"unexpected authority section", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[9] = 1 // NSCOUNT must be zero for this local probe.
+			return resp
+		}},
+		{"unexpected additional section", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			resp[11] = 1 // ARCOUNT must be zero for this local probe.
+			return resp
+		}},
+		{"trailing bytes after answer", func(t *testing.T, r *http.Request) []byte {
+			return append(probeResponse(t, r, 0), 0)
 		}},
 		{"wrong local A answer", func(t *testing.T, r *http.Request) []byte {
 			resp := probeResponse(t, r, 0)

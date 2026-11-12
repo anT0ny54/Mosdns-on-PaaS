@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 const (
@@ -250,9 +251,36 @@ func orDuration(v, def time.Duration) time.Duration {
 // newGateway validates the backend URL once and applies every default, so
 // the request path needs no lazy parsing or defensive fallbacks.
 func newGateway(o gatewayOptions) (*gateway, error) {
+	if strings.IndexFunc(o.BackendURL, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return nil, errors.New("invalid backend URL: whitespace or control characters are not supported")
+	}
 	u, err := url.Parse(o.BackendURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("invalid backend URL %q: want an absolute http(s) URL", o.BackendURL)
+	if err != nil || u.Hostname() == "" {
+		return nil, errors.New("invalid backend URL: want an absolute http(s) URL with a hostname")
+	}
+	// URI schemes are case-insensitive. Normalize before storing the URL so
+	// uppercase HTTP(S) values behave exactly like their lowercase forms and
+	// agree with check-config.sh.
+	u.Scheme = strings.ToLower(u.Scheme)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, errors.New("invalid backend URL: want an absolute http(s) URL with a hostname")
+	}
+	if u.User != nil {
+		return nil, errors.New("invalid backend URL: user-info is not supported")
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return nil, errors.New("invalid backend URL: port must not be empty")
+	}
+	if u.Fragment != "" || strings.Contains(o.BackendURL, "#") {
+		return nil, errors.New("invalid backend URL: fragments are not supported")
+	}
+	if port := u.Port(); port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return nil, errors.New("invalid backend URL: port must be between 1 and 65535")
+		}
 	}
 	processing := orInt(o.Processing, defaultConcurrency)
 	g := &gateway{
@@ -268,7 +296,7 @@ func newGateway(o gatewayOptions) (*gateway, error) {
 		trustProxyCIDRs: o.TrustedProxyPrefixes,
 		backendBase:     u,
 		backendPlain:    u.String(),
-		backendSimple:   u.RawQuery == "" && !u.ForceQuery && u.Fragment == "",
+		backendSimple:   u.RawQuery == "" && !u.ForceQuery,
 		readyCacheTTL:   o.ReadyCacheTTL,
 	}
 	if g.client == nil {
@@ -578,6 +606,11 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer closeBody()
+	if r.Context().Err() != nil {
+		// The client may disconnect after Do returns but before its response is
+		// inspected. Do not classify or count a response nobody can receive.
+		return
+	}
 
 	// One pooled buffer serves both the optional error body and the 2xx answer.
 	respBuf := dnsMessageBufferPool.Get().(*[]byte)
@@ -597,6 +630,19 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode < 400 || resp.StatusCode >= 600 {
 			g.metrics.backendErrorTotal.Add(1)
 			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if resp.ContentLength > maxDNSMessageBytes {
+			// The declared body cannot be relayed within the gateway's bound.
+			// Preserve the upstream status and useful non-representation headers
+			// without holding a processing slot while reading a body we will drop.
+			g.metrics.backendErrorTotal.Add(1)
+			copyResponseHeaders(w.Header(), resp.Header)
+			stripRepresentationHeaders(w.Header())
+			closeBody()
+			releaseSlot()
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(resp.StatusCode)
 			return
 		}
 		respBody, readErr := readDNSMessage(resp.Body, respBuf)
@@ -621,7 +667,17 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if resp.ContentLength > maxDNSMessageBytes {
+		g.metrics.backendErrorTotal.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
 	respBody, err := readDNSMessage(resp.Body, respBuf)
+	if r.Context().Err() != nil {
+		// A transport can finish the body at the same instant the client
+		// disconnects. Treat that as cancellation, not a successful response.
+		return
+	}
 	if err != nil {
 		g.failBackend(w, r, err)
 		return
@@ -758,6 +814,9 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	if resp.StatusCode != http.StatusOK || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
 		return false
 	}
+	if resp.ContentLength > maxDNSMessageBytes {
+		return false
+	}
 	pooled := dnsMessageBufferPool.Get().(*[]byte)
 	defer dnsMessageBufferPool.Put(pooled)
 	buf, err := readDNSMessage(resp.Body, pooled)
@@ -788,10 +847,10 @@ func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
 var loopbackAddr = []byte{127, 0, 0, 1}
 
 // isUsableDNSProbeResponse accepts only the expected local A answer: matching
-// ID, QR set, TC clear, NOERROR, one echoed question, and a complete A
-// 127.0.0.1 record for readinessProbeName. A positive ANCOUNT alone is not
-// sufficient: a truncated or malformed answer must not make /readyz report
-// healthy.
+// ID, standard QUERY opcode, QR set, TC and reserved Z clear, NOERROR, one
+// echoed question, exactly one complete A 127.0.0.1 answer, and no
+// authority/additional records or trailing bytes. A positive ANCOUNT alone is
+// not sufficient: a malformed answer must not make /readyz report healthy.
 func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if len(msg) < 12+len(question) {
 		return false
@@ -799,10 +858,14 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	if binary.BigEndian.Uint16(msg[:2]) != wantID {
 		return false
 	}
-	if msg[2]&0x80 == 0 || msg[2]&0x02 != 0 || msg[3]&0x0f != 0 {
+	if msg[2]&0x80 == 0 || msg[2]&0x78 != 0 || msg[2]&0x02 != 0 ||
+		msg[3]&0x40 != 0 || msg[3]&0x0f != 0 {
 		return false
 	}
-	if binary.BigEndian.Uint16(msg[4:6]) != 1 || binary.BigEndian.Uint16(msg[6:8]) == 0 {
+	if binary.BigEndian.Uint16(msg[4:6]) != 1 ||
+		binary.BigEndian.Uint16(msg[6:8]) != 1 ||
+		binary.BigEndian.Uint16(msg[8:10]) != 0 ||
+		binary.BigEndian.Uint16(msg[10:12]) != 0 {
 		return false
 	}
 	questionEnd := 12 + len(question)
@@ -820,7 +883,7 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 	}
 	rdataLen := int(binary.BigEndian.Uint16(msg[rrStart+8 : rrStart+10]))
 	rdataStart := rrStart + 10
-	if rdataLen != 4 || rdataStart+rdataLen > len(msg) {
+	if rdataLen != 4 || rdataStart+rdataLen != len(msg) {
 		return false
 	}
 	return bytes.Equal(msg[rdataStart:rdataStart+rdataLen], loopbackAddr)
@@ -1157,6 +1220,17 @@ func serverWriteTimeout(bodyReadTimeout, queueWait, upstreamTimeout time.Duratio
 	return defaultWriteTimeout
 }
 
+// backendURLFromEnv preserves non-empty input verbatim so newGateway can
+// reject malformed whitespace/control characters instead of trimming them.
+func backendURLFromEnv() string {
+	// Do not use envString here: trimming would silently turn malformed
+	// MOSDNS_DOH_URL values into valid URLs before newGateway can reject them.
+	if value := os.Getenv("MOSDNS_DOH_URL"); value != "" {
+		return value
+	}
+	return defaultBackend
+}
+
 // parseTrustedProxyPrefixes parses a comma-separated list of CIDRs for the
 // peers allowed to set the trusted client-IP header. An empty list means
 // every peer is trusted.
@@ -1184,7 +1258,7 @@ func parseTrustedProxyPrefixes(value string) ([]netip.Prefix, error) {
 
 func main() {
 	listen := normalizeListenAddr(os.Getenv("PORT"))
-	backend := envString("MOSDNS_DOH_URL", defaultBackend)
+	backend := backendURLFromEnv()
 	limit := envInt("RATE_LIMIT", defaultRateLimit)
 	window := envDuration("RATE_WINDOW", defaultRateWindow)
 	processing := envInt("MAX_CONCURRENT_REQUESTS", defaultConcurrency)
@@ -1237,7 +1311,9 @@ func main() {
 		IdleTimeout:       defaultIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	log.Printf("doh-gateway %s listening on %s, backend=%s, rate=%d/%s, active=%d, processing=%d", version, listen, backend, limit, window, maxActive, processing)
+	// Log only the host: valid backend query strings may contain secrets
+	// such as API tokens and must not be copied into process logs.
+	log.Printf("doh-gateway %s listening on %s, backend_host=%s, rate=%d/%s, active=%d, processing=%d", version, listen, g.backendBase.Host, limit, window, maxActive, processing)
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	serveErr := make(chan error, 1)

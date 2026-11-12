@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # The gateway is our own code and internet-facing, so it builds with a
 # currently supported Go release (same major.minor as go.mod and ci.yml).
-FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS gateway-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS gateway-builder
 # Optional override. The inherited top-level default mirrors the VERSION file
 # (check-config.sh verifies that they agree), so plain `docker build` (e.g.
 # Koyeb) gets the correct version without a build-arg.
@@ -64,7 +64,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X main.version=${version}" \
     -o /out/doh-gateway .
 
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 RUN apk add --no-cache ca-certificates tini \
     && addgroup -S app \

@@ -2,9 +2,9 @@
 
 ## 0.5.15
 
-### Modification log — 2026-11-05
+### Modification log — 2026-11-13
 
-Fifth review pass on the 0.5.15 tree (every file read in full; version unchanged).
+Merged-tree review and hardening (every project file read in full; project version unchanged).
 
 #### Fixed
 - **A non-200 2xx backend answer was relayed to the client.** A DoH answer is
@@ -45,6 +45,55 @@ Fifth review pass on the 0.5.15 tree (every file read in full; version unchanged
   listener and upstream addresses. Raw whitespace and control characters are
   now rejected, with listener and upstream regression cases.
 
+- **The readiness probe accepted incomplete or extended DNS answers.** It now
+  requires exactly one answer record, no authority/additional records, and no
+  trailing bytes after the loopback A record. Regression cases cover each form.
+- **Known-oversized backend bodies could occupy a worker until timeout.** The
+  gateway now rejects a declared oversized success answer immediately; for
+  upstream 4xx/5xx it preserves the status and useful headers while dropping
+  oversized representation data without waiting for the body.
+- **Backend URLs accepted unsafe or unusable authority components.** Startup now
+  rejects URL user-info, all fragments (including an empty trailing `#`), empty
+  explicit ports, and ports outside 1-65535, preventing accidental credential
+  forwarding and URLs that can only fail when a request is dialed.
+- **The config validator could crash on a malformed fallback tag.** A list or
+  mapping tag was used in a set lookup before its type was checked, producing a
+  Python traceback. Fallback tags are now checked as non-empty strings first.
+- **The config validator silently accepted duplicate YAML keys.** PyYAML's
+  default safe loader uses the last value, which can hide conflicting settings.
+  The validator now rejects duplicate explicit mapping keys while keeping safe
+  loading and YAML merge overrides.
+- **MosDNS upstream URL checks were weaker than gateway backend URL checks.**
+  The validator now rejects upstream user-info, all fragments (including an
+  empty trailing `#`), and explicit empty ports; regression cases cover each.
+- **Runtime backend URL validation did not reject raw whitespace consistently.**
+  `newGateway` now rejects raw whitespace/control characters before parsing,
+  matching the configuration validator and preventing ambiguous URL handling.
+- **An oversized declared readiness response was read before rejection.** The
+  `/readyz` probe now rejects `Content-Length` values above the DNS message
+  limit immediately and closes the response without reading its body.
+- **Readiness accepted DNS responses with an invalid opcode or reserved flag.**
+  The probe now requires the standard QUERY opcode and a clear reserved Z bit,
+  with regression cases for both malformed headers.
+- **The Dockerfile cross-check disagreed with gateway startup validation.** It
+  accepted backend user-info and fragments, allowing `make check-config` to pass
+  a configuration that the gateway would refuse at startup. The checker now
+  rejects user-info, fragments (including an empty `#`), and explicit empty
+  ports, matching the Go constructor.
+- **The readiness-record check accepted trailing garbage.** It now requires the
+  complete five-field `IN A` record instead of accepting any record whose first
+  five tokens looked correct.
+
+- **Duplicate readiness A records passed static validation but failed runtime
+  readiness.** The config checker now requires exactly one matching `IN A`
+  record for the probe name, aligning its result with `/readyz`'s strict one-answer
+  DNS parser; a duplicate-record regression fixture covers this case.
+- **A backend answer completing at client cancellation could still be counted.**
+  The gateway now checks the request context after the response is received and
+  after a successful DNS body read, so a disconnect at EOF writes/counts no
+  response and contributes no backend-latency sample. A deterministic transport
+  regression covers the cancellation-at-EOF race.
+
 #### Changed
 - `test-check-config.sh` checks why each config is rejected (a diagnostic per
   case) and fails on any Python traceback, instead of accepting any nonzero exit.
@@ -63,3 +112,37 @@ Fifth review pass on the 0.5.15 tree (every file read in full; version unchanged
   relayed upstream `4xx`/`5xx` statuses, and gateway-generated `502` responses.
 - `main_test.go` is now `gofmt`-clean (the previous check found one missing blank
   line).
+
+- The config validator now rejects unreferenced plugin definitions and duplicate
+  fallback plugin references; regression fixtures cover both cases.
+- Each config validation now starts Python only once (the interpreter-version
+  check runs inside the validator), reducing repeated process overhead in the
+  configuration regression suite.
+- Duplicate local-answer plugin and EDNS-filter references are rejected as
+  redundant; regression coverage now also exercises malformed fallback tags,
+  duplicate YAML keys, readiness-record tails, and Dockerfile backend URL parity.
+- Docker's gateway builder and Alpine runtime pins were refreshed to Go 1.27.4
+  and Alpine 3.24.4 patch releases; MosDNS remains on its required Go 1.19 base.
+- **`MOSDNS_DOH_URL` whitespace was silently trimmed before validation.** The
+  environment loader now preserves every non-empty value verbatim, so leading
+  and trailing whitespace/control characters are rejected; an unset or empty
+  value still selects the default backend.
+- **Backend URL scheme handling disagreed between Go and the config checker.**
+  Go now treats HTTP(S) schemes case-insensitively and normalizes them to
+  lowercase, matching the validator and URI rules.
+- **Backend URL secrets could appear in startup logs and validation errors.**
+  Validation messages no longer echo the supplied URL, and the startup log
+  reports only the backend host instead of its path or query string.
+- **C1 control characters were not rejected consistently.** Go and Python now
+  reject all Unicode control characters, including non-whitespace C1 values;
+  the Dockerfile backend URL receives the same raw-character check.
+- **Malformed UTF-8 could produce a Python traceback in config validation.**
+  The validator now reports a clear file-encoding error for the YAML and the
+  cross-checked project files.
+- Makefile `VERSION` and `BUILD_DATE` values are lazily evaluated, avoiding
+  unnecessary `cat` and `date` subprocesses for targets that do not build.
+- **Body-abandonment regressions depended on a 500 ms wall-clock threshold.**
+  Non-200 2xx, declared-oversize and redirect response tests now use a
+  deterministic transport; they assert that rejected bodies are never read,
+  are closed exactly once, and that redirect headers are not relayed. This
+  removes scheduler-dependent failures under race instrumentation.

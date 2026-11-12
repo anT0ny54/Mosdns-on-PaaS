@@ -1,6 +1,6 @@
 IMAGE ?= mosdns-on-paas:local
-VERSION := $(shell cat VERSION)
-BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+VERSION = $(shell cat VERSION)
+BUILD_DATE = $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 .PHONY: test fmt-check check-config check-config-test entrypoint-test entrypoint-test-busybox vet build docker-build run clean
 

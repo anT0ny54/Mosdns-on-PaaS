@@ -63,7 +63,7 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 |---|---|
 | `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes. A DNS answer must be `200 OK` with an `application/dns-message` body of 12-4096 bytes; statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
-| `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with `Content-Type: application/dns-message`, then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, echoed question, and a complete `A 127.0.0.1` answer for the probe name). An NXDOMAIN, truncated response, absent/malformed answer record, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
+| `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with `Content-Type: application/dns-message`, then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, exactly one answer, zero authority/additional records, the echoed question, and a complete `A 127.0.0.1` answer for the probe name with no trailing bytes). An NXDOMAIN, truncated response, absent/extra/malformed answer record, unexpected DNS section, trailing data, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
 | `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns backend statuses other than `200` and `400`-`599` into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a `200` `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Concurrent `/readyz` callers share one in-flight probe even when the result cache is disabled. Block or restrict `/metrics` at the platform edge if you do not want it public.
@@ -108,7 +108,7 @@ Gateway:
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8080` | Listen address (plain number 1-65535, or a Go address such as `127.0.0.1:8080`). An out-of-range number falls back to `8080`; any other value is passed to the listener as-is and is fatal at startup if it is not a valid address. |
-| `MOSDNS_DOH_URL` | `http://127.0.0.1:8081/dns-query` | Backend; must be an absolute URL. For the bundled MosDNS listener (plain HTTP), use an `http://` URL; `check-config.sh` rejects scheme mismatches. Fatal at startup if malformed. Keep it in sync with the listener in `mosdns.yaml`. |
+| `MOSDNS_DOH_URL` | `http://127.0.0.1:8081/dns-query` | Backend; must be an absolute HTTP(S) URL with a hostname and, when specified, a port from 1 to 65535 (an explicit empty port is invalid). The scheme is case-insensitive and normalized to lowercase. Raw whitespace/control characters, user-info (embedded credentials), and all fragments (including an empty trailing `#`) are rejected. A non-empty environment value is validated verbatim rather than trimmed; unset or empty selects the default. The Go gateway and `check-config.sh` enforce the same URL rules. For the bundled MosDNS listener (plain HTTP), use an `http://` URL; `check-config.sh` rejects scheme mismatches. Fatal at startup if malformed. Keep it in sync with the listener in `mosdns.yaml`. |
 | `RATE_LIMIT` | `100` | `/dns-query` requests per client per window. Every GET/POST counts, including ones later rejected with `400`/`413`/`415`. |
 | `RATE_WINDOW` | `60s` | Rate-limit window (fixed, clock-aligned windows). |
 | `RATE_LIMIT_CLIENTS` | `65536` | Max distinct client keys per window; new clients are denied beyond this until the window rolls over. IPv6 clients are grouped by /64. |
@@ -133,6 +133,9 @@ so spoofed headers from direct clients are ignored.
 Integer variables must be >= 1 and duration variables must be positive Go
 durations (`100ms`, `2.5s`). An invalid value is ignored: the default is used
 and a warning is logged at startup (`PORT` and `MOSDNS_DOH_URL` are the exceptions, see the table).
+For safety, startup logs show only the backend host; validation errors never
+include the raw URL, so query-string tokens and embedded credentials are not
+copied into process logs.
 
 The Dockerfile sets only `MOSDNS_CONFIG` (the entrypoint's own default, repeated for clarity), `MOSDNS_DOH_URL`, `UPSTREAM_TIMEOUT=2.5s`
 (pinned because `check-config.sh` ties it to the MosDNS timeout), `CLIENT_IP_HEADER=X-Forwarded-For`
@@ -185,8 +188,14 @@ cache in under 1 ms (measured end to end through the gateway).
 `make check-config`) validates it:
 
 - YAML structure, plugin tags/types, and upstream URL authorities and ports;
-  listener addresses and upstream URLs containing raw whitespace or control
-  characters are rejected instead of being normalized by the URL parser;
+  duplicate explicit YAML mapping keys and malformed fallback tags are rejected,
+  every plugin definition must be referenced by the configured server sequence,
+  and repeated local-answer, EDNS-filter, or fallback references are rejected;
+  listener addresses, upstream URLs and the Dockerfile backend URL containing
+  raw whitespace or any Unicode control characters are rejected instead of
+  being normalized or partially matched; malformed UTF-8 is reported cleanly;
+  upstream URLs also reject embedded user-info, all fragments (including an
+  empty trailing `#`), and explicit empty ports;
 - the entry sequence (`servers[0].exec`) layout: optional local-answer
   (`arbitrary`/`hosts`) and the two pre-initialized EDNS filters
   (`_edns0_filter_no_edns0` or `_edns0_filter_ecs_only`), then a `cache` plugin,
@@ -199,13 +208,17 @@ cache in under 1 ms (measured end to end through the gateway).
   supported EDNS filter precedes the cache; unknown `_edns0_filter_*` aliases
   are rejected instead of being treated as valid built-ins;
 - an `arbitrary` plugin before the cache answers the gateway's
-  `readinessProbeName` from `main.go` with a class `IN` `A 127.0.0.1` record,
-  so `/readyz` cannot silently start depending on the upstreams;
+  `readinessProbeName` from `main.go` with exactly one class `IN` `A 127.0.0.1`
+  record; duplicate matching A records are rejected because `/readyz` requires
+  exactly one answer RR and no authority/additional records;
 - exactly one server with exactly one listener, which must use the `http`
   protocol and bind to loopback (an `api.http` listener, if present, must also
   be loopback);
 - the Dockerfile's `MOSDNS_DOH_URL` scheme, host, port and path match that
   listener (the listener is plain HTTP, so an `https://` backend is rejected);
+  backend user-info, fragments (including an empty `#`), explicit empty ports,
+  and raw whitespace/control characters are rejected consistently with the
+  gateway's startup validation;
 - the timeout chain `fast_fallback < servers[0].timeout < UPSTREAM_TIMEOUT`,
   using `UPSTREAM_TIMEOUT` from the Dockerfile (`<number>ms`, `<number>s`,
   `<number>m` or `<number>h`) or, if unset there, `defaultUpstreamTO` from
@@ -279,8 +292,8 @@ Docker build arguments (all have defaults in the Dockerfile). The builder
 stages run on `$BUILDPLATFORM` and cross-compile for `TARGETARCH` (GOARM is
 set only for 32-bit arm), so `docker buildx build --platform
 linux/amd64,linux/arm64 .` does not run Go under emulation. The base images
-(`golang:1.19.13-bookworm` for MosDNS, `golang:1.27.3-bookworm` for the gateway,
-`alpine:3.24.3` for the runtime) are written literally in the `FROM` lines,
+(`golang:1.19.13-bookworm` for MosDNS, `golang:1.27.4-bookworm` for the gateway,
+`alpine:3.24.4` for the runtime) are written literally in the `FROM` lines,
 each pinned by multi-arch digest. They are not build arguments because
 Dependabot cannot read ARG-templated `FROM` lines. `.github/dependabot.yml`
 proposes digest and patch updates weekly; for `golang` it ignores minor and

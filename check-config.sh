@@ -14,14 +14,11 @@ else
     echo "check-config: Python 3 with PyYAML is required to validate $CONFIG" >&2
     exit 1
 fi
-if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
-    echo "check-config: Python 3.8+ with PyYAML is required to validate $CONFIG" >&2
-    exit 1
-fi
 exec "$PYTHON" - "$CONFIG" <<'PYTHON'
 import ipaddress
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 try:
@@ -33,6 +30,8 @@ config_path = Path(sys.argv[1])
 def fail(message: str) -> None:
     print(f"check-config: {message}", file=sys.stderr)
     raise SystemExit(1)
+if sys.version_info < (3, 8):
+    fail("Python 3.8+ with PyYAML is required")
 def expect_mapping(value, path: str) -> dict:
     if not isinstance(value, dict):
         fail(f"{path} must be a mapping")
@@ -55,12 +54,20 @@ def exact_bool(value, path: str) -> bool:
     return value
 def no_raw_whitespace_or_control(value: str, path: str) -> str:
     has_invalid_char = any(
-        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f
+        char.isspace() or unicodedata.category(char) == "Cc"
         for char in value
     )
     if has_invalid_char:
         fail(f"{path} must not contain whitespace or control characters")
     return value
+
+def read_utf8(path: Path, label: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeError:
+        fail(f"{label} must be valid UTF-8")
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
 def strip_comments(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 DURATION_UNIT_MS = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000,
@@ -109,23 +116,57 @@ def check_upstream_addr(value, path: str) -> None:
         fail(f"{path} must be a valid upstream URL")
     if not parsed.scheme or not parsed.netloc or not hostname:
         fail(f"{path} must be a valid upstream URL")
+    if parsed.username is not None or parsed.password is not None:
+        fail(f"{path} must not contain user-info")
+    if parsed.fragment or "#" in value:
+        fail(f"{path} must not contain fragments")
+    if parsed.netloc.endswith(":"):
+        fail(f"{path} must not use an empty port")
     try:
         port = parsed.port
     except ValueError:
         fail(f"{path} must contain a valid port")
     if port is not None and not 1 <= port <= 65535:
         fail(f"{path} must contain a valid port from 1 to 65535")
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate explicit mapping keys."""
+
+def construct_unique_mapping(loader, node, deep=False):
+    # Check explicit keys before flattening YAML merge keys. Merge overrides
+    # remain supported, while accidentally repeated keys in the source fail.
+    seen = set()
+    for key_node, _ in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            continue
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in seen
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                "found an unhashable mapping key", key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"found duplicate mapping key {key!r}", key_node.start_mark,
+            )
+        seen.add(key)
+    loader.flatten_mapping(node)
+    return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_unique_mapping
+)
+
 try:
-    with config_path.open("r", encoding="utf-8") as fh:
-        cfg = yaml.safe_load(fh)
+    cfg = yaml.load(read_utf8(config_path, str(config_path)), Loader=UniqueKeySafeLoader)
 except yaml.YAMLError as exc:
     problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
     mark = getattr(exc, "problem_mark", None)
     if mark is not None:
         problem = f"line {mark.line + 1}, column {mark.column + 1}: {problem}"
     fail(f"invalid YAML: {problem}")
-except OSError as exc:
-    fail(f"cannot read {config_path}: {exc}")
 project_dir = config_path.resolve().parent
 root = expect_mapping(cfg, "root")
 log = expect_mapping(root.get("log"), "log")
@@ -193,14 +234,22 @@ EDNS_FILTER_TAGS = {"_edns0_filter_no_edns0", "_edns0_filter_ecs_only"}
 position = 0
 local_tags = []
 edns_filters = []
+seen_local_tags = set()
+seen_edns_filters = set()
 while position < len(exec_chain):
     item = exec_chain[position]
     if isinstance(item, str) and item in EDNS_FILTER_TAGS:
+        if item in seen_edns_filters:
+            fail(f"{seq_path} EDNS filter {item!r} is repeated; one filter before the cache is sufficient")
+        seen_edns_filters.add(item)
         edns_filters.append(item)
     elif isinstance(item, str) and item.startswith("_edns0_filter_"):
         supported = ", ".join(sorted(EDNS_FILTER_TAGS))
         fail(f"{seq_path}[{position}] uses unsupported EDNS filter {item!r}; supported filters: {supported}")
     elif isinstance(item, str) and item in plugin_by_tag and plugin_by_tag[item]["type"] in LOCAL_TYPES:
+        if item in seen_local_tags:
+            fail(f"{seq_path} local-answer plugin {item!r} is referenced more than once")
+        seen_local_tags.add(item)
         local_tags.append(item)
     else:
         break
@@ -225,6 +274,8 @@ if cache.get("when_hit") != "_return":
 if position + 2 != len(exec_chain):
     fail(f"{seq_path} must contain exactly one primary/secondary fallback after {cache_tag}; extra or unvalidated sequence entries are not allowed")
 fallback = exec_chain[position + 1]
+referenced_plugin_tags = {entry, cache_tag, *local_tags}
+seen_fallback_tags = set()
 if not isinstance(fallback, dict) or "primary" not in fallback or "secondary" not in fallback:
     fail(f"{seq_path} must contain a primary/secondary fallback entry immediately after {cache_tag}")
 unknown_fallback_keys = set(fallback) - {"primary", "secondary", "stat_length", "threshold", "fast_fallback", "always_standby"}
@@ -241,7 +292,12 @@ for side in ("primary", "secondary"):
     tags = expect_list(fallback.get(side), f"{seq_path}[].{side}")
     if not tags:
         fail(f"{seq_path}[].{side} must not be empty")
-    for tag in tags:
+    for tag_index, tag in enumerate(tags, start=1):
+        tag = non_empty_string(tag, f"{seq_path}[].{side}[{tag_index}]")
+        if tag in seen_fallback_tags:
+            fail(f"{seq_path} fallback references plugin {tag!r} more than once")
+        seen_fallback_tags.add(tag)
+        referenced_plugin_tags.add(tag)
         args = expect_mapping(plugin_of_type(tag, "fast_forward", f"{seq_path}[].{side}").get("args"), f"plugins[{tag}].args")
         upstreams = expect_list(args.get("upstream"), f"plugins[{tag}].args.upstream")
         if not upstreams:
@@ -267,6 +323,9 @@ for side in ("primary", "secondary"):
             # a race between untrusted upstreams silently degrades.
             if index > 1 and not trusted:
                 fail(f"{p}.trusted must be true: MosDNS v4 drops NXDOMAIN/SERVFAIL answers from untrusted upstreams, so the parallel race in {tag} would only use the first upstream for them")
+unused_plugins = sorted(set(plugin_by_tag) - referenced_plugin_tags)
+if unused_plugins:
+    fail("unused plugin definition(s): " + ", ".join(unused_plugins))
 if exact_int(fallback.get("fast_fallback"), f"{seq_path}[].fast_fallback") <= 0:
     fail("main sequence fast_fallback must be greater than 0 ms")
 if "always_standby" in fallback:
@@ -277,27 +336,30 @@ if fallback["fast_fallback"] >= server_timeout_ms:
 
 # --- main.go: readiness name and default upstream timeout ---------------------
 main_go = project_dir / "main.go"
-main_text = main_go.read_text(encoding="utf-8") if main_go.is_file() else ""
+main_text = read_utf8(main_go, "main.go") if main_go.is_file() else ""
 if main_text:
     m = re.search(r'readinessProbeName\s*=\s*"([^"]+)"', main_text)
     if m is None:
         fail("could not read readinessProbeName from main.go")
     probe = m.group(1).rstrip(".").lower() + "."
-    answered = False
+    readiness_a_records = 0
+    readiness_answer_is_loopback = False
     for tag in local_tags:
         if plugin_by_tag[tag]["type"] != "arbitrary":
             continue
         rrs = expect_list(expect_mapping(plugin_by_tag[tag].get("args"), f"plugins[{tag}].args").get("rr"), f"plugins[{tag}].args.rr")
         for rr in rrs:
             fields = non_empty_string(rr, f"plugins[{tag}].args.rr[]").split()
-            # The gateway probe is an IN query, so a record in another class
-            # (CH, HS, ...) would never answer it: require class IN.
-            if (len(fields) >= 5 and fields[0].lower() == probe
-                    and fields[2].upper() == "IN" and fields[3].upper() == "A"
-                    and fields[4] == "127.0.0.1"):
-                answered = True
-    if not answered:
-        fail(f"no arbitrary plugin before {cache_tag} answers '{probe} IN A 127.0.0.1' (main.go readinessProbeName); /readyz would depend on the public upstreams")
+            # The gateway probe is an IN query. Count every matching IN A
+            # record so duplicate answers cannot pass validation: /readyz
+            # deliberately accepts exactly one answer RR and no extras.
+            if (len(fields) >= 4 and fields[0].lower() == probe
+                    and fields[2].upper() == "IN" and fields[3].upper() == "A"):
+                readiness_a_records += 1
+                if len(fields) == 5 and fields[4] == "127.0.0.1":
+                    readiness_answer_is_loopback = True
+    if readiness_a_records != 1 or not readiness_answer_is_loopback:
+        fail(f"exactly one arbitrary IN A record before {cache_tag} must answer '{probe} IN A 127.0.0.1' (main.go readinessProbeName); /readyz rejects missing, duplicate, or different answers")
     m = re.search(r"mosdnsServerTimeout\s*=\s*(\d+(?:\.\d+)?)\s*\*\s*time\.(Millisecond|Second|Minute|Hour)\b", main_text)
     if m is None:
         fail("could not read mosdnsServerTimeout from main.go (expected '<n> * time.Millisecond|Second|Minute|Hour')")
@@ -307,17 +369,25 @@ if main_text:
 
 # --- Dockerfile cross-checks -------------------------------------------------
 dockerfile = project_dir / "Dockerfile"
-dockerfile_text = strip_comments(dockerfile.read_text(encoding="utf-8")) if dockerfile.is_file() else ""
+dockerfile_text = strip_comments(read_utf8(dockerfile, "Dockerfile")) if dockerfile.is_file() else ""
 if dockerfile_text:
     match = re.search(r"\bMOSDNS_DOH_URL=(\S+)", dockerfile_text)
     if match is None:
         fail("Dockerfile does not set MOSDNS_DOH_URL")
+    backend_raw = match.group(1).rstrip("\\")
+    backend_raw = no_raw_whitespace_or_control(backend_raw, "Dockerfile MOSDNS_DOH_URL")
     try:
-        backend = urlsplit(match.group(1).rstrip("\\"))
+        backend = urlsplit(backend_raw)
         backend_host = backend.hostname
         backend_port = backend.port
     except ValueError:
         fail("Dockerfile MOSDNS_DOH_URL must be a valid URL")
+    if backend.username is not None or backend.password is not None:
+        fail("Dockerfile MOSDNS_DOH_URL must not contain user-info")
+    if backend.fragment or "#" in backend_raw:
+        fail("Dockerfile MOSDNS_DOH_URL must not contain fragments")
+    if backend.netloc.endswith(":"):
+        fail("Dockerfile MOSDNS_DOH_URL must not use an empty port")
     listener_host = listen_host(listener["addr"])
     listener_port = urlsplit("//" + listener["addr"]).port
     if backend.scheme.lower() != protocol:
@@ -348,7 +418,7 @@ if server_timeout_ms >= gateway_timeout_ms:
 go_versions = {}
 go_mod = project_dir / "go.mod"
 if go_mod.is_file():
-    m = re.search(r"^go[ \t]+(\d+(?:\.\d+)*)\s*$", go_mod.read_text(encoding="utf-8"), re.MULTILINE)
+    m = re.search(r"^go[ \t]+(\d+(?:\.\d+)*)\s*$", read_utf8(go_mod, "go.mod"), re.MULTILINE)
     if m is None:
         fail("go.mod has no 'go <version>' directive")
     go_versions["go.mod"] = m.group(1)
@@ -366,7 +436,7 @@ if go_mod.is_file():
             fail(f"Dockerfile mosdns-builder uses Go {m.group(1)}; MosDNS v4 (quic-go v0.30) only builds with Go 1.19")
     ci_file = project_dir / ".github" / "workflows" / "ci.yml"
     if ci_file.is_file():
-        for n, m in enumerate(re.finditer(r"^\s*go-version:\s*[\"']?([^\s\"'#]+)", ci_file.read_text(encoding="utf-8"), re.MULTILINE), 1):
+        for n, m in enumerate(re.finditer(r"^\s*go-version:\s*[\"']?([^\s\"'#]+)", read_utf8(ci_file, "CI workflow"), re.MULTILINE), 1):
             go_versions[f"ci.yml go-version #{n}"] = m.group(1)
     if len({major_minor(v) for v in go_versions.values()}) > 1:
         fail("Go versions disagree (keep them in sync): " + ", ".join(f"{k}={v}" for k, v in go_versions.items()))
@@ -376,7 +446,7 @@ if go_mod.is_file():
 # empty version even though the binary was built from VERSION.
 version_file = project_dir / "VERSION"
 if dockerfile_text and version_file.is_file():
-    image_version = version_file.read_text(encoding="utf-8").strip()
+    image_version = read_utf8(version_file, "VERSION").strip()
     m = re.search(r"^ARG[ \t]+GATEWAY_VERSION=([^\s]+)[ \t]*$", dockerfile_text, re.MULTILINE)
     if m is None:
         fail("Dockerfile has no literal 'ARG GATEWAY_VERSION=<version>' default")
