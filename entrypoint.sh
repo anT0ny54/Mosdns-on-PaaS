@@ -16,20 +16,20 @@ SLEEP_PID=""
 GATEWAY_SHUTDOWN_GRACE=6
 MOSDNS_SHUTDOWN_GRACE=3
 
-# True while the process exists and is not a zombie. `kill -0` alone is not
-# enough: an exited child stays a zombie (and `kill -0` keeps succeeding) until
-# its parent reaps it, so the state is read from /proc as well. Without /proc
-# the check degrades to `kill -0`. Only shell builtins are used, so the check
-# itself forks nothing (the supervision loop forks one `sleep` per second).
-is_alive() {
-  kill -0 "$1" 2>/dev/null || return 1
-  [ -r "/proc/$1/stat" ] || return 0
-  # The state field follows the ")" that closes the command name.
-  # ${state##*) } strips the longest match, so it anchors on the LAST
-  # ") " on the line: a ") " inside the command name cannot mislead it.
-  read -r state < "/proc/$1/stat" 2>/dev/null || return 0
-  state=${state##*) }
-  case "$state" in
+# When /proc is readable, true only while PID is a live direct child of this
+# entrypoint; otherwise fall back to kill -0. The Linux parent-PID check keeps
+# a reaped child PID from matching an unrelated process after PID reuse.
+is_child_alive() {
+  pid=$1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/stat" ] || return 0
+  read -r proc_stat < "/proc/$pid/stat" 2>/dev/null || return 1
+  proc_stat=${proc_stat##*) }
+  proc_state=${proc_stat%% *}
+  proc_fields=${proc_stat#* }
+  proc_ppid=${proc_fields%% *}
+  [ "$proc_ppid" = "$$" ] || return 1
+  case "$proc_state" in
     Z*|X*) return 1 ;;
   esac
   return 0
@@ -40,12 +40,14 @@ is_alive() {
 stop_child() {
   pid=$1
   ticks=$(($2 * 5))
-  kill -TERM "$pid" 2>/dev/null || true
-  while [ "$ticks" -gt 0 ] && is_alive "$pid"; do
+  if is_child_alive "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+  while [ "$ticks" -gt 0 ] && is_child_alive "$pid"; do
     sleep 0.2
     ticks=$((ticks - 1))
   done
-  if is_alive "$pid"; then
+  if is_child_alive "$pid"; then
     kill -KILL "$pid" 2>/dev/null || true
   fi
   # Reap it so no zombie is left behind.
@@ -53,10 +55,13 @@ stop_child() {
 }
 
 terminate_children() {
-  # Cancel the supervision sleep so it cannot outlive the entrypoint. SLEEP_PID is
-  # cleared after every normal wait, so a stale (already reaped) PID is never signalled.
+  # Cancel the supervision sleep so it cannot outlive the entrypoint. When
+  # /proc is readable, child signals are guarded by direct-child ownership so a
+  # reaped PID cannot be mistaken for an unrelated process after PID reuse.
   if [ -n "$SLEEP_PID" ]; then
-    kill "$SLEEP_PID" 2>/dev/null || true
+    if is_child_alive "$SLEEP_PID"; then
+      kill "$SLEEP_PID" 2>/dev/null || true
+    fi
     wait "$SLEEP_PID" 2>/dev/null || true
   fi
   if [ -n "$GATEWAY_PID" ]; then
@@ -91,7 +96,7 @@ GATEWAY_PID=$!
 # with a single process. The sleep runs in the background and is waited on so
 # a trapped TERM/INT/HUP interrupts it immediately; teardown then cancels it.
 while :; do
-  if ! is_alive "$MOSDNS_PID" || ! is_alive "$GATEWAY_PID"; then
+  if ! is_child_alive "$MOSDNS_PID" || ! is_child_alive "$GATEWAY_PID"; then
     # Already tearing down because a child died: a TERM arriving now must
     # not re-run the shutdown and turn this exit 1 into exit 0.
     trap '' TERM INT HUP

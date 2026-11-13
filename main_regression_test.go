@@ -262,6 +262,24 @@ func (tr closeCountingTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}, nil
 }
 
+func TestReadinessRejectsDeclaredUndersizeWithoutReading(t *testing.T) {
+	body := &closeCountingBody{reader: bytes.NewReader(make([]byte, minDNSMessageBytes))}
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", nil)
+	g.readyClient = &http.Client{Transport: closeCountingTransport{
+		status: http.StatusOK, contentType: "application/dns-message",
+		contentLength: minDNSMessageBytes - 1, body: body,
+	}}
+	if g.backendReady(context.Background()) {
+		t.Fatal("readiness accepted a declared undersized DNS response")
+	}
+	if body.readCount != 0 {
+		t.Fatalf("readiness read the undersized body %d times, want no reads", body.readCount)
+	}
+	if body.closed != 1 {
+		t.Fatalf("readiness body closed %d times, want exactly once", body.closed)
+	}
+}
+
 func TestReadinessRejectsDeclaredOversizeWithoutReading(t *testing.T) {
 	body := &closeCountingBody{reader: bytes.NewReader(bytes.Repeat([]byte{'x'}, maxDNSMessageBytes+1))}
 	g := regGateway(t, "http://127.0.0.1:9/dns-query", nil)
@@ -277,6 +295,66 @@ func TestReadinessRejectsDeclaredOversizeWithoutReading(t *testing.T) {
 	}
 	if body.closed != 1 {
 		t.Fatalf("readiness body closed %d times, want exactly once", body.closed)
+	}
+}
+
+func TestSuccessfulBackendInvalidResponseMetadataRejectedBeforeBodyRead(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		header        http.Header
+		contentLength int64
+	}{
+		{
+			name:          "wrong content type",
+			header:        http.Header{"Content-Type": []string{"text/plain"}},
+			contentLength: -1,
+		},
+		{
+			name:          "duplicate content type",
+			header:        http.Header{"Content-Type": []string{"application/dns-message", "application/dns-message"}},
+			contentLength: -1,
+		},
+		{
+			name:          "declared oversized body",
+			header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+			contentLength: maxDNSMessageBytes + 1,
+		},
+		{
+			name:          "declared undersized body",
+			header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+			contentLength: minDNSMessageBytes - 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &closeCountingBody{reader: bytes.NewReader(make([]byte, minDNSMessageBytes))}
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        tc.header,
+					ContentLength: tc.contentLength,
+					Body:          body,
+					Request:       req,
+				}, nil
+			})}
+			g := regGateway(t, "http://127.0.0.1:9/dns-query", client)
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, postReq(bytes.NewReader(make([]byte, minDNSMessageBytes))))
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", rec.Code)
+			}
+			if body.readCount != 0 {
+				t.Fatalf("gateway read an invalid response body %d times, want no reads", body.readCount)
+			}
+			if body.closed != 1 {
+				t.Fatalf("backend body closed %d times, want exactly once", body.closed)
+			}
+			if got := g.metrics.backendErrorTotal.Load(); got != 1 {
+				t.Fatalf("backendErrorTotal = %d, want 1", got)
+			}
+			if got := g.metrics.backendLatencySamples.Load(); got != 0 {
+				t.Fatalf("backendLatencySamples = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -536,10 +614,11 @@ func (tr *getBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	_, _ = io.Copy(io.Discard, req.Body)
 	_ = req.Body.Close()
 	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/dns-message"}},
-		Body:       io.NopCloser(bytes.NewReader(make([]byte, 32))),
-		Request:    req,
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+		ContentLength: 32,
+		Body:          io.NopCloser(bytes.NewReader(make([]byte, 32))),
+		Request:       req,
 	}, nil
 }
 
@@ -577,10 +656,11 @@ type cancelAtEOFTransport struct {
 
 func (tr cancelAtEOFTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/dns-message"}},
-		Body:       &cancelAtEOFBody{data: probeResponse(tr.t, req, 0), cancel: tr.cancel},
-		Request:    req,
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+		ContentLength: -1, // The body is streamed and its size is not declared.
+		Body:          &cancelAtEOFBody{data: probeResponse(tr.t, req, 0), cancel: tr.cancel},
+		Request:       req,
 	}, nil
 }
 
@@ -590,10 +670,11 @@ func TestDNSAnswerCanceledAtSuccessfulBodyEndIsNotCounted(t *testing.T) {
 	g := regGateway(t, "http://127.0.0.1:9/dns-query", &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"application/dns-message"}},
-				Body:       &cancelAtEOFBody{data: make([]byte, minDNSMessageBytes), cancel: cancel},
-				Request:    req,
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+				ContentLength: -1, // The test body is streaming and has no declared size.
+				Body:          &cancelAtEOFBody{data: make([]byte, minDNSMessageBytes), cancel: cancel},
+				Request:       req,
 			}, nil
 		}),
 	})

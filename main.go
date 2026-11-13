@@ -70,6 +70,7 @@ const (
 // used to clamp Retry-After on platforms where int is 32 bits (linux/arm/v7)
 // when a valid, very long RATE_WINDOW exceeds the largest representable int.
 var maxIntValue = int64(int(^uint(0) >> 1))
+var readinessProbeLabels = strings.Split(readinessProbeName, ".")
 
 var version = "dev"
 var dnsMessageBufferPool = sync.Pool{
@@ -474,7 +475,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var dnsParam string
 	if r.Method == http.MethodPost {
-		if !isStrictDoHContentType(r.Header.Get("Content-Type")) {
+		if !isStrictDoHContentType(r.Header) {
 			w.WriteHeader(http.StatusUnsupportedMediaType)
 			return
 		}
@@ -547,6 +548,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		case g.processingSlots <- struct{}{}:
 			queueTimer.Stop()
 		case <-queueTimer.C:
+			// The timer and request cancellation may become ready together.
+			// Prefer cancellation so a disconnected client is not counted as a
+			// queue timeout and does not receive a response it cannot read.
+			if r.Context().Err() != nil {
+				return
+			}
 			g.metrics.queueTimeoutTotal.Add(1)
 			w.Header().Set("Retry-After", "1")
 			writeText(w, http.StatusServiceUnavailable, "server busy\n")
@@ -665,7 +672,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if resp.ContentLength > maxDNSMessageBytes {
+	// Reject a malformed DoH representation from its headers alone. In
+	// particular, do not let a 200 response with a wrong or ambiguous
+	// Content-Type hold a processing slot while its body stalls.
+	if !isStrictDoHContentType(resp.Header) ||
+		resp.ContentLength > maxDNSMessageBytes ||
+		(resp.ContentLength >= 0 && resp.ContentLength < minDNSMessageBytes) {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -686,8 +698,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	backendElapsed := time.Since(backendStart)
 	// The status is now known to be 200. A DoH answer must also contain a
 	// plausible DNS message (12-4096 bytes) and the strict DoH content type.
-	if len(respBody) > maxDNSMessageBytes || len(respBody) < minDNSMessageBytes ||
-		!isStrictDoHContentType(resp.Header.Get("Content-Type")) {
+	if len(respBody) > maxDNSMessageBytes || len(respBody) < minDNSMessageBytes {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -787,8 +798,11 @@ func isValidDoHGetParameter(value string) bool {
 	return true
 }
 
-func isStrictDoHContentType(value string) bool {
-	return strings.EqualFold(strings.TrimSpace(value), "application/dns-message")
+func isStrictDoHContentType(header http.Header) bool {
+	values := header.Values("Content-Type")
+	// HTTP optional whitespace is limited to SP and HTAB. strings.TrimSpace
+	// would also accept Unicode whitespace that is not valid OWS in a field.
+	return len(values) == 1 && strings.EqualFold(strings.Trim(values[0], " \t"), "application/dns-message")
 }
 
 // backendReady performs a readiness check. The owner in ready records the
@@ -809,10 +823,11 @@ func (g *gateway) backendReady(parent context.Context) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !isStrictDoHContentType(resp.Header.Get("Content-Type")) {
+	if resp.StatusCode != http.StatusOK || !isStrictDoHContentType(resp.Header) {
 		return false
 	}
-	if resp.ContentLength > maxDNSMessageBytes {
+	if resp.ContentLength > maxDNSMessageBytes ||
+		(resp.ContentLength >= 0 && resp.ContentLength < minDNSMessageBytes) {
 		return false
 	}
 	pooled := dnsMessageBufferPool.Get().(*[]byte)
@@ -871,9 +886,14 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 		return false
 	}
 
-	answerName, rrStart, ok := decodeDNSName(msg, questionEnd)
-	if !ok || !strings.EqualFold(answerName, readinessProbeName) || rrStart+10 > len(msg) {
+	answerLabels, rrStart, ok := decodeDNSName(msg, questionEnd)
+	if !ok || len(answerLabels) != len(readinessProbeLabels) || rrStart+10 > len(msg) {
 		return false
+	}
+	for i, want := range readinessProbeLabels {
+		if !strings.EqualFold(answerLabels[i], want) {
+			return false
+		}
 	}
 	if binary.BigEndian.Uint16(msg[rrStart:rrStart+2]) != 1 || // A
 		binary.BigEndian.Uint16(msg[rrStart+2:rrStart+4]) != 1 { // IN
@@ -891,9 +911,9 @@ func isUsableDNSProbeResponse(msg []byte, wantID uint16, question []byte) bool {
 // compression pointers and returning the offset immediately after the encoded
 // name at its original location. The response is bounded to 4 KiB, and the
 // step limit prevents malformed pointer chains from looping forever.
-func decodeDNSName(msg []byte, offset int) (string, int, bool) {
+func decodeDNSName(msg []byte, offset int) ([]string, int, bool) {
 	if offset < 0 || offset >= len(msg) {
-		return "", 0, false
+		return nil, 0, false
 	}
 	labels := make([]string, 0, 4)
 	cursor := offset
@@ -901,7 +921,7 @@ func decodeDNSName(msg []byte, offset int) (string, int, bool) {
 	jumped := false
 	for steps := 0; steps < len(msg); steps++ {
 		if cursor >= len(msg) {
-			return "", 0, false
+			return nil, 0, false
 		}
 		length := int(msg[cursor])
 		switch length & 0xc0 {
@@ -911,10 +931,10 @@ func decodeDNSName(msg []byte, offset int) (string, int, bool) {
 				if !jumped {
 					end = cursor
 				}
-				return strings.Join(labels, "."), end, true
+				return labels, end, true
 			}
 			if cursor+length > len(msg) {
-				return "", 0, false
+				return nil, 0, false
 			}
 			labels = append(labels, string(msg[cursor:cursor+length]))
 			cursor += length
@@ -923,11 +943,11 @@ func decodeDNSName(msg []byte, offset int) (string, int, bool) {
 			}
 		case 0xc0:
 			if cursor+1 >= len(msg) {
-				return "", 0, false
+				return nil, 0, false
 			}
 			pointer := ((length & 0x3f) << 8) | int(msg[cursor+1])
 			if pointer >= cursor || pointer >= len(msg) {
-				return "", 0, false
+				return nil, 0, false
 			}
 			if !jumped {
 				end = cursor + 2
@@ -935,10 +955,10 @@ func decodeDNSName(msg []byte, offset int) (string, int, bool) {
 			}
 			cursor = pointer
 		default:
-			return "", 0, false
+			return nil, 0, false
 		}
 	}
-	return "", 0, false
+	return nil, 0, false
 }
 
 const metricsResponsesTemplate = `# HELP doh_gateway_responses_total Responses grouped by status class.

@@ -32,27 +32,31 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
   DoH upstreams, falling back to a third HaGeZi endpoint if no answer arrives
   within 400 ms.
 
-`entrypoint.sh` starts both processes and then polls them once per second. A
-child counts as gone when it has exited, was killed by a signal (OOM kill,
-SIGSEGV, SIGKILL) or is a zombie (state read from `/proc`; without `/proc` it
-falls back to `kill -0`). If either is gone, it stops the other and exits with
-status 1. The loop does not use `wait -n`: BusyBox ash does not return from it
-when a child is killed by a signal, so the container would keep running with
-only one process. On `TERM`, `INT` or `HUP` it stops the gateway first (`TERM`,
-then `KILL` if it is still alive after a 6 s grace period) so the gateway can
-drain while MosDNS is still available, then stops MosDNS the same way (3 s
-grace). Together that is 9 s, inside Docker's default 10 s stop timeout. Further
-`TERM`, `INT` or `HUP` signals are ignored during teardown so they cannot
-interrupt child cleanup; a signal during crash teardown also leaves the exit
-status at 1. The supervision loop checks for a child exit once per second;
-during shutdown, each child is polled every 0.2 s so
-an already-stopped child does not consume its full grace period (BusyBox `sleep`
-supports fractional seconds). Teardown also cancels the one-second supervision
-sleep. If the entrypoint exits, PID 1 (tini) exits with it and the container's
-remaining processes are killed. Supervision is process-level only: it detects
-an *exit*, not a wedge. If MosDNS hangs without exiting, point the platform
-health check at the gateway's
-`/readyz` (HTTP, not just TCP). The entrypoint honours these optional
+`entrypoint.sh` starts both processes and then polls them once per second.
+When it can read `/proc/<pid>/stat`, it requires recorded PIDs to remain live
+direct children and checks process state, including zombies; if `/proc` is
+unavailable or unreadable, it falls back to `kill -0`. If either child is gone,
+the entrypoint stops the other and exits with status 1. The loop does not use
+`wait -n`: BusyBox ash does not return from it when a child is killed by a
+signal, so the container would keep running with only one process. On `TERM`,
+`INT` or `HUP` it stops the gateway first (`TERM`, then `KILL` if it is still
+alive after a 6 s grace period) so the gateway can drain while MosDNS is still
+available, then stops MosDNS the same way (3 s grace). Together that is 9 s,
+inside Docker's default 10 s stop timeout. Further `TERM`, `INT` or `HUP`
+signals are ignored during teardown so they cannot interrupt child cleanup; a
+signal during crash teardown also leaves the exit status at 1. The supervision
+loop checks for a child exit once per second; during shutdown, each child is
+polled every 0.2 s so an already-stopped child does not consume its full grace
+period (BusyBox `sleep` supports fractional seconds). Teardown cancels the
+one-second supervision sleep and signals MosDNS, the gateway, or the sleep
+process only while its recorded PID is still a live direct child when
+`/proc/<pid>/stat` is readable. This prevents a reaped PID reused by an
+unrelated process from being signalled; if `/proc` is unavailable or
+unreadable, ownership checking falls back to `kill -0`. If the entrypoint
+exits, PID 1 (tini) exits with it and the container's remaining processes are
+killed. Supervision is process-level only: it detects an *exit*, not a wedge.
+If MosDNS hangs without exiting, point the platform health check at the
+gateway's `/readyz` (HTTP, not just TCP). The entrypoint honours these optional
 variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 (default `/etc/mosdns`), and `MOSDNS_BIN` / `GATEWAY_BIN` (default
 `/usr/local/bin/mosdns` and `/usr/local/bin/doh-gateway`; they exist so
@@ -62,9 +66,9 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 
 | Path | Behavior |
 |---|---|
-| `GET/POST /dns-query` | DoH. POST requires `Content-Type: application/dns-message` (case-insensitive, no parameters); GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes. A DNS answer must be `200 OK` with an `application/dns-message` body of 12-4096 bytes; statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
+| `GET/POST /dns-query` | DoH. POST requires exactly one `Content-Type: application/dns-message` header (case-insensitive, optional surrounding SP/HTAB only, no parameters); duplicate or conflicting values are rejected. GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes. A successful backend answer must be `200 OK` with exactly one `Content-Type: application/dns-message` header and a 12-4096-byte body; invalid media-type headers and declared out-of-range body lengths are rejected before reading the body. The readiness probe applies the same declared 12-4096-byte length bounds before reading. Statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
-| `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with `Content-Type: application/dns-message`, then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, exactly one answer, zero authority/additional records, the echoed question, and a complete `A 127.0.0.1` answer for the probe name with no trailing bytes). An NXDOMAIN, truncated response, absent/extra/malformed answer record, unexpected DNS section, trailing data, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
+| `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with exactly one `Content-Type: application/dns-message` header (optional surrounding SP/HTAB only), then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, exactly one answer, zero authority/additional records, the echoed question, and a complete `A 127.0.0.1` answer whose owner name matches the probe's individual DNS labels (not merely a dot-joined string), with no trailing bytes). An NXDOMAIN, truncated response, absent/extra/malformed answer record, unexpected DNS section, trailing data, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
 | `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns backend statuses other than `200` and `400`-`599` into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a `200` `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Concurrent `/readyz` callers share one in-flight probe even when the result cache is disabled. Block or restrict `/metrics` at the platform edge if you do not want it public.
@@ -78,7 +82,7 @@ Anything else returns `404`; a wrong method returns `405` with an `Allow` header
 | `400` | Malformed or missing `dns` parameter, unreadable body, or message shorter than 12 bytes. A body that fails to read because the client already disconnected gets no response and is not counted. |
 | `405` | Method other than GET/POST (`Allow: GET, POST`). |
 | `413` | POST body larger than 4096 bytes. |
-| `415` | POST without exactly `application/dns-message`. |
+| `415` | POST without exactly one `Content-Type: application/dns-message` value (parameters and duplicate headers are rejected). |
 | `429` | Per-client rate limit exceeded (`Retry-After` = seconds to the end of the window). |
 | `502` | Backend unreachable, truncated/oversize/non-DoH response, a status other than `200` or `400`-`599`, or a body shorter than the 12-byte DNS header. |
 | `503` | Active-request ceiling reached, or no processing slot within `QUEUE_WAIT` (both with `Retry-After: 1`). |
@@ -172,8 +176,11 @@ from the others, which would reduce the race to `root.hagezi.org` for those
 answers. The server timeout is 2 s (mirrored by `mosdnsServerTimeout` in
 `main.go`). `enable_pipeline` has no effect on DoH upstreams in MosDNS v4.5.3
 (it only applies to TCP/DoT) and `max_conns` already defaults to 2 for DoH, so
-the file sets neither. `check-config.sh` validates optional upstream keys such
-as `idle_timeout` and optional fallback fields `stat_length`, `threshold`, and
+the file sets neither. `check-config.sh` rejects `enable_pipeline` unless the
+upstream uses TCP/DoT and rejects `idle_timeout` for UDP, where MosDNS ignores
+it. Supported URL schemes are `udp://`, `tcp://`, `tls://` and `https://` (the
+last two are DoT and DoH); other schemes fail validation before startup. The
+validator also checks optional fallback fields `stat_length`, `threshold`, and
 `always_standby` when present.
 
 Why the EDNS filter and `cache_everything`: MosDNS v4.5.3 only caches "simple"
@@ -188,9 +195,12 @@ cache in under 1 ms (measured end to end through the gateway).
 `check-config.sh` (requires Python 3.8+ with PyYAML; run via
 `make check-config`) validates it:
 
-- YAML structure, plugin tags/types, and upstream URL authorities and ports;
-  duplicate explicit YAML mapping keys and malformed fallback tags are rejected,
-  every plugin definition must be referenced by the configured server sequence,
+- YAML structure, plugin tags/types, and supported upstream URL schemes,
+  authorities and ports (`udp`, `tcp`, `tls`, `https`); unsupported protocols
+  and transport-inapplicable `enable_pipeline`/`idle_timeout` settings are
+  rejected rather than silently ignored by MosDNS. Duplicate explicit YAML
+  mapping keys and malformed fallback tags are rejected; every plugin
+  definition must be referenced by the configured server sequence,
   and repeated local-answer, EDNS-filter, or fallback references are rejected;
   listener addresses, upstream URLs and the Dockerfile backend URL containing
   raw whitespace or any Unicode control characters are rejected instead of
@@ -259,12 +269,16 @@ names must be lowercase). Override it with `make docker-build IMAGE=your-name:ta
 
 `test-entrypoint.sh` runs the real `entrypoint.sh` against fake MosDNS and
 gateway processes (its cleanup signals only fakes still started by that run) and checks, for each scenario, both the exit code and that
-neither fake child is still running afterwards: TERM shutdown exits 0; a
+neither fake child is still running afterwards. Its exit wait treats zombies as
+exited before reaping them, and missing-binary scenarios verify the shell's
+missing-executable diagnostic as well as the absence of any surviving child.
+Scenarios include: TERM shutdown exits 0; a
 SIGKILLed MosDNS or gateway and a child that exits on its own are detected
 (exit 1, the other child stopped); a child that ignores TERM is KILLed after its
 grace period; MosDNS exiting while the gateway ignores TERM still ends in
-KILL and exit 1; and a TERM that arrives during that crash teardown keeps exit
-1. The seven scenarios take roughly 25 s. It runs under `sh`;
+KILL and exit 1; a TERM that arrives during that crash teardown keeps exit 1;
+and a missing MosDNS or gateway binary is detected without leaving the other
+child running. The nine scenarios take roughly 30 s. It runs under `sh`;
 set `TEST_SHELL` (for example `TEST_SHELL="busybox sh"`) to run it under another
 shell.
 

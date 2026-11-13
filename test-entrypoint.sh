@@ -56,13 +56,61 @@ run_entry() { # $1 = mosdns mode, $2 = gateway mode
   while [ ! -s "$TMP/mosdns.pid" ] || [ ! -s "$TMP/gateway.pid" ]; do
     i=$((i + 1)); [ "$i" -gt 50 ] && break; sleep 0.1
   done
+  if [ ! -s "$TMP/mosdns.pid" ] || [ ! -s "$TMP/gateway.pid" ]; then
+    echo "FAIL entrypoint did not start both children" >&2
+    cat "$TMP/out" >&2
+    fail=1
+  fi
+}
+
+run_entry_with_missing_child() { # $1 = mosdns or gateway
+  missing=$1
+  rm -f "$TMP"/*.pid
+  echo run > "$TMP/mosdns.mode"
+  echo run > "$TMP/gateway.mode"
+  mosdns_path="$TMP/mosdns"
+  gateway_path="$TMP/gateway"
+  if [ "$missing" = mosdns ]; then
+    mosdns_path="$TMP/missing-mosdns"
+    live_child=gateway
+  else
+    gateway_path="$TMP/missing-gateway"
+    live_child=mosdns
+  fi
+  FAKE_DIR="$TMP" MOSDNS_BIN="$mosdns_path" GATEWAY_BIN="$gateway_path" \
+    MOSDNS_DIR="$TMP/dir" MOSDNS_CONFIG="$TMP/cfg" \
+    $SHELL_UNDER_TEST "$DIR/entrypoint.sh" >"$TMP/out" 2>&1 &
+  ENTRY=$!
+  i=0
+  # The missing executable may fail before the other background child is
+  # scheduled. Wait briefly for its PID if it does start; children_gone below
+  # verifies that any recorded child was stopped and reaped.
+  while [ ! -s "$TMP/$live_child.pid" ]; do
+    i=$((i + 1)); [ "$i" -gt 50 ] && break; sleep 0.1
+  done
+}
+
+entry_alive() {
+  kill -0 "$ENTRY" 2>/dev/null || return 1
+  [ -r "/proc/$ENTRY/stat" ] || return 0
+  read -r entry_stat < "/proc/$ENTRY/stat" 2>/dev/null || return 0
+  entry_stat=${entry_stat##*) }
+  case "$entry_stat" in
+    Z*|X*) return 1 ;;
+  esac
+  return 0
 }
 
 wait_exit() { # $1 = max seconds; sets RC, or RC=timeout
   i=0
-  while kill -0 "$ENTRY" 2>/dev/null; do
+  while entry_alive; do
     i=$((i + 1))
-    if [ "$i" -gt $(($1 * 10)) ]; then RC=timeout; kill -KILL "$ENTRY" 2>/dev/null; return; fi
+    if [ "$i" -gt $(($1 * 10)) ]; then
+      RC=timeout
+      kill -KILL "$ENTRY" 2>/dev/null || true
+      wait "$ENTRY" 2>/dev/null || true
+      return
+    fi
     sleep 0.1
   done
   wait "$ENTRY"; RC=$?
@@ -92,6 +140,17 @@ children_gone() {
 
 check_gone() { # $1 = name
   if children_gone; then echo "ok   $1: no child left running"; else echo "FAIL $1: a child is still running"; fail=1; fi
+}
+
+check_missing_binary() { # $1 = mosdns or gateway
+  missing_path="$TMP/missing-$1"
+  if grep -F "$missing_path" "$TMP/out" >/dev/null 2>&1; then
+    echo "ok   missing $1 executable reported"
+  else
+    echo "FAIL missing $1 executable diagnostic absent"
+    cat "$TMP/out" >&2
+    fail=1
+  fi
 }
 
 # 1. TERM stops both children and exits 0.
@@ -141,5 +200,18 @@ sleep 2
 kill -TERM "$ENTRY" 2>/dev/null; wait_exit 15
 check "TERM during crash teardown keeps exit 1" 1
 check_gone "TERM during crash teardown keeps exit 1"
+
+# 8-9. A missing child binary must be detected, and the other child stopped.
+run_entry_with_missing_child mosdns
+wait_exit 10
+check "missing MosDNS binary detected" 1
+check_missing_binary mosdns
+check_gone "missing MosDNS binary detected"
+
+run_entry_with_missing_child gateway
+wait_exit 10
+check "missing gateway binary detected" 1
+check_missing_binary gateway
+check_gone "missing gateway binary detected"
 
 exit "$fail"

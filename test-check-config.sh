@@ -122,6 +122,33 @@ write_case("upstream-empty-fragment", set_primary_upstream_url("https://root.hag
 write_case("upstream-empty-port", set_primary_upstream_url("https://root.hagezi.org:/dns-query"))
 write_case("upstream-invalid-port", set_primary_upstream_url("https://root.hagezi.org:not-a-port/dns-query"))
 write_case("upstream-out-of-range-port", set_primary_upstream_url("https://root.hagezi.org:65536/dns-query"))
+write_case("upstream-unsupported-ftp", set_primary_upstream_url("ftp://root.hagezi.org/dns-query"))
+write_case("upstream-unsupported-http", set_primary_upstream_url("http://root.hagezi.org/dns-query"))
+write_case("valid-uppercase-upstream-scheme", set_primary_upstream_url("HTTPS://root.hagezi.org/dns-query"))
+
+def set_primary_upstream_options(config, addr=None, **options):
+    upstream = next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"][0]
+    if addr is not None:
+        upstream["addr"] = addr
+    upstream.update(options)
+
+def set_udp_pipeline(config, cache, sequence, fallback):
+    set_primary_upstream_options(config, "udp://root.hagezi.org", enable_pipeline=True)
+    # UDP ignores idle_timeout too; keep this test focused on enable_pipeline.
+    next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"][0].pop("idle_timeout", None)
+
+write_case("upstream-udp-pipeline", set_udp_pipeline)
+write_case("upstream-https-pipeline", lambda c, cache, seq, fb: set_primary_upstream_options(c, enable_pipeline=True))
+write_case("upstream-udp-idle-timeout", lambda c, cache, seq, fb: set_primary_upstream_options(c, "udp://root.hagezi.org"))
+
+def set_udp_without_connection_options(config, cache, sequence, fallback):
+    set_primary_upstream_options(config, "udp://root.hagezi.org")
+    upstream = next(plugin for plugin in config["plugins"] if plugin["tag"] == "primary_fast")["args"]["upstream"][0]
+    upstream.pop("idle_timeout", None)
+
+write_case("valid-udp-upstream", set_udp_without_connection_options)
+write_case("valid-tcp-pipeline", lambda c, cache, seq, fb: set_primary_upstream_options(c, "tcp://root.hagezi.org:53", enable_pipeline=True))
+write_case("valid-tls-pipeline", lambda c, cache, seq, fb: set_primary_upstream_options(c, "tls://root.hagezi.org:853", enable_pipeline=True))
 
 def set_api_non_loopback(config, cache, sequence, fallback):
     config["api"] = {"http": "0.0.0.0:9091"}
@@ -162,6 +189,10 @@ expect_ok valid-disabled-normal-fallback
 expect_ok valid-no-edns-filter
 expect_ok valid-threshold-clamped-by-mosdns
 expect_ok valid-api-without-http
+expect_ok valid-uppercase-upstream-scheme
+expect_ok valid-udp-upstream
+expect_ok valid-tcp-pipeline
+expect_ok valid-tls-pipeline
 expect_fail listener-userinfo "must be a host:port address without user-info"
 expect_fail listener-whitespace "must not contain whitespace or control characters"
 expect_fail upstream-whitespace "must not contain whitespace or control characters"
@@ -173,6 +204,11 @@ expect_fail upstream-empty-fragment "must not contain fragments"
 expect_fail upstream-empty-port "must not use an empty port"
 expect_fail upstream-invalid-port "must contain a valid port"
 expect_fail upstream-out-of-range-port "must contain a valid port"
+expect_fail upstream-unsupported-ftp "uses unsupported upstream URL scheme 'ftp'"
+expect_fail upstream-unsupported-http "uses unsupported upstream URL scheme 'http'"
+expect_fail upstream-udp-pipeline "enable_pipeline is only supported for tcp:// and tls://"
+expect_fail upstream-https-pipeline "enable_pipeline is only supported for tcp:// and tls://"
+expect_fail upstream-udp-idle-timeout "idle_timeout is not supported for udp://"
 expect_fail api-non-loopback "api.http must bind to loopback, not 0.0.0.0"
 expect_fail unknown-fallback-key "fallback contains unsupported key"
 expect_fail negative-stat-length "stat_length must not be negative"

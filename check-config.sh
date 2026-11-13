@@ -105,7 +105,7 @@ def check_loopback(value: str, path: str) -> None:
         fail(f"{path} must bind to loopback explicitly (an empty host listens on every interface)")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         fail(f"{path} must bind to loopback, not {host}")
-def check_upstream_addr(value, path: str) -> None:
+def check_upstream_addr(value, path: str) -> str:
     value = no_raw_whitespace_or_control(non_empty_string(value, path), path)
     try:
         parsed = urlsplit(value)
@@ -116,6 +116,9 @@ def check_upstream_addr(value, path: str) -> None:
         fail(f"{path} must be a valid upstream URL")
     if not parsed.scheme or not parsed.netloc or not hostname:
         fail(f"{path} must be a valid upstream URL")
+    scheme = parsed.scheme.lower()
+    if scheme not in {"udp", "tcp", "tls", "https"}:
+        fail(f"{path} uses unsupported upstream URL scheme {parsed.scheme!r}; use udp, tcp, tls, or https")
     if parsed.username is not None or parsed.password is not None:
         fail(f"{path} must not contain user-info")
     if parsed.fragment or "#" in value:
@@ -128,6 +131,7 @@ def check_upstream_addr(value, path: str) -> None:
         fail(f"{path} must contain a valid port")
     if port is not None and not 1 <= port <= 65535:
         fail(f"{path} must contain a valid port from 1 to 65535")
+    return scheme
 class UniqueKeySafeLoader(yaml.SafeLoader):
     """SafeLoader variant that rejects duplicate explicit mapping keys."""
 
@@ -305,16 +309,23 @@ for side in ("primary", "secondary"):
         for index, upstream in enumerate(upstreams, start=1):
             p = f"plugins[{tag}].args.upstream[{index}]"
             upstream = expect_mapping(upstream, p)
-            check_upstream_addr(upstream.get("addr"), f"{p}.addr")
+            scheme = check_upstream_addr(upstream.get("addr"), f"{p}.addr")
             if "dial_addr" in upstream:
                 check_ip(upstream.get("dial_addr"), f"{p}.dial_addr")
-            # Optional keys are validated only when present. MosDNS v4.5.3
-            # only applies pipeline to TCP/DoT upstreams (a dead key for DoH),
-            # and max_conns defaults to 2 for DoH.
+            # MosDNS v4.5.3 silently ignores options that do not apply to the
+            # selected transport. Reject those combinations instead of letting
+            # an apparently active setting have no effect.
             if "enable_pipeline" in upstream:
                 exact_bool(upstream.get("enable_pipeline"), f"{p}.enable_pipeline")
-            if "idle_timeout" in upstream and exact_int(upstream.get("idle_timeout"), f"{p}.idle_timeout") <= 0:
-                fail(f"{p}.idle_timeout must be greater than 0")
+                if scheme not in {"tcp", "tls"}:
+                    fail(f"{p}.enable_pipeline is only supported for tcp:// and tls:// upstreams")
+            if "idle_timeout" in upstream:
+                if exact_int(upstream.get("idle_timeout"), f"{p}.idle_timeout") <= 0:
+                    fail(f"{p}.idle_timeout must be greater than 0")
+                if scheme == "udp":
+                    fail(f"{p}.idle_timeout is not supported for udp:// upstreams")
+            # max_conns defaults to 2 for DoH; an explicit positive value is
+            # also supported by the UDP/TCP/DoT/DoH upstream implementations.
             if "max_conns" in upstream and exact_int(upstream.get("max_conns"), f"{p}.max_conns") <= 0:
                 fail(f"{p}.max_conns must be greater than 0")
             trusted = exact_bool(upstream["trusted"], f"{p}.trusted") if "trusted" in upstream else False

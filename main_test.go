@@ -141,6 +141,14 @@ func TestDoHContentTypeAndSize(t *testing.T) {
 	if w.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("parameterized content type: got %d, want %d", w.Code, http.StatusUnsupportedMediaType)
 	}
+	duplicateType := httptest.NewRequest(http.MethodPost, "/dns-query", strings.NewReader(testDNSBody))
+	duplicateType.Header.Add("Content-Type", "application/dns-message")
+	duplicateType.Header.Add("Content-Type", "text/plain")
+	w = httptest.NewRecorder()
+	g.ServeHTTP(w, duplicateType)
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("duplicate content types: got %d, want %d", w.Code, http.StatusUnsupportedMediaType)
+	}
 	tooLarge := postReq(strings.NewReader(strings.Repeat("a", maxDNSMessageBytes+1)))
 	tooLarge.ContentLength = maxDNSMessageBytes + 1
 	w = httptest.NewRecorder()
@@ -149,6 +157,45 @@ func TestDoHContentTypeAndSize(t *testing.T) {
 		t.Fatalf("oversize body: got %d", w.Code)
 	}
 }
+func TestStrictDoHContentTypeUsesHTTPOptionalWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "application/dns-message", want: true},
+		{value: " \tapplication/dns-message\t ", want: true},
+		{value: "\u00a0application/dns-message", want: false},
+		{value: "application/dns-message\u00a0", want: false},
+	} {
+		header := make(http.Header)
+		header.Set("Content-Type", tc.value)
+		if got := isStrictDoHContentType(header); got != tc.want {
+			t.Errorf("Content-Type %q accepted=%t, want %t", tc.value, got, tc.want)
+		}
+	}
+	header := make(http.Header)
+	header.Add("Content-Type", "application/dns-message")
+	header.Add("Content-Type", "application/dns-message")
+	if isStrictDoHContentType(header) {
+		t.Fatal("duplicate identical Content-Type values were accepted")
+	}
+}
+
+func TestBackendDuplicateDoHContentTypeRejected(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Content-Type", "application/dns-message")
+		w.Header().Add("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(testDNSBody))
+	}))
+	defer backend.Close()
+	g := testGateway(t, backend.URL, 100, 10)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, postReq(strings.NewReader(testDNSBody)))
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("duplicate backend content types: got %d, want %d", w.Code, http.StatusBadGateway)
+	}
+}
+
 func TestDoHGETParameterValidation(t *testing.T) {
 	valid := base64.RawURLEncoding.EncodeToString([]byte(testDNSBody))
 	if !isValidDoHGetParameter(valid) {
@@ -490,6 +537,21 @@ func TestReadyEndpointTracksBackend(t *testing.T) {
 		t.Fatalf("dead backend: got %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 }
+func TestReadyEndpointRejectsDuplicateContentType(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Content-Type", "application/dns-message")
+		w.Header().Add("Content-Type", "text/plain")
+		_, _ = w.Write(probeResponse(t, r, 0))
+	}))
+	defer backend.Close()
+	g := testGateway(t, backend.URL, 100, 10)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("duplicate readiness content types: got %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
 	g.metrics.requestsTotal.Add(7)
@@ -934,6 +996,29 @@ func TestClientDisconnectIsNotABackendError(t *testing.T) {
 		t.Fatalf("client disconnect counted as %d backend errors, want 0", got)
 	}
 }
+func TestQueueCancellationWinsWhenTimerAlsoReady(t *testing.T) {
+	g := testGateway(t, "http://127.0.0.1:1", 100, 1)
+	g.processingSlots <- struct{}{} // Keep every processing slot occupied.
+	g.queueWait = 0                 // Make the queue timer ready immediately.
+
+	for i := 0; i < 64; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Both the request context and zero-duration timer are ready.
+		req := postReq(strings.NewReader(testDNSBody)).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, req)
+		if rec.Body.Len() != 0 {
+			t.Fatalf("attempt %d wrote a response after cancellation: body=%q", i, rec.Body.String())
+		}
+	}
+	if got := g.metrics.queueTimeoutTotal.Load(); got != 0 {
+		t.Fatalf("queue timeouts = %d, want 0 for canceled requests", got)
+	}
+	if got := g.metrics.responses5xxTotal.Load(); got != 0 {
+		t.Fatalf("canceled queue requests wrote %d 5xx responses, want 0", got)
+	}
+}
+
 func TestQueueTimeoutReturns503(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -1256,6 +1341,24 @@ func TestReadyEndpointRejectsUnusableAnswers(t *testing.T) {
 		}},
 		{"trailing bytes after answer", func(t *testing.T, r *http.Request) []byte {
 			return append(probeResponse(t, r, 0), 0)
+		}},
+		{"single label containing dotted probe text", func(t *testing.T, r *http.Request) []byte {
+			resp := probeResponse(t, r, 0)
+			query, err := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			answerStart := 12 + len(query[12:])
+			name := []byte(readinessProbeName)
+			// The owner name is one valid DNS label whose bytes happen to
+			// contain dots; it is not the three-label readiness name.
+			bad := make([]byte, 0, len(resp)+len(name))
+			bad = append(bad, resp[:answerStart]...)
+			bad = append(bad, byte(len(name)))
+			bad = append(bad, name...)
+			bad = append(bad, 0)
+			bad = append(bad, resp[answerStart+2:]...)
+			return bad
 		}},
 		{"wrong local A answer", func(t *testing.T, r *http.Request) []byte {
 			resp := probeResponse(t, r, 0)
