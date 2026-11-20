@@ -773,6 +773,55 @@ func startRegServer(t *testing.T, g *gateway) net.Listener {
 	})
 }
 
+// A recorder can verify the Connection header but cannot prove that net/http
+// skips its post-handler request-body drain. Exercise a real HTTP/1 socket
+// with an incomplete, small upload: the 415 must be returned promptly and the
+// server must close the connection instead of waiting for the missing bytes.
+func TestHTTP1UnreadRequestBodyClosesConnectionWithoutDraining(t *testing.T) {
+	g := regGateway(t, "http://127.0.0.1:9/dns-query", nil)
+	ln := startRegServer(t, g)
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	// The declared body is intentionally not sent. Content-Length is below
+	// net/http's small-body drain threshold, so without Connection: close the
+	// server could wait for the remaining bytes before reusing the connection.
+	_, err = fmt.Fprintf(conn,
+		"POST /dns-query HTTP/1.1\r\nHost: %s\r\nContent-Type: text/plain\r\nContent-Length: 1024\r\n\r\n",
+		ln.Addr().String(),
+	)
+	if err != nil {
+		t.Fatalf("write request headers: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response before unread body arrived: %v", err)
+	}
+	_, bodyErr := io.Copy(io.Discard, resp.Body)
+	closeErr := resp.Body.Close()
+	if bodyErr != nil {
+		t.Fatalf("read response body: %v", bodyErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close response body: %v", closeErr)
+	}
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnsupportedMediaType)
+	}
+	if !resp.Close {
+		t.Fatalf("response did not mark the HTTP/1 connection for closure: Close=%t headers=%v", resp.Close, resp.Header)
+	}
+	var one [1]byte
+	if n, err := conn.Read(one[:]); n != 0 || err != io.EOF {
+		t.Fatalf("connection after response = (%d, %v), want (0, EOF)", n, err)
+	}
+}
+
 // serveOnLoopback serves server on an ephemeral loopback port until the test ends.
 func serveOnLoopback(t *testing.T, server *http.Server) net.Listener {
 	t.Helper()

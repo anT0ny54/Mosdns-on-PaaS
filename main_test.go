@@ -40,6 +40,105 @@ func postReq(body io.Reader) *http.Request {
 	return r
 }
 
+func TestUnconsumedRequestBodiesCloseConnection(t *testing.T) {
+	tests := []struct {
+		name          string
+		method        string
+		path          string
+		body          string
+		contentType   string
+		contentLength int64
+		wantStatus    int
+		setup         func(*gateway, *http.Request)
+	}{
+		{
+			name: "wrong DoH method", method: http.MethodPut, path: "/dns-query",
+			body: testDNSBody, wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name: "rate limited", method: http.MethodPost, path: "/dns-query",
+			body: testDNSBody, contentType: "application/dns-message", wantStatus: http.StatusTooManyRequests,
+			setup: func(g *gateway, r *http.Request) {
+				r.RemoteAddr = "192.0.2.1:1234"
+				g.limiter.admit(testAddr("192.0.2.1"))
+			},
+		},
+		{
+			name: "active request limit", method: http.MethodPost, path: "/dns-query",
+			body: testDNSBody, contentType: "application/dns-message", wantStatus: http.StatusServiceUnavailable,
+			setup: func(g *gateway, _ *http.Request) { g.activeSlots <- struct{}{} },
+		},
+		{
+			name: "unsupported content type", method: http.MethodPost, path: "/dns-query",
+			body: testDNSBody, contentType: "text/plain", wantStatus: http.StatusUnsupportedMediaType,
+		},
+		{
+			name: "declared oversized body", method: http.MethodPost, path: "/dns-query",
+			body: strings.Repeat("x", maxDNSMessageBytes+1), contentType: "application/dns-message",
+			contentLength: maxDNSMessageBytes + 1, wantStatus: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name: "streamed oversized body", method: http.MethodPost, path: "/dns-query",
+			body: strings.Repeat("x", maxDNSMessageBytes+1), contentType: "application/dns-message",
+			contentLength: -1, wantStatus: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name: "read-only endpoint ignores body", method: http.MethodGet, path: "/healthz",
+			body: "ignored", wantStatus: http.StatusOK,
+		},
+		{
+			name: "unknown route", method: http.MethodGet, path: "/unknown",
+			body: "ignored", wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newTestGateway(t, gatewayOptions{
+				BackendURL: "http://127.0.0.1:1", RateLimit: 1, Processing: 1,
+				MaxActive: 1, UpstreamTimeout: 2 * time.Second,
+				TrustedIPHeader: "X-Forwarded-For",
+			})
+			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			if tc.contentLength != 0 {
+				r.ContentLength = tc.contentLength
+			}
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			if tc.setup != nil {
+				tc.setup(g, r)
+			}
+
+			w := httptest.NewRecorder()
+			g.ServeHTTP(w, r)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+			if got := w.Header().Get("Connection"); got != "close" {
+				t.Fatalf("Connection = %q, want close for unread request body", got)
+			}
+		})
+	}
+}
+
+func TestUnconsumedRequestBodyDoesNotCloseHTTP2Connection(t *testing.T) {
+	g := newTestGateway(t, gatewayOptions{BackendURL: "http://127.0.0.1:1"})
+	r := httptest.NewRequest(http.MethodGet, "/healthz", strings.NewReader("ignored"))
+	r.Proto = "HTTP/2.0"
+	r.ProtoMajor = 2
+	r.ProtoMinor = 0
+
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("Connection"); got != "" {
+		t.Fatalf("HTTP/2 Connection header = %q, want none", got)
+	}
+}
+
 // okBackend answers every query with testDNSBody.
 func okBackend() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -421,6 +520,9 @@ func TestHealthEndpoint(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("got %d", w.Code)
 	}
+	if got := w.Header().Get("Connection"); got == "close" {
+		t.Fatalf("bodyless HTTP/1 request unexpectedly closed its connection")
+	}
 	body, _ := io.ReadAll(w.Result().Body)
 	if string(body) != "ok\n" {
 		t.Fatalf("body=%q", body)
@@ -473,6 +575,9 @@ func TestPOSTReadErrorRejected(t *testing.T) {
 	g.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("got %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	if got := w.Header().Get("Connection"); got != "close" {
+		t.Fatalf("Connection = %q, want close after an unread body error", got)
 	}
 	if called.Load() {
 		t.Fatal("backend was called after request body read failure")

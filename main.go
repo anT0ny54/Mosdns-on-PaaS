@@ -443,6 +443,10 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/dns-query":
 		g.serveDNS(w, r)
 	default:
+		// The route will not consume an optional request body. Close an HTTP/1
+		// connection rather than making net/http drain an untrusted body just
+		// to preserve keep-alive.
+		closeConnectionIfRequestBodyIsUnread(w, r)
 		// Plain text like every other gateway-generated error; http.NotFound
 		// would emit Go's HTML error page despite the nosniff header.
 		writeText(w, http.StatusNotFound, "not found\n")
@@ -452,10 +456,17 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	g.metrics.requestsTotal.Add(1)
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		closeConnectionIfRequestBodyIsUnread(w, r)
 		methodNotAllowed(w, "GET, POST")
 		return
 	}
+	// GET bodies are not part of DoH's GET representation and are never
+	// forwarded or consumed by this handler.
+	if r.Method == http.MethodGet {
+		closeConnectionIfRequestBodyIsUnread(w, r)
+	}
 	if retryAfter := g.limiter.admit(rateLimitKey(g.clientIP(r))); retryAfter > 0 {
+		closeConnectionIfRequestBodyIsUnread(w, r)
 		g.metrics.rateLimitedTotal.Add(1)
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		writeText(w, http.StatusTooManyRequests, "rate limit exceeded\n")
@@ -465,6 +476,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	case g.activeSlots <- struct{}{}:
 		defer func() { <-g.activeSlots }()
 	default:
+		closeConnectionIfRequestBodyIsUnread(w, r)
 		g.metrics.activeRejectedTotal.Add(1)
 		w.Header().Set("Retry-After", "1")
 		writeText(w, http.StatusServiceUnavailable, "active request limit reached\n")
@@ -476,10 +488,12 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	var dnsParam string
 	if r.Method == http.MethodPost {
 		if !isStrictDoHContentType(r.Header) {
+			closeConnectionIfRequestBodyIsUnread(w, r)
 			w.WriteHeader(http.StatusUnsupportedMediaType)
 			return
 		}
 		if r.ContentLength > maxDNSMessageBytes {
+			closeConnectionIfRequestBodyIsUnread(w, r)
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -511,13 +525,14 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 				// so none is written and none is counted (see README).
 				return
 			}
-			if timedOut {
-				w.Header().Set("Connection", "close")
-			}
+			closeConnectionIfRequestBodyIsUnread(w, r)
 			writeText(w, http.StatusBadRequest, "invalid request body\n")
 			return
 		}
 		if len(body) > maxDNSMessageBytes {
+			// readDNSMessage stops after max+1 bytes. Do not let the HTTP server
+			// spend time draining an arbitrarily large remainder.
+			closeConnectionIfRequestBodyIsUnread(w, r)
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -1067,10 +1082,26 @@ func rateLimitKey(ip netip.Addr) netip.Addr {
 // writes the 405 response and returns false.
 func allowGetHead(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		closeConnectionIfRequestBodyIsUnread(w, r)
 		return true
 	}
+	closeConnectionIfRequestBodyIsUnread(w, r)
 	methodNotAllowed(w, "GET, HEAD")
 	return false
+}
+
+// closeConnectionIfRequestBodyIsUnread prevents net/http from waiting for an
+// unread HTTP/1 request body after an early response. In addition to marking
+// the connection for closure, the read deadline makes net/http's bounded
+// post-handler body drain fail immediately; the write deadline is untouched.
+// HTTP/2 request bodies are scoped to their stream, so no connection-level
+// close is appropriate (Connection: close would shut down the entire HTTP/2
+// connection).
+func closeConnectionIfRequestBodyIsUnread(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor == 1 && r.Body != nil && r.Body != http.NoBody {
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+	}
 }
 
 func methodNotAllowed(w http.ResponseWriter, allow string) {
