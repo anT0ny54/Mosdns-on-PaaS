@@ -71,10 +71,45 @@ run_entry_with_missing_child() { # $1 = mosdns or gateway
   mosdns_path="$TMP/mosdns"
   gateway_path="$TMP/gateway"
   if [ "$missing" = mosdns ]; then
-    mosdns_path="$TMP/missing-mosdns"
+    # BusyBox ash may report a missing first background command before the
+    # companion gateway gets scheduled. Wait for its PID record before failing
+    # the exec, so the test can prove that teardown stops a real child.
+    cat > "$TMP/delayed-missing-mosdns" <<EOF
+#!/bin/sh
+echo \$\$ > "$TMP/delayed-missing-mosdns.pid"
+i=0
+while [ ! -s "$TMP/gateway.pid" ]; do
+  i=\$((i + 1))
+  if [ "\$i" -ge 40 ]; then
+    echo "timed out waiting for companion gateway PID" >&2
+    exit 125
+  fi
+  sleep 0.05
+done
+exec "$TMP/missing-mosdns"
+EOF
+    chmod +x "$TMP/delayed-missing-mosdns"
+    mosdns_path="$TMP/delayed-missing-mosdns"
     live_child=gateway
   else
-    gateway_path="$TMP/missing-gateway"
+    # The same scheduling race applies when the missing gateway is second:
+    # wait for MosDNS to start before failing the gateway exec.
+    cat > "$TMP/delayed-missing-gateway" <<EOF
+#!/bin/sh
+echo \$\$ > "$TMP/delayed-missing-gateway.pid"
+i=0
+while [ ! -s "$TMP/mosdns.pid" ]; do
+  i=\$((i + 1))
+  if [ "\$i" -ge 40 ]; then
+    echo "timed out waiting for companion MosDNS PID" >&2
+    exit 125
+  fi
+  sleep 0.05
+done
+exec "$TMP/missing-gateway"
+EOF
+    chmod +x "$TMP/delayed-missing-gateway"
+    gateway_path="$TMP/delayed-missing-gateway"
     live_child=mosdns
   fi
   FAKE_DIR="$TMP" MOSDNS_BIN="$mosdns_path" GATEWAY_BIN="$gateway_path" \
@@ -82,12 +117,14 @@ run_entry_with_missing_child() { # $1 = mosdns or gateway
     $SHELL_UNDER_TEST "$DIR/entrypoint.sh" >"$TMP/out" 2>&1 &
   ENTRY=$!
   i=0
-  # The missing executable may fail before the other background child is
-  # scheduled. Wait briefly for its PID if it does start; children_gone below
-  # verifies that any recorded child was stopped and reaped.
   while [ ! -s "$TMP/$live_child.pid" ]; do
     i=$((i + 1)); [ "$i" -gt 50 ] && break; sleep 0.1
   done
+  if [ ! -s "$TMP/$live_child.pid" ]; then
+    echo "FAIL missing-$missing scenario did not start its companion $live_child child" >&2
+    cat "$TMP/out" >&2
+    fail=1
+  fi
 }
 
 entry_alive() {

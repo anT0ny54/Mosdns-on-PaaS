@@ -161,6 +161,7 @@ func testGateway(t testing.TB, backend string, limit int, concurrency int) *gate
 		TrustedIPHeader: "X-Forwarded-For",
 	})
 }
+
 func TestNormalizeListenAddr(t *testing.T) {
 	tests := map[string]string{
 		"8080":           ":8080",
@@ -1270,6 +1271,10 @@ func TestBackendRequestURL(t *testing.T) {
 		"http://127.0.0.1:/dns-query",
 		"http://127.0.0.1:65536/dns-query",
 		"http://127.0.0.1:8081/dns query",
+		"http://127.0.0.1:8081/dns-query?token=%ZZ",
+		"http://127.0.0.1:8081/dns%ZZ-query",
+		"http://127.0.0.1%ZZ:8081/dns-query",
+		"http://127.0.0.1:8081/dns-query?token=a;b",
 		"http://127.0.0.1:8081/dns\u00a0query",
 		"http://127.0.0.1:8081/dns\u0090query",
 	} {
@@ -1371,7 +1376,16 @@ func TestSlowReadingClientDoesNotHoldProcessingSlot(t *testing.T) {
 
 func TestGETInvalidParameterRejected(t *testing.T) {
 	g := testGateway(t, "http://127.0.0.1:1", 100, 10)
-	for _, q := range []string{"dns=not-base64!", "dns=AQ%3D%3D", "dns=", "other=1"} {
+	valid := base64.RawURLEncoding.EncodeToString([]byte(testDNSBody))
+	for _, q := range []string{
+		"dns=not-base64!", "dns=AQ%3D%3D", "dns=", "other=1",
+		"dns=" + valid + "&dns=" + valid,
+		"dns=" + valid + "&dns=",
+		"dns=&dns=" + valid,
+		"dns=%ZZ",
+		"dns=" + valid + "&dns=%ZZ",
+		"dns=" + valid + "&other=%ZZ",
+	} {
 		w := httptest.NewRecorder()
 		g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/dns-query?"+q, nil))
 		if w.Code != http.StatusBadRequest {

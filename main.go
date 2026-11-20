@@ -28,6 +28,7 @@ const (
 	// maxDNSMessageBytes bounds both DoH requests and MosDNS answers.
 	maxDNSMessageBytes       = 4096
 	minDNSMessageBytes       = 12
+	maxConsecutiveEmptyReads = 100
 	maxHeaderBytes           = 8 * 1024
 	defaultListen            = ":8080"
 	defaultBackend           = "http://127.0.0.1:8081/dns-query"
@@ -261,15 +262,16 @@ func newGateway(o gatewayOptions) (*gateway, error) {
 	if err != nil || u.Hostname() == "" {
 		return nil, errors.New("invalid backend URL: want an absolute http(s) URL with a hostname")
 	}
-	// URI schemes are case-insensitive. Normalize before storing the URL so
-	// uppercase HTTP(S) values behave exactly like their lowercase forms and
-	// agree with check-config.sh.
-	u.Scheme = strings.ToLower(u.Scheme)
+	// url.Parse lowercases the scheme, so HTTP:// and http:// are treated alike
+	// here and in check-config.sh.
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, errors.New("invalid backend URL: want an absolute http(s) URL with a hostname")
 	}
 	if u.User != nil {
 		return nil, errors.New("invalid backend URL: user-info is not supported")
+	}
+	if _, err := url.ParseQuery(u.RawQuery); err != nil {
+		return nil, errors.New("invalid backend URL: malformed query string")
 	}
 	if strings.HasSuffix(u.Host, ":") {
 		return nil, errors.New("invalid backend URL: port must not be empty")
@@ -541,18 +543,29 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		dnsParam = r.URL.Query().Get("dns")
-		if !isValidDoHGetParameter(dnsParam) {
+		queryValues, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		// A GET has no body, so the request is already fully read. As for POST
-		// above, clear the connection's read deadline: otherwise the server's
-		// ReadTimeout stays armed, its background read fails when it expires and
-		// cancels the request context, and a raised QUEUE_WAIT/UPSTREAM_TIMEOUT
-		// would end without any gateway response. The server sets fresh
-		// deadlines for the next request on this connection.
-		_ = rc.SetReadDeadline(time.Time{})
+		dnsValues := queryValues["dns"]
+		if len(dnsValues) != 1 || !isValidDoHGetParameter(dnsValues[0]) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		dnsParam = dnsValues[0]
+		// A GET without a body is already fully read. As for POST above, clear
+		// the connection's read deadline: otherwise the server's ReadTimeout
+		// stays armed, its background read fails when it expires and cancels
+		// the request context, and a raised QUEUE_WAIT/UPSTREAM_TIMEOUT would
+		// end without any gateway response. The server sets fresh deadlines for
+		// the next request on this connection. A GET that carries a body keeps
+		// the deadline set above instead: its body is never read, so no
+		// background read runs, and net/http's post-handler drain must fail at
+		// once rather than wait for bytes that may never arrive.
+		if r.Body == http.NoBody {
+			_ = rc.SetReadDeadline(time.Time{})
+		}
 	}
 	queueStart := time.Now()
 	select {
@@ -652,32 +665,26 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		if resp.ContentLength > maxDNSMessageBytes {
-			// The declared body cannot be relayed within the gateway's bound.
-			// Preserve the upstream status and useful non-representation headers
-			// without holding a processing slot while reading a body we will drop.
-			g.metrics.backendErrorTotal.Add(1)
-			copyResponseHeaders(w.Header(), resp.Header)
-			stripRepresentationHeaders(w.Header())
-			closeBody()
-			releaseSlot()
-			w.Header().Set("Content-Length", "0")
-			w.WriteHeader(resp.StatusCode)
-			return
-		}
-		respBody, readErr := readDNSMessage(resp.Body, respBuf)
-		if r.Context().Err() != nil {
-			return
+		// The optional error body is read only if its declared length is within
+		// the relay bound: a larger declared body is dropped unread. A body that
+		// fails to read or is too long is dropped as well.
+		var respBody []byte
+		relayBody := false
+		if resp.ContentLength <= maxDNSMessageBytes {
+			var readErr error
+			respBody, readErr = readDNSMessage(resp.Body, respBuf)
+			if r.Context().Err() != nil {
+				return
+			}
+			relayBody = readErr == nil && len(respBody) <= maxDNSMessageBytes
 		}
 		g.metrics.backendErrorTotal.Add(1)
-		if readErr != nil || len(respBody) > maxDNSMessageBytes {
-			// Preserve useful status headers (such as Retry-After), but not
-			// representation metadata for a body we deliberately discard.
+		copyResponseHeaders(w.Header(), resp.Header)
+		if !relayBody {
+			// Keep useful status headers (such as Retry-After), but not the
+			// representation metadata of a body that is discarded.
 			respBody = nil
-			copyResponseHeaders(w.Header(), resp.Header)
 			stripRepresentationHeaders(w.Header())
-		} else {
-			copyResponseHeaders(w.Header(), resp.Header)
 		}
 		closeBody()
 		releaseSlot()
@@ -690,9 +697,7 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 	// Reject a malformed DoH representation from its headers alone. In
 	// particular, do not let a 200 response with a wrong or ambiguous
 	// Content-Type hold a processing slot while its body stalls.
-	if !isStrictDoHContentType(resp.Header) ||
-		resp.ContentLength > maxDNSMessageBytes ||
-		(resp.ContentLength >= 0 && resp.ContentLength < minDNSMessageBytes) {
+	if !isStrictDoHContentType(resp.Header) || !declaredLengthInRange(resp.ContentLength) {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -760,10 +765,13 @@ func (g *gateway) backendRequestURL(dns string) string {
 
 // readDNSMessage reads r into a buffer from dnsMessageBufferPool (capacity
 // maxDNSMessageBytes+1) and returns at most that many bytes; a result longer
-// than maxDNSMessageBytes means the message was too large. The result aliases
-// *pooled, so it is only valid until the buffer is returned to the pool.
+// than maxDNSMessageBytes means the message was too large. It tolerates short
+// runs of empty reads but bounds them with maxConsecutiveEmptyReads. The result
+// aliases *pooled, so it is only valid until the buffer is returned to the
+// pool.
 func readDNSMessage(r io.Reader, pooled *[]byte) ([]byte, error) {
 	buf := (*pooled)[:0]
+	emptyReads := 0
 	for len(buf) < cap(buf) {
 		n, err := r.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]
@@ -774,8 +782,13 @@ func readDNSMessage(r io.Reader, pooled *[]byte) ([]byte, error) {
 			return nil, err
 		}
 		if n == 0 {
-			return nil, io.ErrNoProgress
+			emptyReads++
+			if emptyReads >= maxConsecutiveEmptyReads {
+				return nil, io.ErrNoProgress
+			}
+			continue
 		}
+		emptyReads = 0
 	}
 	return buf, nil
 }
@@ -820,6 +833,13 @@ func isStrictDoHContentType(header http.Header) bool {
 	return len(values) == 1 && strings.EqualFold(strings.Trim(values[0], " \t"), "application/dns-message")
 }
 
+// declaredLengthInRange reports whether a declared Content-Length (-1 when
+// unknown) is within the DNS message bounds, so a body can be rejected before
+// it is read.
+func declaredLengthInRange(n int64) bool {
+	return n <= maxDNSMessageBytes && (n < 0 || n >= minDNSMessageBytes)
+}
+
 // backendReady performs a readiness check. The owner in ready records the
 // result only after confirming the caller's context is still live.
 func (g *gateway) backendReady(parent context.Context) bool {
@@ -841,8 +861,7 @@ func (g *gateway) backendReady(parent context.Context) bool {
 	if resp.StatusCode != http.StatusOK || !isStrictDoHContentType(resp.Header) {
 		return false
 	}
-	if resp.ContentLength > maxDNSMessageBytes ||
-		(resp.ContentLength >= 0 && resp.ContentLength < minDNSMessageBytes) {
+	if !declaredLengthInRange(resp.ContentLength) {
 		return false
 	}
 	pooled := dnsMessageBufferPool.Get().(*[]byte)
@@ -862,7 +881,7 @@ func buildReadinessDNSQuery(seq uint64) ([]byte, uint16) {
 	query[1] = byte(id)
 	query[2] = 0x01
 	query[5] = 0x01
-	for _, part := range strings.Split(readinessProbeName, ".") {
+	for _, part := range readinessProbeLabels {
 		query = append(query, byte(len(part)))
 		query = append(query, part...)
 	}
@@ -1081,11 +1100,10 @@ func rateLimitKey(ip netip.Addr) netip.Addr {
 // allowGetHead reports whether r may use a read-only endpoint. Otherwise it
 // writes the 405 response and returns false.
 func allowGetHead(w http.ResponseWriter, r *http.Request) bool {
+	closeConnectionIfRequestBodyIsUnread(w, r)
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		closeConnectionIfRequestBodyIsUnread(w, r)
 		return true
 	}
-	closeConnectionIfRequestBodyIsUnread(w, r)
 	methodNotAllowed(w, "GET, HEAD")
 	return false
 }

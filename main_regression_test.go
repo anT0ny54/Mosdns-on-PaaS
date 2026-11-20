@@ -14,6 +14,61 @@ import (
 	"time"
 )
 
+type emptyThenReader struct {
+	remainingEmptyReads int
+	reader              io.Reader
+}
+
+func (r *emptyThenReader) Read(p []byte) (int, error) {
+	if r.remainingEmptyReads > 0 {
+		r.remainingEmptyReads--
+		return 0, nil
+	}
+	return r.reader.Read(p)
+}
+
+type noProgressReader struct {
+	reads int
+}
+
+func (r *noProgressReader) Read([]byte) (int, error) {
+	r.reads++
+	return 0, nil
+}
+
+func TestReadDNSMessageRetriesTransientEmptyReads(t *testing.T) {
+	want := []byte("valid dns test")
+	reader := &emptyThenReader{
+		remainingEmptyReads: 3,
+		reader:              bytes.NewReader(want),
+	}
+	pooled := make([]byte, maxDNSMessageBytes+1)
+
+	got, err := readDNSMessage(reader, &pooled)
+	if err != nil {
+		t.Fatalf("readDNSMessage: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("readDNSMessage = %q, want %q", got, want)
+	}
+	if reader.remainingEmptyReads != 0 {
+		t.Fatalf("remaining empty reads = %d, want 0", reader.remainingEmptyReads)
+	}
+}
+
+func TestReadDNSMessageBoundsConsecutiveEmptyReads(t *testing.T) {
+	reader := &noProgressReader{}
+	pooled := make([]byte, maxDNSMessageBytes+1)
+
+	_, err := readDNSMessage(reader, &pooled)
+	if !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("readDNSMessage error = %v, want %v", err, io.ErrNoProgress)
+	}
+	if reader.reads != maxConsecutiveEmptyReads {
+		t.Fatalf("Read calls = %d, want %d", reader.reads, maxConsecutiveEmptyReads)
+	}
+}
+
 // regGateway is a gateway with the default limits, the given client (nil
 // for the production client) and a 5 s upstream timeout.
 func regGateway(t testing.TB, backend string, client *http.Client) *gateway {
@@ -924,5 +979,43 @@ func TestGETUpstreamWaitOutlivesServerReadTimeout(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || len(body) != 32 {
 		t.Fatalf("status = %d, body = %d bytes; want 200 with the 32-byte answer", resp.StatusCode, len(body))
+	}
+}
+
+// A GET /dns-query that declares a body and never sends it must still be
+// answered, and the connection must close right after the answer. Clearing the
+// read deadline here would let net/http's post-handler drain wait indefinitely.
+func TestHTTP1GETWithUnreadBodyClosesConnectionWithoutDraining(t *testing.T) {
+	backend := okBackend()
+	defer backend.Close()
+	g := regGateway(t, backend.URL+"/dns-query", backend.Client())
+	ln := startRegServer(t, g)
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	// 12 zero bytes as raw base64url: the smallest valid DNS message. The
+	// declared body is intentionally not sent.
+	if _, err := fmt.Fprintf(conn,
+		"GET /dns-query?dns=AAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: %s\r\nContent-Length: 1024\r\n\r\n",
+		ln.Addr().String()); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response before unread body arrived: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var one [1]byte
+	if n, err := conn.Read(one[:]); n != 0 || err != io.EOF {
+		t.Fatalf("connection after response = (%d, %v), want (0, EOF)", n, err)
 	}
 }

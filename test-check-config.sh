@@ -102,6 +102,8 @@ def set_listener_userinfo(config, cache, sequence, fallback):
     config["servers"][0]["listeners"][0]["addr"] = "user:pass@127.0.0.1:8081"
 
 write_case("listener-userinfo", set_listener_userinfo)
+write_case("listener-empty-query", lambda c, cache, seq, fb: c["servers"][0]["listeners"][0].update(addr="127.0.0.1:8081?"))
+write_case("listener-empty-fragment", lambda c, cache, seq, fb: c["servers"][0]["listeners"][0].update(addr="127.0.0.1:8081#"))
 
 def set_listener_whitespace(config, cache, sequence, fallback):
     config["servers"][0]["listeners"][0]["addr"] = "127.0.0.1:\t8081"
@@ -114,6 +116,11 @@ def set_primary_upstream_url(value):
         upstream[0]["addr"] = value
     return edit
 
+write_case("upstream-malformed-query", set_primary_upstream_url("https://root.hagezi.org/dns-query?token=%ZZ"))
+write_case("upstream-malformed-path-escape", set_primary_upstream_url("https://root.hagezi.org/dns%ZZ-query"))
+write_case("upstream-malformed-authority-escape", set_primary_upstream_url("https://root%ZZ.hagezi.org/dns-query"))
+write_case("valid-upstream-path-percent-escape", set_primary_upstream_url("https://root.hagezi.org/dns%2Dquery"))
+write_case("upstream-semicolon-query", set_primary_upstream_url("https://root.hagezi.org/dns-query?token=a;b"))
 write_case("upstream-whitespace", set_primary_upstream_url("https://root.hagezi.org\n/dns-query"))
 write_case("upstream-control-character", set_primary_upstream_url("https://root.hagezi.org/\u0090dns-query"))
 write_case("upstream-userinfo", set_primary_upstream_url("https://user:pass@root.hagezi.org/dns-query"))
@@ -190,10 +197,13 @@ expect_ok valid-no-edns-filter
 expect_ok valid-threshold-clamped-by-mosdns
 expect_ok valid-api-without-http
 expect_ok valid-uppercase-upstream-scheme
+expect_ok valid-upstream-path-percent-escape
 expect_ok valid-udp-upstream
 expect_ok valid-tcp-pipeline
 expect_ok valid-tls-pipeline
 expect_fail listener-userinfo "must be a host:port address without user-info"
+expect_fail listener-empty-query "must be a host:port address"
+expect_fail listener-empty-fragment "must be a host:port address"
 expect_fail listener-whitespace "must not contain whitespace or control characters"
 expect_fail upstream-whitespace "must not contain whitespace or control characters"
 expect_fail upstream-control-character "must not contain whitespace or control characters"
@@ -226,6 +236,10 @@ expect_fail readiness-extra-token "IN A 127.0.0.1"
 expect_fail readiness-duplicate-a "exactly one arbitrary IN A record"
 expect_fail duplicate-yaml-key "duplicate mapping key 'timeout'"
 expect_fail malformed-upstream-url "must be a valid upstream URL"
+expect_fail upstream-malformed-query "must contain a valid query string"
+expect_fail upstream-malformed-path-escape "must contain valid percent escapes"
+expect_fail upstream-malformed-authority-escape "must contain valid percent escapes"
+expect_fail upstream-semicolon-query "must contain a valid query string"
 expect_fail readiness-wrong-class "IN A 127.0.0.1"
 
 # Dockerfile cross-checks: each mutation must be rejected for its own reason.
@@ -263,6 +277,9 @@ reject_dockerfile backend-userinfo 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-q
 reject_dockerfile backend-fragment 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query#fragment|' "must not contain fragments"
 reject_dockerfile backend-empty-fragment 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query#|' "must not contain fragments"
 reject_dockerfile backend-empty-port 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:/dns-query|' "must not use an empty port"
+reject_dockerfile backend-malformed-query 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query?token=%ZZ|' "must contain a valid query string"
+reject_dockerfile backend-malformed-path-escape 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns%ZZ-query|' "must contain valid percent escapes"
+reject_dockerfile backend-semicolon-query 's|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query|MOSDNS_DOH_URL=http://127.0.0.1:8081/dns-query?token=a;b|' "must contain a valid query string"
 # A non-whitespace C1 control character is not matched by Python's \S
 # class, so ensure the explicit raw-character check catches it too.
 "$PYTHON" - "$TMP" <<'PYTHON'

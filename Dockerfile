@@ -15,7 +15,7 @@ ARG MOSDNS_COMMIT=760a660192fdf996463b024d1d0e19bd66b6ed31
 # Mirrors the VERSION file so a plain `docker build` (Koyeb, CI) labels the
 # image correctly without a build-arg. check-config.sh verifies this default
 # still equals VERSION; --build-arg GATEWAY_VERSION overrides it.
-ARG GATEWAY_VERSION=0.5.15
+ARG GATEWAY_VERSION=0.5.21
 
 # Builders run on the build host and cross-compile for TARGETARCH, so
 # multi-arch builds (docker buildx --platform ...) do not run Go under QEMU.

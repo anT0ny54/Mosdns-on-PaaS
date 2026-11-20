@@ -90,7 +90,7 @@ def check_listen_addr(value, path: str) -> None:
         fail(f"{path} must be a host:port address without user-info")
     if port is None or not 1 <= port <= 65535:
         fail(f"{path} must include a valid port from 1 to 65535")
-    if parsed.path or parsed.query or parsed.fragment:
+    if parsed.path or parsed.query or parsed.fragment or "?" in value or "#" in value:
         fail(f"{path} must be a host:port address")
 def listen_host(value: str):
     host = urlsplit("//" + value).hostname
@@ -105,6 +105,18 @@ def check_loopback(value: str, path: str) -> None:
         fail(f"{path} must bind to loopback explicitly (an empty host listens on every interface)")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         fail(f"{path} must bind to loopback, not {host}")
+def check_query_string(value: str, path: str) -> None:
+    # Match net/url.ParseQuery: malformed percent escapes and raw semicolons
+    # are rejected rather than silently discarded by URL.Query().
+    if ";" in value or re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        fail(f"{path} must contain a valid query string")
+
+def check_url_percent_escapes(value: str, path: str) -> None:
+    # urllib.parse.urlsplit does not validate percent escapes. Go's url.Parse
+    # does, including in the path and authority, so match that behavior here.
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        fail(f"{path} must contain valid percent escapes")
+
 def check_upstream_addr(value, path: str) -> str:
     value = no_raw_whitespace_or_control(non_empty_string(value, path), path)
     try:
@@ -125,6 +137,8 @@ def check_upstream_addr(value, path: str) -> str:
         fail(f"{path} must not contain fragments")
     if parsed.netloc.endswith(":"):
         fail(f"{path} must not use an empty port")
+    check_query_string(parsed.query, path)
+    check_url_percent_escapes(value, path)
     try:
         port = parsed.port
     except ValueError:
@@ -166,7 +180,7 @@ UniqueKeySafeLoader.add_constructor(
 try:
     cfg = yaml.load(read_utf8(config_path, str(config_path)), Loader=UniqueKeySafeLoader)
 except yaml.YAMLError as exc:
-    problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+    problem = getattr(exc, "problem", None) or (str(exc).splitlines() or ["invalid YAML"])[0]
     mark = getattr(exc, "problem_mark", None)
     if mark is not None:
         problem = f"line {mark.line + 1}, column {mark.column + 1}: {problem}"
@@ -397,6 +411,8 @@ if dockerfile_text:
         fail("Dockerfile MOSDNS_DOH_URL must not contain user-info")
     if backend.fragment or "#" in backend_raw:
         fail("Dockerfile MOSDNS_DOH_URL must not contain fragments")
+    check_query_string(backend.query, "Dockerfile MOSDNS_DOH_URL")
+    check_url_percent_escapes(backend_raw, "Dockerfile MOSDNS_DOH_URL")
     if backend.netloc.endswith(":"):
         fail("Dockerfile MOSDNS_DOH_URL must not use an empty port")
     listener_host = listen_host(listener["addr"])

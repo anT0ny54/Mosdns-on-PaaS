@@ -20,11 +20,13 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
   body read is included because the write deadline starts when the request
   headers arrive, so a slow POST upload still ends in a `503`/`504` instead of
   a dropped connection. Once a request has been fully read (the POST body, or
-  the request itself for a GET) the gateway clears the connection's read
+  a GET without a body) the gateway clears the connection's read
   deadline, so the 5 s whole-request limit cannot cancel a request that is only
   waiting in the queue or on MosDNS under a raised `QUEUE_WAIT` or
-  `UPSTREAM_TIMEOUT`. A startup warning is logged if `UPSTREAM_TIMEOUT` is
-  not above the MosDNS server timeout (2 s).
+  `UPSTREAM_TIMEOUT`. A GET that carries a body keeps its read deadline, so the
+  connection closes after the answer instead of waiting for the unread body. A
+  startup warning is logged if `UPSTREAM_TIMEOUT` is not above the MosDNS server
+  timeout (2 s).
 - **MosDNS v4.5.3** (built from upstream in the Dockerfile): listens on
   `127.0.0.1:8081` (`/dns-query`), answers the readiness probe name locally,
   strips every EDNS0 option except ECS, answers from a cache (32768 entries, lazy
@@ -66,7 +68,7 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 
 | Path | Behavior |
 |---|---|
-| `GET/POST /dns-query` | DoH. POST requires exactly one `Content-Type: application/dns-message` header (case-insensitive, optional surrounding SP/HTAB only, no parameters); duplicate or conflicting values are rejected. GET requires a raw (unpadded) base64url `dns` query parameter. Messages must be 12-4096 bytes. A successful backend answer must be `200 OK` with exactly one `Content-Type: application/dns-message` header and a 12-4096-byte body; invalid media-type headers and declared out-of-range body lengths are rejected before reading the body. The readiness probe applies the same declared 12-4096-byte length bounds before reading. Statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
+| `GET/POST /dns-query` | DoH. POST requires exactly one `Content-Type: application/dns-message` header (case-insensitive, optional surrounding SP/HTAB only, no parameters); duplicate or conflicting values are rejected. GET requires exactly one raw (unpadded) base64url `dns` query parameter; duplicate `dns` values and malformed query-string encoding are rejected. Messages must be 12-4096 bytes. A successful backend answer must be `200 OK` with exactly one `Content-Type: application/dns-message` header and a 12-4096-byte body; invalid media-type headers and declared out-of-range body lengths are rejected before reading the body. The readiness probe applies the same declared 12-4096-byte length bounds before reading. Statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
 | `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with exactly one `Content-Type: application/dns-message` header (optional surrounding SP/HTAB only), then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, exactly one answer, zero authority/additional records, the echoed question, and a complete `A 127.0.0.1` answer whose owner name matches the probe's individual DNS labels (not merely a dot-joined string), with no trailing bytes). An NXDOMAIN, truncated response, absent/extra/malformed answer record, unexpected DNS section, trailing data, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
 | `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns backend statuses other than `200` and `400`-`599` into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a `200` `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
@@ -206,7 +208,11 @@ cache in under 1 ms (measured end to end through the gateway).
   and repeated local-answer, EDNS-filter, or fallback references are rejected;
   listener addresses, upstream URLs and the Dockerfile backend URL containing
   raw whitespace or any Unicode control characters are rejected instead of
-  being normalized or partially matched; malformed UTF-8 is reported cleanly;
+  being normalized or partially matched; listener addresses also reject empty
+  query/fragment delimiters, malformed percent escapes anywhere in a URL,
+  and raw semicolons in URL query strings are rejected by static validation
+  and gateway startup (rather than being silently discarded during parsing);
+  malformed UTF-8 is reported cleanly;
   upstream URLs also reject embedded user-info, all fragments (including an
   empty trailing `#`), and explicit empty ports;
 - the entry sequence (`servers[0].exec`) layout: optional local-answer
@@ -270,10 +276,14 @@ The local image tag defaults to `mosdns-on-paas:local` (Docker image repository
 names must be lowercase). Override it with `make docker-build IMAGE=your-name:tag`.
 
 `test-entrypoint.sh` runs the real `entrypoint.sh` against fake MosDNS and
-gateway processes (its cleanup signals only fakes still started by that run) and checks, for each scenario, both the exit code and that
-neither fake child is still running afterwards. Its exit wait treats zombies as
-exited before reaping them, and missing-binary scenarios verify the shell's
-missing-executable diagnostic as well as the absence of any surviving child.
+gateway processes (its cleanup signals only fakes still started by that run).
+For each scenario it checks both the exit code and that neither fake child is
+still running afterwards. Its exit wait treats zombies as
+exited before reaping them. Missing-binary scenarios also require the companion
+child to have recorded its PID before verifying the missing-executable
+diagnostic and that the started child was stopped. The failing-exec wrappers
+wait up to two seconds for that PID record to avoid scheduler races in BusyBox ash;
+a timeout exits with a diagnostic instead of leaving a wrapper running indefinitely.
 Scenarios include: TERM shutdown exits 0; a
 SIGKILLed MosDNS or gateway and a child that exits on its own are detected
 (exit 1, the other child stopped); a child that ignores TERM is KILLed after its
@@ -357,7 +367,7 @@ together.
 
 ## Version
 
-The gateway version lives in `VERSION` (currently 0.5.15); the Dockerfile
+The gateway version lives in `VERSION` (currently 0.5.21); the Dockerfile
 reads it during the build (plain `docker build`, as Koyeb does, gets it too)
 and injects it with `-ldflags -X main.version=...`. The top-level
 `ARG GATEWAY_VERSION` default mirrors `VERSION` so the image's
