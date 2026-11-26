@@ -67,14 +67,30 @@ jobs:
             if [ "$i" = 30 ]; then echo "/readyz never became ready" >&2; exit 1; fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:8080/healthz | grep -qx ok
+          health=$(curl -fsS http://127.0.0.1:8080/healthz)
+          [ "$health" = ok ] || { echo "unexpected /healthz body: $health" >&2; exit 1; }
           # "A ready.doh-gateway.invalid" as a raw base64url DoH GET parameter.
-          q=$(python3 -c 'import base64; n=b"".join(bytes([len(l)])+l for l in b"ready.doh-gateway.invalid".split(b"."))+b"\0"; print(base64.urlsafe_b64encode(b"\0\0\1\0\0\1\0\0\0\0\0\0"+n+b"\0\1\0\1").decode().rstrip("="))')
+          # It uses the same QNAME/QTYPE/QCLASS as buildReadinessDNSQuery; this
+          # standalone CI request uses ID 0 (runtime probes use incrementing IDs).
+          q=$(python3 -c '
+          import base64
+          name = b"".join(bytes([len(l)]) + l for l in b"ready.doh-gateway.invalid".split(b".")) + b"\0"
+          header = b"\0\0\1\0\0\1\0\0\0\0\0\0"
+          print(base64.urlsafe_b64encode(header + name + b"\0\1\0\1").decode().rstrip("="))
+          ')
+          [ -n "$q" ] || { echo "could not build the DNS probe query" >&2; exit 1; }
           ct=$(curl -fsS -o /tmp/answer -w '%{content_type}' "http://127.0.0.1:8080/dns-query?dns=${q}")
           [ "$ct" = "application/dns-message" ] || { echo "unexpected content type: $ct" >&2; exit 1; }
           [ "$(stat -c %s /tmp/answer)" -gt 12 ] || { echo "answer too short" >&2; exit 1; }
           [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/nope)" = 404 ]
-          curl -fsS http://127.0.0.1:8080/metrics | grep -q '^doh_gateway_build_info{version="'"$(cat VERSION)"'"} 1$'
+          metrics=$(curl -fsS http://127.0.0.1:8080/metrics)
+          grep -q '^doh_gateway_build_info{version="'"$(cat VERSION)"'"} 1$' <<<"$metrics"
           # Graceful stop must fit Docker's default 10 s stop timeout.
-          start=$(date +%s); docker stop smoke >/dev/null; end=$(date +%s)
-          [ $((end - start)) -lt 10 ] || { echo "docker stop took $((end - start)) s" >&2; exit 1; }
+          start_ns=$(date +%s%N)
+          docker stop smoke >/dev/null
+          end_ns=$(date +%s%N)
+          elapsed_ns=$((end_ns - start_ns))
+          [ "$elapsed_ns" -lt 10000000000 ] || {
+            echo "docker stop took ${elapsed_ns} ns (limit: 10000000000 ns)" >&2
+            exit 1
+          }
