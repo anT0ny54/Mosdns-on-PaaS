@@ -67,6 +67,7 @@ write_case("string-threshold", lambda c, cache, seq, fb: fb.update(threshold="5"
 write_case("string-cache-boolean", lambda c, cache, seq, fb: cache.update(cache_everything="true"))
 write_case("extra-sequence-step", lambda c, cache, seq, fb: seq.append("fallback_hagezi"))
 write_case("unknown-edns-filter", lambda c, cache, seq, fb: seq.insert(1, "_edns0_filter_typo"))
+write_case("multiple-edns-filters", lambda c, cache, seq, fb: seq.insert(2, "_edns0_filter_no_edns0"))
 write_case("duplicate-fallback-plugin", lambda c, cache, seq, fb: fb["primary"].append(fb["primary"][0]))
 write_case("unhashable-fallback-tag", lambda c, cache, seq, fb: fb["primary"].__setitem__(0, []))
 write_case("unused-plugin", lambda c, cache, seq, fb: c["plugins"].append({"tag": "unused_probe", "type": "arbitrary", "args": {"rr": []}}))
@@ -109,6 +110,8 @@ def set_listener_whitespace(config, cache, sequence, fallback):
     config["servers"][0]["listeners"][0]["addr"] = "127.0.0.1:\t8081"
 
 write_case("listener-whitespace", set_listener_whitespace)
+write_case("listener-ipv4-zone-suffix", lambda c, cache, seq, fb: c["servers"][0]["listeners"][0].update(addr="127.0.0.1%eth0:8081"))
+write_case("listener-hostname-zone-suffix", lambda c, cache, seq, fb: c["servers"][0]["listeners"][0].update(addr="localhost%eth0:8081"))
 
 def set_primary_upstream_url(value):
     def edit(config, cache, sequence, fallback):
@@ -205,6 +208,8 @@ expect_fail listener-userinfo "must be a host:port address without user-info"
 expect_fail listener-empty-query "must be a host:port address"
 expect_fail listener-empty-fragment "must be a host:port address"
 expect_fail listener-whitespace "must not contain whitespace or control characters"
+expect_fail listener-ipv4-zone-suffix "must bind to loopback, not 127.0.0.1%eth0"
+expect_fail listener-hostname-zone-suffix "must bind to loopback, not localhost%eth0"
 expect_fail upstream-whitespace "must not contain whitespace or control characters"
 expect_fail upstream-control-character "must not contain whitespace or control characters"
 expect_fail invalid-utf8 "must be valid UTF-8"
@@ -227,6 +232,7 @@ expect_fail string-threshold "threshold must be an integer"
 expect_fail string-cache-boolean "cache_everything must be true or false"
 expect_fail extra-sequence-step "must contain exactly one primary/secondary fallback"
 expect_fail unknown-edns-filter "uses unsupported EDNS filter"
+expect_fail multiple-edns-filters "may contain only one EDNS filter"
 expect_fail duplicate-fallback-plugin "references plugin .* more than once"
 expect_fail unhashable-fallback-tag "primary\[1\] must be a non-empty string"
 expect_fail unused-plugin "unused plugin definition"

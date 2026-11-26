@@ -541,11 +541,15 @@ func TestResponseConnectionHeaderTokensAreStripped(t *testing.T) {
 	src.Add("Connection", "X-Request-Token, X-Another")
 	src.Set("X-Request-Token", "secret")
 	src.Set("X-Another", "secret2")
+	src.Set("Proxy-Connection", "keep-alive")
 	src.Set("X-Keep", "safe")
 	dst := make(http.Header)
 	copyResponseHeaders(dst, src)
 	if dst.Get("X-Request-Token") != "" || dst.Get("X-Another") != "" {
 		t.Fatalf("connection-token response headers leaked: %v", dst)
+	}
+	if dst.Get("Proxy-Connection") != "" {
+		t.Fatalf("legacy hop-by-hop response header leaked: %v", dst)
 	}
 	if dst.Get("X-Keep") != "safe" {
 		t.Fatalf("ordinary response header lost: %v", dst)
@@ -677,6 +681,8 @@ func TestMetricsEndpoint(t *testing.T) {
 		"doh_gateway_queue_wait_seconds_total 0.150000",
 		"doh_gateway_queue_wait_samples_total 2",
 		"doh_gateway_backend_latency_samples_total 5",
+		"# HELP doh_gateway_backend_latency_seconds_total Total time from request send until the body is fully read for MosDNS responses that pass the gateway's HTTP status, media-type and DNS-message size checks.",
+		"# HELP doh_gateway_backend_latency_samples_total MosDNS response bodies that pass the gateway's HTTP status, media-type and DNS-message size checks.",
 		"doh_gateway_build_info{version=",
 		`doh_gateway_responses_total{class="2xx"}`,
 	} {

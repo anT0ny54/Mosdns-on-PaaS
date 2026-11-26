@@ -19,8 +19,13 @@ MosDNS serves plain-HTTP DNS-over-HTTPS-format queries on loopback behind it
   so the 8 s floor applies; raised timeouts raise the deadline with them. The
   body read is included because the write deadline starts when the request
   headers arrive, so a slow POST upload still ends in a `503`/`504` instead of
-  a dropped connection. Once a request has been fully read (the POST body, or
-  a GET without a body) the gateway clears the connection's read
+  a dropped connection. Graceful shutdown has a separate fixed 5 s drain
+  timeout to fit inside the entrypoint's 6 s gateway grace period. The
+  shipped body-read + queue + upstream budget is 4.6 s and fits; raising
+  `QUEUE_WAIT` or `UPSTREAM_TIMEOUT` does not extend the shutdown drain, so
+  requests still running after 5 s are closed. Once a request has been fully
+  read (the POST body, or a GET without a body), the gateway clears the
+  connection's read
   deadline, so the 5 s whole-request limit cannot cancel a request that is only
   waiting in the queue or on MosDNS under a raised `QUEUE_WAIT` or
   `UPSTREAM_TIMEOUT`. A GET that carries a body keeps its read deadline, so the
@@ -68,10 +73,10 @@ variables: `MOSDNS_CONFIG` (default `/etc/mosdns/config.yaml`), `MOSDNS_DIR`
 
 | Path | Behavior |
 |---|---|
-| `GET/POST /dns-query` | DoH. POST requires exactly one `Content-Type: application/dns-message` header (case-insensitive, optional surrounding SP/HTAB only, no parameters); duplicate or conflicting values are rejected. GET requires exactly one raw (unpadded) base64url `dns` query parameter; duplicate `dns` values and malformed query-string encoding are rejected. Messages must be 12-4096 bytes. A successful backend answer must be `200 OK` with exactly one `Content-Type: application/dns-message` header and a 12-4096-byte body; invalid media-type headers and declared out-of-range body lengths are rejected before reading the body. The readiness probe applies the same declared 12-4096-byte length bounds before reading. Statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
+| `GET/POST /dns-query` | DoH. POST requires exactly one `Content-Type: application/dns-message` header (case-insensitive, optional surrounding SP/HTAB only, no parameters); duplicate or conflicting values are rejected. GET requires exactly one raw (unpadded) base64url `dns` query parameter; duplicate `dns` values and malformed query-string encoding are rejected. Messages must be 12-4096 bytes. A successful backend answer must be `200 OK` with exactly one `Content-Type: application/dns-message` header and a 12-4096-byte body; invalid media-type headers and declared out-of-range body lengths are rejected before reading the body. These are HTTP transport, media-type and size checks only: the gateway does not parse the DNS wire format of ordinary query answers; MosDNS parses DNS requests and creates the answers. The readiness probe separately validates the DNS wire format of its local response and applies the same declared 12-4096-byte length bounds before reading the body. Statuses other than `200` and standard `400`-`599` statuses become `502` immediately, while backend 4xx/5xx statuses are relayed with a bounded optional body. |
 | `GET/HEAD /healthz` | Liveness. Always `200 ok` if the gateway process is up. |
 | `GET/HEAD /readyz` | Readiness of the gateway **and MosDNS**, independent of the public upstreams. Sends `A ready.doh-gateway.invalid` (fixed name, incrementing transaction ID) through MosDNS, where the `readiness` plugin answers it locally before the cache, and validates the response (HTTP `200` with exactly one `Content-Type: application/dns-message` header (optional surrounding SP/HTAB only), then the network-order transaction ID, QR set, TC clear, RCODE 0 (NOERROR), QDCOUNT 1, exactly one answer, zero authority/additional records, the echoed question, and a complete `A 127.0.0.1` answer whose owner name matches the probe's individual DNS labels (not merely a dot-joined string), with no trailing bytes). An NXDOMAIN, truncated response, absent/extra/malformed answer record, unexpected DNS section, trailing data, or wrong address means the local rule is missing and is reported as not ready. An upstream outage therefore does not fail the probe (DNS queries return SERVFAIL instead), so a platform health check on `/readyz` cannot restart-loop the container while HaGeZi is unreachable. Each probe has a 1 s budget and goes through a dedicated readiness client (single connection). The result is cached 5 s on success and 1 s on failure; concurrent callers share one in-flight probe, and each caller still honours its own request context: a disconnecting client stops waiting, and if it owned the probe, the probe is canceled, never cached, not counted as either `ready` or `not_ready` in `doh_gateway_ready_probe_total`, and no response is written or counted for that client. |
-| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns backend statuses other than `200` and `400`-`599` into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only valid answers: a sample is recorded after a `200` `application/dns-message` response of 12-4096 bytes has been completely read and validated, measured from sending the request until the body was read. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
+| `GET/HEAD /metrics` | Plain-text Prometheus exposition (`doh_gateway_*`): request (`/dns-query` only), rate-limit, active-reject, queue-timeout and backend-error counters; responses by status class (`2xx`/`4xx`/`5xx`, counting every response the gateway writes, including `/healthz`, `/readyz`, `/metrics` and `404`; the gateway never redirects and turns backend statuses other than `200` and `400`-`599` into `502`, so there is no `3xx` series; a client that disconnects mid-request, on `/dns-query` or `/readyz`, is not counted, since no response is written); readiness probe results; `doh_gateway_build_info{version="..."}`; queue-wait and backend-latency totals and sample counts (averages are left to the scraper: divide `_seconds_total` by `_samples_total`; backend latency covers only backend responses accepted by the gateway's HTTP checks: a sample is recorded after a `200` response with exactly one `application/dns-message` content type and a 12-4096-byte body has been completely read, measured from sending the request until the body was read. The gateway does not structurally parse ordinary answer DNS messages. Timeouts, truncated, oversize, wrong-type or too-short bodies, and answers other than `200` add no sample; they are counted in `doh_gateway_backend_error_total` instead). |
 
 `/healthz`, `/readyz` and `/metrics` are served unauthenticated on the same public listener and are not subject to the rate limiter, the active-request ceiling or the processing queue (only `/dns-query` is). `/readyz` is bounded by its result cache (one local MosDNS query per 5 s on success, per 1 s on failure) and never reaches the upstreams. Concurrent `/readyz` callers share one in-flight probe even when the result cache is disabled. Block or restrict `/metrics` at the platform edge if you do not want it public.
 
@@ -150,16 +155,17 @@ and the runtime tuning values `GOMAXPROCS=1` and `GOMEMLIMIT=160MiB`; everything
 else, including `PORT`, `RATE_LIMIT`, `RATE_WINDOW`, `MAX_CONCURRENT_REQUESTS`,
 `MAX_ACTIVE_REQUESTS` and `QUEUE_WAIT`, relies on the built-in defaults above
 (the image still `EXPOSE`s 8080). The Go runtime values are ordinary environment
-variables, so both the gateway and MosDNS inherit them; the memory limit applies
-to each process separately, not to the container as a whole.
+variables, so both the gateway and MosDNS inherit them. `GOMEMLIMIT` is a soft
+limit on memory managed by each Go runtime, not a hard RSS, process, or
+container-memory cap; each Go process applies the setting independently.
 
 Client headers (Cookie, Authorization, ...) are never forwarded upstream; only
 `Accept` and, for POST, `Content-Type` are set by the gateway (Go's HTTP client
 adds its own `Host`, `User-Agent` and `Content-Length`). The client address is
 used only for rate limiting and is not sent to MosDNS, because `mosdns.yaml`
 does not use it; `check-config.sh` therefore rejects
-`get_user_ip_from_header`. The answer is relayed with hop-by-hop headers removed
-and `Content-Length` recomputed from the validated body. Backend redirects are
+`get_user_ip_from_header`. The answer is relayed with hop-by-hop headers (including the legacy
+`Proxy-Connection`) removed and `Content-Length` recomputed from the validated body. Backend redirects are
 never followed.
 
 ## MosDNS configuration
@@ -205,7 +211,8 @@ cache in under 1 ms (measured end to end through the gateway).
   rejected rather than silently ignored by MosDNS. Duplicate explicit YAML
   mapping keys and malformed fallback tags are rejected; every plugin
   definition must be referenced by the configured server sequence,
-  and repeated local-answer, EDNS-filter, or fallback references are rejected;
+  and repeated local-answer/fallback references, duplicate EDNS filters, or
+  combinations of both EDNS filters are rejected;
   listener addresses, upstream URLs and the Dockerfile backend URL containing
   raw whitespace or any Unicode control characters are rejected instead of
   being normalized or partially matched; listener addresses also reject empty
@@ -216,8 +223,8 @@ cache in under 1 ms (measured end to end through the gateway).
   upstream URLs also reject embedded user-info, all fragments (including an
   empty trailing `#`), and explicit empty ports;
 - the entry sequence (`servers[0].exec`) layout: optional local-answer
-  (`arbitrary`/`hosts`) and the two pre-initialized EDNS filters
-  (`_edns0_filter_no_edns0` or `_edns0_filter_ecs_only`), then a `cache` plugin,
+  (`arbitrary`/`hosts`) and at most one pre-initialized EDNS filter (choose
+  `_edns0_filter_no_edns0` or `_edns0_filter_ecs_only`), then a `cache` plugin,
   then a `primary`/`secondary` fallback whose tags are `fast_forward` plugins
   with at least one upstream each (tag names are free); in a `fast_forward`
   with several upstreams, every upstream after the first must be
@@ -232,7 +239,8 @@ cache in under 1 ms (measured end to end through the gateway).
   exactly one answer RR and no authority/additional records;
 - exactly one server with exactly one listener, which must use the `http`
   protocol and bind to loopback (an `api.http` listener, if present, must also
-  be loopback);
+  be loopback); IPv6 zone identifiers are accepted only on valid IPv6 literals,
+  so `%zone` suffixes on IPv4 addresses and hostnames are rejected;
 - the Dockerfile's `MOSDNS_DOH_URL` scheme, host, port and path match that
   listener (the listener is plain HTTP, so an `https://` backend is rejected);
   backend user-info, fragments (including an empty `#`), explicit empty ports,
@@ -272,6 +280,10 @@ make run                     # local gateway on :8080 (needs a backend on :8081)
 make clean                   # remove ./doh-gateway
 ```
 
+`test-check-config.sh` runs 53 accepted/rejected MosDNS YAML fixtures, then
+12 Dockerfile mutation fixtures to verify that the backend URL, listener
+settings, build version and related cross-file values stay consistent.
+
 The local image tag defaults to `mosdns-on-paas:local` (Docker image repository
 names must be lowercase). Override it with `make docker-build IMAGE=your-name:tag`.
 
@@ -295,16 +307,23 @@ set `TEST_SHELL` (for example `TEST_SHELL="busybox sh"`) to run it under another
 shell.
 
 `go test ./...` on its own does not need Python, but it does need Go 1.27 or
-newer (see `go.mod`).
+newer (see `go.mod`). `make test` additionally needs Python 3.8+ with PyYAML for
+the configuration checks and a C toolchain supported by Go's race detector
+(for example, GCC on Linux). The local `make test` target does not build a
+container or require Docker; Docker is needed only for `make docker-build`.
+The optional `make entrypoint-test-busybox` target also requires BusyBox.
 
 `make test` runs the unit tests with `-race`, which covers the
 concurrency-sensitive paths (POST buffer pool, per-client limiter, processing
 queue, shared readiness probe). CI (`.github/workflows/ci.yml`) runs `make
 test`, the entrypoint test again under BusyBox ash, and a full Buildx image
 build (GitHub Actions layer cache, no push, image tag `mosdns-on-paas:ci`)
-followed by a smoke test of the built image: it starts the container, waits for `/readyz`, checks `/healthz`,
-a DoH query for the local readiness name, a `404`, the `build_info` version,
-and that `docker stop` finishes within 10 s (no public upstream is contacted).
+followed by a smoke test of the built image. It starts the container, waits for
+`/readyz`, checks `/healthz`, sends a DoH query for the local readiness name
+(the same QNAME/QTYPE/QCLASS as the runtime probe; CI uses transaction ID 0,
+while runtime probes use incrementing IDs), checks a `404` and the `build_info`
+version, and verifies with nanosecond elapsed-time measurement that
+`docker stop` finishes in less than 10 s. No public upstream is contacted.
 It runs on every push to `main` and every pull request, has read-only
 repository permissions and cancels a run that a newer push to the same ref
 supersedes.
@@ -411,6 +430,8 @@ If you find this project useful, donations are appreciated:
 
 ## License
 
-See [`LICENSE`](LICENSE). The container image includes this license at
-`/usr/share/licenses/doh-gateway/LICENSE` and the license of the bundled MosDNS
-source at `/usr/share/licenses/mosdns/LICENSE`.
+The gateway and other repository-owned project files are licensed under the
+MIT License; see [`LICENSE`](LICENSE). The bundled MosDNS source retains its
+own upstream license, which is included separately in the container image at
+`/usr/share/licenses/mosdns/LICENSE`. The repository's MIT license is included
+at `/usr/share/licenses/doh-gateway/LICENSE`.

@@ -713,11 +713,13 @@ func (g *gateway) serveDNS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Take the elapsed time as soon as the body has been read, but only
-	// record it once the response has passed every check below: a timeout,
-	// an oversize body or an invalid answer must not feed backend-latency metrics.
+	// record it once the response has passed the HTTP status, media-type and
+	// body-size checks: a timeout, read error or out-of-range body must not
+	// feed backend-latency metrics. Ordinary DNS wire-format parsing is left
+	// to MosDNS.
 	backendElapsed := time.Since(backendStart)
-	// The status is now known to be 200. A DoH answer must also contain a
-	// plausible DNS message (12-4096 bytes) and the strict DoH content type.
+	// The status is 200 and the strict DoH content type was checked above.
+	// Count the response only when its body is within the configured bounds.
 	if len(respBody) > maxDNSMessageBytes || len(respBody) < minDNSMessageBytes {
 		g.metrics.backendErrorTotal.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
@@ -1024,8 +1026,8 @@ func (g *gateway) serveMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(&b, metricsReadyTemplate, m.readyPassTotal.Load(), m.readyFailTotal.Load())
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_seconds_total Total processing-slot wait time.\n# TYPE doh_gateway_queue_wait_seconds_total counter\ndoh_gateway_queue_wait_seconds_total %.6f\n", float64(m.queueWaitNanos.Load())/float64(time.Second))
 	fmt.Fprintf(&b, "# HELP doh_gateway_queue_wait_samples_total Requests that obtained a processing slot.\n# TYPE doh_gateway_queue_wait_samples_total counter\ndoh_gateway_queue_wait_samples_total %d\n", m.queueWaitSamples.Load())
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total time of valid MosDNS answers (request sent until the 2xx DNS body was fully read and validated).\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(m.backendLatencyNanos.Load())/float64(time.Second))
-	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total Valid MosDNS answers included in the latency total.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", m.backendLatencySamples.Load())
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_seconds_total Total time from request send until the body is fully read for MosDNS responses that pass the gateway's HTTP status, media-type and DNS-message size checks.\n# TYPE doh_gateway_backend_latency_seconds_total counter\ndoh_gateway_backend_latency_seconds_total %.6f\n", float64(m.backendLatencyNanos.Load())/float64(time.Second))
+	fmt.Fprintf(&b, "# HELP doh_gateway_backend_latency_samples_total MosDNS response bodies that pass the gateway's HTTP status, media-type and DNS-message size checks.\n# TYPE doh_gateway_backend_latency_samples_total counter\ndoh_gateway_backend_latency_samples_total %d\n", m.backendLatencySamples.Load())
 	_, _ = io.WriteString(w, b.String())
 }
 
@@ -1188,7 +1190,8 @@ func connectionHeaderTokens(h http.Header) map[string]bool {
 }
 
 // hopByHopHeaders are never relayed to the client (RFC 9110 section 7.6.1).
-var hopByHopHeaders = [...]string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
+// Proxy-Connection is legacy, but some clients and proxies still send it.
+var hopByHopHeaders = [...]string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}
 
 // isHopByHopHeader compares case-insensitively without allocating, because it
 // runs for every relayed response header.

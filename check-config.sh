@@ -94,10 +94,17 @@ def check_listen_addr(value, path: str) -> None:
         fail(f"{path} must be a host:port address")
 def listen_host(value: str):
     host = urlsplit("//" + value).hostname
-    if host is not None and "%" in host:
-        # urlsplit keeps an IPv6 zone id in the hostname ([fe80::1%eth0]
-        # parses to "fe80::1%eth0"); strip it before comparing.
-        host = host.split("%", 1)[0]
+    if host is not None and "%" in host and ":" in host:
+        # A zone identifier is meaningful only on an IPv6 literal. Validate
+        # the complete address before stripping its zone for host comparison;
+        # otherwise values such as 127.0.0.1%eth0 or localhost%eth0 would be
+        # misclassified as loopback after a blind split at the percent sign.
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            host = host.split("%", 1)[0]
     return host
 def check_loopback(value: str, path: str) -> None:
     host = listen_host(value)
@@ -272,6 +279,8 @@ while position < len(exec_chain):
     else:
         break
     position += 1
+if len(edns_filters) > 1:
+    fail(f"{seq_path} may contain only one EDNS filter before the cache; choose either _edns0_filter_no_edns0 or _edns0_filter_ecs_only")
 if position >= len(exec_chain):
     fail(f"{seq_path} must contain a cache plugin")
 cache_tag = exec_chain[position]
